@@ -1,0 +1,67 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ProcWeaver",
+  "version": "2.0.0",
+  "identifier": "com.procweaver.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "binaries/mihomo.exe": "binaries/mihomo.exe",
+      "binaries/mihomo-compatible.exe": "binaries/mihomo-compatible.exe",
+      "binaries/mihomo-v3.exe": "binaries/mihomo-v3.exe",
+      "defaults": "defaults"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "compression": "lzma"
+      }
+    }
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "ProcWeaver",
+        "visible": false,
+        "width": 1200,
+        "height": 800,
+        "minWidth": 1200,
+        "minHeight": 800,
+        "center": true,
+        "resizable": true,
+        "decorations": false
+      },
+      {
+        "label": "tray-menu",
+        "title": "ProcWeaver Menu",
+        "url": "index.html?window=tray-menu",
+        "visible": false,
+        "width": 500,
+        "height": 380,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  }
+}

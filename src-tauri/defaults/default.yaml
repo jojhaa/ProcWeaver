@@ -1,0 +1,11 @@
+mixed-port: 7890
+external-controller: 127.0.0.1:9090
+allow-lan: false
+unified-delay: true
+mode: rule
+log-level: info
+ipv6: false
+proxies: []
+proxy-groups: []
+rules:
+  - MATCH,DIRECT
