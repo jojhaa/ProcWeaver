@@ -5,7 +5,7 @@ import { X, Sparkles, Check, Shield, Wifi, Search, CheckSquare, Square, ArrowUp,
 interface Props {
   isOpen: boolean;
   onClose: () => void;
-  onSave: (rule: SmartGroupRule) => void;
+  onSave: (rule: SmartGroupRule) => Promise<void> | void;
   editingRule?: SmartGroupRule | null;
   allProxyNames: string[];
   fallbackOptions: string[];
@@ -40,6 +40,9 @@ export const SmartGroupModal: React.FC<Props> = ({
   const [relayExit, setRelayExit] = useState<string>("");
   // 多级链路型兜底方案列表
   const [fallbackChain, setFallbackChain] = useState<string[]>(["REJECT"]);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const submitting = useRef(false);
 
   // 防抖锁：仅在弹窗刚打开瞬间或切换编辑规则时初始化表单，严禁因外部数据刷新冲掉用户刚选的地区
   const prevIsOpenRef = useRef(false);
@@ -58,6 +61,8 @@ export const SmartGroupModal: React.FC<Props> = ({
     if (isJustOpened || isRuleChanged) {
       prevIsOpenRef.current = true;
       prevRuleIdRef.current = ruleId;
+      setSaveError("");
+      setManualSearch("");
 
       if (editingRule) {
         setName(editingRule.name);
@@ -213,10 +218,16 @@ export const SmartGroupModal: React.FC<Props> = ({
     });
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.SyntheticEvent) => {
     e.preventDefault();
+    if (submitting.current) return;
+    setSaveError("");
     if (!name.trim()) {
       alert("请输入代理组名称");
+      return;
+    }
+    if (otherSmartGroupNames.includes(name.trim()) || allProxyNames.includes(name.trim()) || ["DIRECT", "REJECT", "GLOBAL", "RULES"].includes(name.trim())) {
+      setSaveError("该名称已被其他线路、节点或系统出口使用，请换一个名称。");
       return;
     }
 
@@ -239,6 +250,7 @@ export const SmartGroupModal: React.FC<Props> = ({
     const safeChain = fallbackChain.length > 0 ? fallbackChain : ["REJECT"];
 
     const rule: SmartGroupRule = {
+      ...editingRule,
       id: editingRule ? editingRule.id : `smart_${Date.now()}`,
       name: name.trim(),
       type,
@@ -261,12 +273,31 @@ export const SmartGroupModal: React.FC<Props> = ({
       lastEvaluatedAt: editingRule?.lastEvaluatedAt,
     };
 
-    onSave(rule);
-    onClose();
+    submitting.current = true;
+    setSaving(true);
+    try {
+      await onSave(rule);
+      onClose();
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : String(error));
+    } finally {
+      submitting.current = false;
+      setSaving(false);
+    }
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
+    <div role="dialog" aria-modal="true" aria-labelledby="smart-group-title" onKeyDown={event => {
+      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); if (!saving) onClose(); }
+      if (event.key === "Tab") {
+        const controls = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('button, input, select, textarea, [tabindex]'))
+          .filter(el => !el.matches(':disabled') && el.tabIndex >= 0 && el.getClientRects().length > 0);
+        const first = controls[0], last = controls[controls.length - 1];
+        if (!first) event.preventDefault();
+        else if (event.shiftKey && event.target === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && event.target === last) { event.preventDefault(); first.focus(); }
+      }
+    }} className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
       <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl w-full max-w-2xl max-h-[90vh] shadow-2xl flex flex-col overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/50">
@@ -275,7 +306,7 @@ export const SmartGroupModal: React.FC<Props> = ({
               <Sparkles className="w-5 h-5" />
             </div>
             <div>
-              <h3 className="text-base font-semibold text-slate-900 dark:text-white">
+              <h3 id="smart-group-title" className="text-base font-semibold text-slate-900 dark:text-white">
                 {editingRule ? "编辑代理组" : "新建代理组"}
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400">
@@ -285,6 +316,8 @@ export const SmartGroupModal: React.FC<Props> = ({
           </div>
           <button
             onClick={onClose}
+            disabled={saving}
+            aria-label="关闭线路编辑"
             className="text-slate-400 hover:text-slate-700 dark:hover:text-white p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition"
           >
             <X className="w-5 h-5" />
@@ -292,7 +325,8 @@ export const SmartGroupModal: React.FC<Props> = ({
         </div>
 
         {/* Content Form */}
-        <form onSubmit={handleSubmit} className="flex-1 overflow-y-auto px-6 py-5 space-y-5">
+        <form id="smart-group-form" onSubmit={handleSubmit} className="flex-1 overflow-y-auto px-6 py-5 space-y-5">
+          <fieldset disabled={saving} className="space-y-5 min-w-0">
           {/* 代理组名称与模式 */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
@@ -301,6 +335,8 @@ export const SmartGroupModal: React.FC<Props> = ({
               </label>
               <input
                 type="text"
+                autoFocus
+                aria-label="代理组名称"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="例如：🛡️ 美区极稳接力"
@@ -311,6 +347,7 @@ export const SmartGroupModal: React.FC<Props> = ({
             <div>
               <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">运行模式</label>
               <select
+                aria-label="运行模式"
                 value={type}
                 onChange={(e) => setType(e.target.value as SmartGroupType)}
                 className="w-full bg-white dark:bg-slate-800/80 border border-slate-300 dark:border-slate-700 rounded-xl px-3 py-2 text-sm text-slate-900 dark:text-white focus:outline-none focus:border-purple-500 transition shadow-sm dark:shadow-none font-medium"
@@ -573,10 +610,14 @@ export const SmartGroupModal: React.FC<Props> = ({
                   .map((name) => {
                     const checked = manualNodes.includes(name);
                     return (
-                      <div
+                      <button
+                        type="button"
+                        role="checkbox"
+                        aria-checked={checked}
+                        aria-label={name}
                         key={name}
                         onClick={() => toggleManualNode(name)}
-                        className={`p-2 rounded-lg border transition cursor-pointer flex items-center justify-between gap-2 text-xs ${
+                        className={`w-full text-left p-2 rounded-lg border transition cursor-pointer flex items-center justify-between gap-2 text-xs ${
                           checked
                             ? "bg-purple-50/80 dark:bg-purple-950/40 border-purple-300 dark:border-purple-500/50 text-purple-900 dark:text-purple-200 font-medium"
                             : "bg-slate-50/50 dark:bg-slate-800/40 border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
@@ -592,7 +633,7 @@ export const SmartGroupModal: React.FC<Props> = ({
                             {name}
                           </span>
                         </div>
-                      </div>
+                      </button>
                     );
                   })}
               </div>
@@ -916,24 +957,29 @@ export const SmartGroupModal: React.FC<Props> = ({
           </div>
           </>
           )}
+          </fieldset>
         </form>
+
+        {saveError && <div role="alert" className="px-6 py-2 text-xs text-rose-600 dark:text-rose-400 break-words">{saveError}</div>}
 
         {/* Footer */}
         <div className="px-6 py-4 border-t border-slate-200 dark:border-slate-800 bg-slate-50/90 dark:bg-slate-900/90 flex items-center justify-between">
           <button
             type="button"
             onClick={onClose}
+            disabled={saving}
             className="px-4 py-2 rounded-xl text-xs text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/60 dark:hover:bg-slate-800 transition"
           >
             取消
           </button>
           <button
-            type="button"
-            onClick={handleSubmit}
+            type="submit"
+            form="smart-group-form"
+            disabled={saving}
             className="px-5 py-2 rounded-xl text-xs font-medium text-white bg-purple-600 hover:bg-purple-500 shadow-lg shadow-purple-600/30 transition flex items-center gap-1.5"
           >
             <Check className="w-4 h-4" />
-            保存并应用规则
+            {saving ? "正在保存并应用…" : "保存并应用规则"}
           </button>
         </div>
       </div>

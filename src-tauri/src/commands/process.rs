@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::Mutex;
-use crate::commands::sysproxy::{get_system_proxy_status, set_system_proxy_raw};
+use crate::commands::sysproxy::{self, get_system_proxy_status, set_system_proxy_raw};
 pub static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub(crate) static PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 pub(crate) static LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -59,6 +59,8 @@ pub struct CoreStatus {
     pub pid: Option<u32>,
     #[serde(rename = "systemProxyEnabled")]
     pub system_proxy_enabled: bool,
+    #[serde(rename = "systemProxy")]
+    pub system_proxy: sysproxy::SystemProxyStatus,
     #[serde(rename = "mixedPort")]
     pub mixed_port: u16,
     #[serde(rename = "controllerPort")]
@@ -98,6 +100,7 @@ pub fn stop_owned_child(state: &mut CoreState) -> Result<(), String> {
 }
 
 pub fn stop_owned_child_ex(state: &mut CoreState, keep_proxy: bool) -> Result<(), String> {
+    crate::routing_overrides::reset_system_proxy_observation();
     crate::capture::stop();
     if let Some(child) = state.child.as_mut() {
         if child.try_wait().map_err(|e| e.to_string())?.is_none() {
@@ -128,58 +131,44 @@ pub fn get_cpu_info() -> CpuInfo {
     }
 }
 
+/// UI queries only observe. Cleanup and route reconciliation belong to the background lifecycle.
 #[tauri::command]
 pub async fn get_core_status(state: tauri::State<'_, CoreStateMutex>) -> Result<CoreStatus, String> {
     let _lifecycle = LIFECYCLE.lock().await;
-    let mut state = state.lock().map_err(|e| e.to_string())?;
-    
-    let mut running = false;
-    let mut pid = None;
+    read_core_status(&state)
+}
 
-    if let Some(ref mut child) = state.child {
-        match child.try_wait() {
-            Ok(Some(_status)) => {
-                crate::capture::stop();
-                state.child = None;
-                ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-                PID.store(0, std::sync::atomic::Ordering::SeqCst);
-                state.active_core = None;
-                state.core_mode = None;
-                set_system_proxy_raw(false, None)?;
-            }
-            Ok(None) => {
-                running = true;
-                pid = Some(child.id());
-            }
-            Err(_) => {
-                return Err("无法读取内核状态，保留进程句柄以便重试清理".into());
-            }
+fn read_core_status(state: &CoreStateMutex) -> Result<CoreStatus, String> {
+    let mut state = state.lock().map_err(|e| e.to_string())?;
+    let pid = match state.child.as_mut() {
+        Some(child) => if child.try_wait().map_err(|_| "无法读取核心状态")?.is_none() { Some(child.id()) } else { None },
+        None => None,
+    };
+    let proxy = sysproxy::system_proxy_snapshot();
+    Ok(CoreStatus {
+        running: pid.is_some(), pid,
+        system_proxy_enabled: proxy.enabled(), system_proxy: proxy,
+        mixed_port: state.mixed_port, controller_port: state.controller_port,
+        active_core: state.active_core.clone(), started_at: if pid.is_some() { state.started_at } else { None },
+    })
+}
+
+pub(crate) async fn monitor_core(state: tauri::State<'_, CoreStateMutex>) -> Result<(), String> {
+    let _lifecycle = LIFECYCLE.lock().await;
+    {
+        let mut state = state.lock().map_err(|e| e.to_string())?;
+        let exited = match state.child.as_mut() {
+            Some(child) => child.try_wait().map_err(|_| "无法读取核心状态，暂缓退出恢复")?.is_some(),
+            None => false,
+        };
+        if exited || (state.child.is_none() && sysproxy::has_owned_proxy()) {
+            // Release proxy before dropping the handle, so a failed restore is retried next tick.
+            sysproxy::set_system_proxy_with_reason(false, None, "核心异常退出，恢复接管前的系统代理设置")?;
+            stop_owned_child_ex(&mut state, true)?;
         }
     }
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    if running && state.started_at.is_none() {
-        state.started_at = Some(now);
-    } else if !running {
-        state.started_at = None;
-        set_system_proxy_raw(false, None)?;
-    }
-
-    let sys_proxy = get_system_proxy_status().unwrap_or(false);
-
-    Ok(CoreStatus {
-        running,
-        pid,
-        system_proxy_enabled: sys_proxy,
-        mixed_port: state.mixed_port,
-        controller_port: state.controller_port,
-        active_core: state.active_core.clone(),
-        started_at: state.started_at,
-    })
+    let proxy = sysproxy::observe_change(None);
+    crate::routing_overrides::reconcile_system_proxy(&proxy).await
 }
 
 #[tauri::command]
@@ -197,16 +186,18 @@ pub(crate) async fn start_core_transaction(core_mode: Option<String>, state: &Co
 
 /// 调用方持有 LIFECYCLE，设置事务重启时避免重复获取同一锁。
 pub(crate) async fn start_core_locked(core_mode: Option<String>, state: &CoreStateMutex) -> Result<CoreStatus, String> {
+    if crate::shutdown::in_progress() { return Err("正在恢复网络并退出，暂不启动核心".into()); }
     // 如果已经在运行，先检查并返回
     {
         let mut state_guard = state.lock().map_err(|e| e.to_string())?;
         if let Some(ref mut child) = state_guard.child {
             if child.try_wait().map(|s| s.is_none()).unwrap_or(false) {
-                let sys_proxy = get_system_proxy_status().unwrap_or(false);
+                let sys_proxy = sysproxy::system_proxy_snapshot();
                 return Ok(CoreStatus {
                     running: true,
                     pid: Some(child.id()),
-                    system_proxy_enabled: sys_proxy,
+                    system_proxy_enabled: sys_proxy.enabled(),
+                    system_proxy: sys_proxy,
                     mixed_port: state_guard.mixed_port,
                     controller_port: state_guard.controller_port,
                     active_core: state_guard.active_core.clone(),
@@ -332,6 +323,7 @@ pub(crate) async fn start_core_locked(core_mode: Option<String>, state: &CoreSta
         }
         let prepared = rule_startup_config(&crate::commands::settings::prepare_config(&raw)?)?;
         crate::commands::profile::validate_config(&prepared)?;
+        super::dns_runtime::preflight(&prepared, 0).await?;
         crate::storage::replace(&core_config, prepared.as_bytes())?;
         cmd.arg("-f").arg(&core_config);
     } else { return Err("配置文件不存在，请重新选择订阅".into()); }
@@ -358,6 +350,7 @@ pub(crate) async fn start_core_locked(core_mode: Option<String>, state: &CoreSta
     let ready = async {
         wait_for_core_ready(&mut child, preferences.controller_port, preferences.mixed_port).await?;
         let raw = std::fs::read_to_string(&core_config).map_err(|_| "读取核心启动配置失败")?;
+        super::dns_runtime::confirm(&raw, child.id()).await?;
         crate::routing_overrides::bundles::select(&raw).await?;
         crate::capture::confirm_runtime(&raw).await
     }.await;
@@ -398,12 +391,13 @@ pub(crate) async fn start_core_locked(core_mode: Option<String>, state: &CoreSta
     }.into());
     state_guard.started_at = Some(now);
 
-    let sys_proxy = get_system_proxy_status().unwrap_or(false);
+    let sys_proxy = sysproxy::system_proxy_snapshot();
 
     Ok(CoreStatus {
         running: true,
         pid: Some(pid),
-        system_proxy_enabled: sys_proxy,
+        system_proxy_enabled: sys_proxy.enabled(),
+        system_proxy: sys_proxy,
         mixed_port: state_guard.mixed_port,
         controller_port: state_guard.controller_port,
         active_core: state_guard.active_core.clone(),
@@ -434,11 +428,13 @@ pub async fn stop_core(state: tauri::State<'_, CoreStateMutex>) -> Result<CoreSt
     let mut state = state.lock().map_err(|e| e.to_string())?;
 
     stop_owned_child(&mut state)?;
+    let proxy = sysproxy::system_proxy_snapshot();
 
     Ok(CoreStatus {
         running: false,
         pid: None,
-        system_proxy_enabled: false,
+        system_proxy_enabled: proxy.enabled(),
+        system_proxy: proxy,
         mixed_port: state.mixed_port,
         controller_port: state.controller_port,
         active_core: None,
@@ -457,7 +453,7 @@ pub async fn restart_core_transaction(app: &tauri::AppHandle) -> Result<CoreStat
     let _lifecycle = LIFECYCLE.lock().await;
 
     // 1. 抓取重启前环境快照
-    let was_proxy_enabled = crate::commands::sysproxy::get_system_proxy_status().unwrap_or(false);
+    let was_proxy_enabled = get_system_proxy_status()?;
     let mut last_active_node: Option<String> = None;
     let mut last_mode: Option<String> = None;
 
@@ -488,12 +484,13 @@ pub async fn restart_core_transaction(app: &tauri::AppHandle) -> Result<CoreStat
 
     // 3. 启动新核心（持锁状态下调用 start_core_locked，避免 LIFECYCLE 死锁）
     let state = app.state::<CoreStateMutex>();
-    let status = match start_core_locked(None, &state).await {
+    let mut status = match start_core_locked(None, &state).await {
         Ok(s) => s,
         Err(e) => {
             // 启动失败时，旧核心已停，系统代理必须关闭并通知，防止系统代理指向死端口导致用户断网
             if was_proxy_enabled {
-                let _ = set_system_proxy_raw(false, None);
+                sysproxy::set_system_proxy_with_reason(false, None, "核心重启失败，恢复接管前的系统代理设置")
+                    .map_err(|restore| format!("重启失败：{e}；系统代理恢复失败：{restore}"))?;
                 crate::app_lifecycle::notify_sysproxy_changed(app, false);
             }
             return Err(format!("重启核心失败: {}", e));
@@ -502,8 +499,13 @@ pub async fn restart_core_transaction(app: &tauri::AppHandle) -> Result<CoreStat
 
     // 4. 环境还原
     if was_proxy_enabled {
-        let _ = set_system_proxy_raw(true, Some(status.mixed_port));
-        crate::app_lifecycle::notify_sysproxy_changed(app, true);
+        // If another application took over while restarting, keep its settings intact.
+        if get_system_proxy_status()? {
+            sysproxy::set_system_proxy_with_reason(true, Some(status.mixed_port), "核心重启完成，系统代理保持启用")?;
+        }
+        status.system_proxy = sysproxy::system_proxy_snapshot();
+        status.system_proxy_enabled = status.system_proxy.enabled();
+        crate::app_lifecycle::notify_sysproxy_changed(app, status.system_proxy_enabled);
     }
     if let Some(node) = last_active_node {
         for group in ["节点选择", "🚀 节点选择", "PROXY", "GLOBAL"] {
@@ -524,6 +526,20 @@ pub async fn restart_core_transaction(app: &tauri::AppHandle) -> Result<CoreStat
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    #[test]
+    fn status_queries_never_cleanup_exited_core_or_write_proxy_events() {
+        use std::os::windows::process::CommandExt;
+        let mut child = std::process::Command::new("pwsh").args(["-NoProfile", "-Command", "exit 0"])
+            .creation_flags(0x08000000).spawn().unwrap();
+        child.wait().unwrap();
+        let state = Mutex::new(CoreState { child: Some(child), mixed_port: 7890, controller_port: 9090,
+            active_core: None, active_core_path: None, core_mode: None, started_at: Some(1) });
+        let events = crate::storage::data_dir().join("config/system-proxy-events.json");
+        let before = std::fs::read(&events).ok();
+        for _ in 0..5 { assert!(!read_core_status(&state).unwrap().running); }
+        assert!(state.lock().unwrap().child.is_some(), "查询保留句柄，由后台生命周期执行退出恢复");
+        assert_eq!(std::fs::read(&events).ok(), before);
+    }
     #[test]
     fn forced_owner_exit_terminates_bound_core() {
         use std::os::windows::{io::{FromRawHandle, OwnedHandle, AsRawHandle}, process::CommandExt};

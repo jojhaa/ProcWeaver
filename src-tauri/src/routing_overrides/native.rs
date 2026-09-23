@@ -1,5 +1,11 @@
 //! Windows 只读进程快照与 WMI 事件；不改变目标进程、不收集命令行。
 use super::tracker::ProcessEntry;
+use std::{collections::{HashMap, HashSet}, sync::{LazyLock, Mutex}};
+static PATHS: LazyLock<Mutex<HashMap<(u32, u64), String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+static PATH_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[derive(Clone)]
+pub struct ProcessRecord { pub pid: u32, pub parent_pid: u32, pub name: String }
 #[cfg(windows)]
 pub fn inspect(pid: u32, parent_pid: u32, name: String) -> ProcessEntry {
     use windows_sys::Win32::{Foundation::*, System::Threading::*};
@@ -16,16 +22,33 @@ pub fn inspect(pid: u32, parent_pid: u32, name: String) -> ProcessEntry {
             item.created_at = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
             item.identity = format!("{pid}:{}", item.created_at);
         }
-        let mut buffer = vec![0u16; 32768]; let mut length = buffer.len() as u32;
-        if QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length) != 0 {
-            item.executable_path = Some(String::from_utf16_lossy(&buffer[..length as usize]));
+        if item.created_at > 0 {
+            item.executable_path = PATHS.lock().unwrap_or_else(|p| p.into_inner()).get(&(pid, item.created_at)).cloned();
+        }
+        if item.executable_path.is_none() {
+            #[cfg(test)] PATH_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut buffer = vec![0u16; 512];
+            loop {
+                let mut length = buffer.len() as u32;
+                if QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length) != 0 {
+                    let path = String::from_utf16_lossy(&buffer[..length as usize]);
+                    if item.created_at > 0 {
+                        let mut cache = PATHS.lock().unwrap_or_else(|p| p.into_inner());
+                        if cache.len() >= 8192 { cache.clear(); }
+                        cache.insert((pid, item.created_at), path.clone());
+                    }
+                    item.executable_path = Some(path); break;
+                }
+                if GetLastError() != ERROR_INSUFFICIENT_BUFFER || buffer.len() >= 32768 { break; }
+                buffer.resize(buffer.len() * 2, 0);
+            }
         }
         CloseHandle(handle);
     }
     item
 }
 #[cfg(windows)]
-pub fn snapshot() -> Result<Vec<ProcessEntry>, String> {
+pub fn process_list() -> Result<Vec<ProcessRecord>, String> {
     use windows_sys::Win32::{Foundation::*, System::Diagnostics::ToolHelp::*};
     unsafe {
         let handle = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -34,7 +57,7 @@ pub fn snapshot() -> Result<Vec<ProcessEntry>, String> {
         let mut ok = Process32FirstW(handle, &mut entry); let mut result = Vec::new();
         while ok != 0 && result.len() < 8192 {
             let length = entry.szExeFile.iter().position(|c| *c == 0).unwrap_or(entry.szExeFile.len());
-            result.push(inspect(entry.th32ProcessID, entry.th32ParentProcessID, String::from_utf16_lossy(&entry.szExeFile[..length])));
+            result.push(ProcessRecord { pid: entry.th32ProcessID, parent_pid: entry.th32ParentProcessID, name: String::from_utf16_lossy(&entry.szExeFile[..length]) });
             ok = Process32NextW(handle, &mut entry);
         }
         CloseHandle(handle);
@@ -43,7 +66,29 @@ pub fn snapshot() -> Result<Vec<ProcessEntry>, String> {
     }
 }
 #[cfg(not(windows))]
-pub fn snapshot() -> Result<Vec<ProcessEntry>, String> { Err("进程树仅支持 Windows".into()) }
+pub fn process_list() -> Result<Vec<ProcessRecord>, String> { Err("进程树仅支持 Windows".into()) }
+
+pub fn snapshot() -> Result<Vec<ProcessEntry>, String> {
+    let entries: Vec<_> = process_list()?.into_iter().map(|p| inspect(p.pid, p.parent_pid, p.name)).collect();
+    let live: HashSet<_> = entries.iter().map(|p| (p.pid, p.created_at)).collect();
+    PATHS.lock().unwrap_or_else(|p| p.into_inner()).retain(|key, _| live.contains(key));
+    Ok(entries)
+}
+
+#[cfg(all(test, windows))]
+mod performance_tests {
+    use super::*;
+    #[test]
+    fn performance_repeated_identity_reuses_path() {
+        let pid = std::process::id();
+        let first = inspect(pid, 0, String::new());
+        assert!(!first.identity.is_empty());
+        assert!(first.executable_path.is_some());
+        let reads = PATH_READS.load(std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..50 { assert_eq!(inspect(pid, 0, String::new()).executable_path, first.executable_path); }
+        assert_eq!(PATH_READS.load(std::sync::atomic::Ordering::Relaxed), reads);
+    }
+}
 
 #[cfg(windows)]
 pub fn observe() -> Result<(), String> {

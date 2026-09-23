@@ -9,7 +9,15 @@ fn native_bundle_entries_switch_only_one_selector_and_rollback() {
     }
     let dir=std::env::temp_dir().join(format!("procweaver-bundle-runtime-{}",std::process::id())); std::fs::create_dir_all(&dir).unwrap();
     crate::storage::initialize_test(dir.clone(),std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf());
-    let free=||std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    // Mixed listeners need TCP and UDP; Windows can reserve UDP-only ranges.
+    let free=||{
+        for _ in 0..256 {
+            let tcp=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port=tcp.local_addr().unwrap().port();
+            if std::net::UdpSocket::bind(("127.0.0.1",port)).is_ok(){return port;}
+        }
+        panic!("没有找到同时可用的 TCP/UDP 测试端口");
+    };
     let preferences=settings::GeneralSettings{mixed_port:free(),controller_port:free(),..Default::default()};
     std::fs::write(dir.join("config/preferences.json"),serde_json::to_vec(&preferences).unwrap()).unwrap();
     std::fs::write(dir.join("config/local-rules.json"),r#"{"enabled":false,"providers":[]}"#).unwrap();
@@ -117,6 +125,7 @@ try {{
         let _rolled_back=connect_to(ports[3],&destination(),"direct").await;
         for enabled in [true,false,true] {
             {let _lock=process::LIFECYCLE.lock().await;assert_eq!(change_system_proxy(enabled,||Ok(enabled)).await.unwrap(),enabled);}
+            assert_eq!(*SYSTEM_PROXY_ROUTED.lock().unwrap(),Some(enabled),"显式切换也更新最近成功的回退状态，避免外部立即改回时漏处理");
             // Public original selector changes must never replace the bundle's selected target.
             control.put(format!("http://127.0.0.1:{}/proxies/PROXY",preferences.controller_port)).json(&serde_json::json!({"name":"node-b"})).send().await.unwrap().error_for_status().unwrap();
             for port in [ports[3],preferences.mixed_port] {
@@ -134,6 +143,24 @@ try {{
             let _strong=connect(ports[0],"node-a").await;
             kept.write_all(b"alive").await.unwrap();let mut echo=[0;5];tokio::time::timeout(std::time::Duration::from_secs(3),kept.read_exact(&mut echo)).await.unwrap().unwrap();assert_eq!(&echo,b"alive");
         }
+        // Observer reconciliation uses actual status; read errors and bypass changes keep routing.
+        let proxy_status=|state:&str,bypass_changed:bool|crate::commands::sysproxy::SystemProxyStatus {
+            state:state.into(),bypass_changed,message:String::new(),last_change:None,
+        };
+        {
+            let _lock=process::LIFECYCLE.lock().await;
+            reconcile_system_proxy(&proxy_status("enabled",false)).await.unwrap();
+            let before=std::fs::read_to_string(dir.join("core_data/config.yaml")).unwrap();
+            reconcile_system_proxy(&proxy_status("unknown",false)).await.unwrap();
+            reconcile_system_proxy(&proxy_status("enabled",true)).await.unwrap();
+            assert_eq!(std::fs::read_to_string(dir.join("core_data/config.yaml")).unwrap(),before);
+        }
+        let _retained=connect_to(ports[3],"unmatched.example.test:443","node-b").await;
+        {let _lock=process::LIFECYCLE.lock().await;reconcile_system_proxy(&proxy_status("disabled",false)).await.unwrap();}
+        let _off_after_observation=connect_to(ports[3],&destination(),"direct").await;
+        {let _lock=process::LIFECYCLE.lock().await;reconcile_system_proxy(&proxy_status("enabled",false)).await.unwrap();}
+        let _on_after_observation=connect_to(ports[3],"unmatched.example.test:443","node-b").await;
+        println!("系统代理观察器：读取未知与绕过项变化不改变路由；实际关闭/开启才切换回退：通过");
         let mut direct_only=saved.config.clone();direct_only.bundles[3].fallback="direct".into();
         let saved=save(direct_only,vec![]).await.unwrap();
         {let _lock=process::LIFECYCLE.lock().await;change_system_proxy(true,||Ok(true)).await.unwrap();}

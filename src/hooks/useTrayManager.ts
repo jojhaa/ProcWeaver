@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import { CoreStatus } from "../types";
-import { TrafficReading } from "../utils/trafficCounter";
 import { getGeneralSettings, GeneralSettings } from "../api/settings";
 import { fetchProxies } from "../api/mihomo";
 import { syncTrayMenu, TrayRegionGroup } from "../utils/traySync";
@@ -17,14 +16,12 @@ interface TrayManagerProps {
   coreStatus: CoreStatus;
   mode: "rule" | "global" | "direct" | null;
   activeNodeName: string;
-  trafficReading: TrafficReading;
 }
 
 export function useTrayManager({
   coreStatus,
   mode,
   activeNodeName,
-  trafficReading,
 }: TrayManagerProps) {
   const [settings, setSettings] = useState<GeneralSettings | null>(null);
   const [groups, setGroups] = useState<TrayRegionGroup[]>(globalTrayGroupsCache);
@@ -145,13 +142,12 @@ export function useTrayManager({
       running: coreStatus.running,
       mode: mode || "rule",
       sysProxyEnabled: coreStatus.systemProxyEnabled,
+      sysProxyState: coreStatus.systemProxy?.state ?? "unknown",
       tunEnabled: settings?.tunMode ?? false,
       autoRun: settings?.autoStart ?? settings?.autoRun ?? true,
       processEnabled: processEnabled,
       activeNode: activeNodeName || null,
       activeNodeDelay: activeNodeDelay,
-      downSpeed: trafficReading.downSpeed,
-      upSpeed: trafficReading.upSpeed,
       groups: groups.map((g) => ({
         ...g,
         nodes: g.nodes.map((n) => ({
@@ -163,6 +159,7 @@ export function useTrayManager({
   }, [
     coreStatus.running,
     coreStatus.systemProxyEnabled,
+    coreStatus.systemProxy?.state,
     mode,
     activeNodeName,
     activeNodeDelay,
@@ -171,7 +168,5 @@ export function useTrayManager({
     settings?.autoRun,
     processEnabled,
     groups,
-    trafficReading.downSpeed,
-    trafficReading.upSpeed,
   ]);
 }

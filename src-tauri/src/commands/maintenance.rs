@@ -388,24 +388,9 @@ pub async fn install_app_update(archive_path: String) -> Result<bool, String> {
 
 /// 重启应用
 #[tauri::command]
-pub async fn restart_app() -> Result<(), String> {
-    let current_exe = std::env::current_exe().map_err(|e| format!("获取程序路径失败: {}", e))?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        std::process::Command::new(&current_exe)
-            .creation_flags(0x00000008) // DETACHED_PROCESS
-            .spawn()
-            .map_err(|e| format!("重新启动应用程序失败: {}", e))?;
-        std::process::exit(0);
-    }
-    #[cfg(not(windows))]
-    {
-        std::process::Command::new(&current_exe)
-            .spawn()
-            .map_err(|e| format!("重新启动应用程序失败: {}", e))?;
-        std::process::exit(0);
-    }
+pub async fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
+    crate::shutdown::request(&app, tauri::RESTART_EXIT_CODE);
+    Ok(())
 }
 
 /// 获取当前内核的详细运行与版本信息

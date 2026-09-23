@@ -20,7 +20,8 @@ export interface BundleProcessMember {
 export type BundleCategory = "dev" | "chat" | "browser" | "game" | "media" | "custom";
 export type BundleTrafficMode = "strict" | "sandbox"; // strict = 强锁独占, sandbox = 智能沙盒
 export type BundleFallback = "rules" | "system" | "direct";
-export type BundleWatcherMode = "auto" | "notify" | "disabled"; // auto = ⚡ 自动热替换, notify = 🔔 仅提醒, disabled = ⚪ 关闭后台守护
+// 热替换单独选择；旧版 auto 继续只检测，不能升级为自动重启授权。
+export type BundleWatcherMode = "auto" | "hot_swap" | "notify" | "disabled";
 
 export interface BusinessBundleDefinition {
   packageId: string;

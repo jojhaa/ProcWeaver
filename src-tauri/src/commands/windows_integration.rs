@@ -79,16 +79,25 @@ pub fn split_arguments(command: &str) -> Result<Vec<String>, String> {
 
 // Limit WMI reads to the selected executable name. Command lines stay in memory.
 pub fn command_lines(name: &str) -> Result<Vec<(u32, String)>, String> {
-    if name.contains(['\'', '"', '\\', '/']) { return Err("应用文件名无效".into()); }
+    Ok(process_command_lines(&[name])?.into_iter().map(|row| (row.pid, row.command)).collect())
+}
+pub struct ProcessCommand { pub pid: u32, pub name: String, pub command: String }
+pub fn process_command_lines(names: &[&str]) -> Result<Vec<ProcessCommand>, String> {
+    if names.is_empty() { return Ok(vec![]); }
+    if names.len() > 128 || names.iter().any(|name| name.is_empty() || name.contains(['\'', '"', '\\', '/'])) { return Err("应用文件名无效".into()); }
+    let filter = names.iter().map(|name| format!("Name='{name}'")).collect::<Vec<_>>().join(" OR ");
     #[cfg(windows)] { com(|| unsafe {
         use windows::{core::{BSTR,w}, Win32::System::{Com::*, Wmi::*, Variant::*}};
         let locator: IWbemLocator = CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER).map_err(|_| "创建进程查询失败")?;
         let empty = BSTR::new();
         let service = locator.ConnectServer(&BSTR::from("ROOT\\CIMV2"), &empty,&empty,&empty,0,&empty,None).map_err(|_| "连接进程查询失败")?;
         CoSetProxyBlanket(&service,10,0,None,RPC_C_AUTHN_LEVEL_CALL,RPC_C_IMP_LEVEL_IMPERSONATE,None,EOAC_NONE).map_err(|_| "设置进程查询权限失败")?;
-        let rows = service.ExecQuery(&BSTR::from("WQL"), &BSTR::from(format!("SELECT ProcessId,CommandLine FROM Win32_Process WHERE Name='{name}'")), WBEM_FLAG_RETURN_IMMEDIATELY|WBEM_FLAG_FORWARD_ONLY, None).map_err(|_| "查询应用进程失败")?;
+        let rows = service.ExecQuery(&BSTR::from("WQL"), &BSTR::from(format!("SELECT ProcessId,Name,CommandLine FROM Win32_Process WHERE {filter}")), WBEM_FLAG_RETURN_IMMEDIATELY|WBEM_FLAG_FORWARD_ONLY, None).map_err(|_| "查询应用进程失败")?;
         let mut result = Vec::new();
+        let started = std::time::Instant::now();
+        let mut buffer = vec![0;32768];
         loop {
+            if started.elapsed() > std::time::Duration::from_secs(3) { return Err("查询应用进程超时".into()); }
             let mut objects = [None]; let mut count = 0;
             let status = rows.Next(1500, &mut objects, &mut count);
             if status.0 == WBEM_S_TIMEDOUT.0 { return Err("查询应用进程超时".into()); }
@@ -97,14 +106,31 @@ pub fn command_lines(name: &str) -> Result<Vec<(u32, String)>, String> {
             let object = objects[0].as_ref().ok_or("应用进程查询无效")?;
             let mut value = VARIANT::default(); object.Get(w!("ProcessId"),0,&mut value,None,None).map_err(|_| "进程身份不可读")?;
             let pid = VariantToUInt32(&value).map_err(|_| "进程身份无效")?;
+            let mut value = VARIANT::default(); object.Get(w!("Name"),0,&mut value,None,None).map_err(|_| "进程名称不可读")?;
+            buffer.fill(0);
+            let name = if VariantToString(&value, &mut buffer).is_ok() { string(&buffer) } else { String::new() };
             let mut value = VARIANT::default(); object.Get(w!("CommandLine"),0,&mut value,None,None).map_err(|_| "进程参数不可读")?;
-            let mut buffer = vec![0;32768];
+            buffer.fill(0);
             let command = if VariantToString(&value, &mut buffer).is_ok() { string(&buffer) } else { String::new() };
-            result.push((pid,command));
+            result.push(ProcessCommand { pid, name, command });
             if result.len() > 2048 { return Err("应用进程过多，无法安全核对".into()); }
         } Ok(result)
     }) }
-    #[cfg(not(windows))] { let _ = name; Err("仅支持 Windows".into()) }
+    #[cfg(not(windows))] { let _ = filter; Err("仅支持 Windows".into()) }
+}
+
+#[cfg(all(test, windows))]
+mod performance_tests {
+    #[test]
+    fn performance_native_command_query_batches_names_without_shell() {
+        let exe = std::env::current_exe().unwrap();
+        let name = exe.file_name().unwrap().to_str().unwrap();
+        let rows = super::process_command_lines(&[name, "procweaver-absent-test.exe"]).unwrap();
+        let own = rows.iter().find(|row| row.pid == std::process::id()).unwrap();
+        assert_eq!(own.name.to_lowercase(), name.to_lowercase());
+        assert!(!own.command.is_empty());
+        assert!(super::process_command_lines(&["a' OR 1=1"]).is_err());
+    }
 }
 
 pub fn request_close(pid: u32, identity: &str) -> Result<(), String> {

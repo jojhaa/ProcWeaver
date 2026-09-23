@@ -371,7 +371,7 @@ fn native_save_revision_rollback_and_dns_proxy_egress() {
             c.dns_rules.push(DnsRule { id: id.into(), enabled: true, domain_kind: kind.into(), domain: domain.into(), resolver_url: format!("https://{ip}/dns-query"), target: target("node") });
         }
         let saved = save(c.clone(), vec![]).await.unwrap(); assert_eq!(saved.config.revision, 1);
-        assert!(profile::select_profile("other".into()).await.is_err(), "同名节点不可越过订阅身份绑定");
+        assert!(profile::select_profile("other".into(), None).await.is_err(), "同名节点不可越过订阅身份绑定");
         assert!(profile::read_profiles_index().iter().any(|p| p.id == "default" && p.is_selected));
         assert!(save(c, vec![]).await.unwrap_err_string().contains("其他页面"));
         let original = std::fs::read(path()).unwrap(); let source = std::fs::read(dir.join("config/default.yaml")).unwrap();

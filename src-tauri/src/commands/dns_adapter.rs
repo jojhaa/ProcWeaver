@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+#[cfg(windows)]
+mod native;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -23,6 +25,7 @@ async fn run_hidden_cmd_async(program: &str, args: &[&str], timeout_secs: u64) -
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args);
     cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.kill_on_drop(true);
 
     let output_future = cmd.output();
     let res = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), output_future)
@@ -32,8 +35,8 @@ async fn run_hidden_cmd_async(program: &str, args: &[&str], timeout_secs: u64) -
 
     let stdout = String::from_utf8_lossy(&res.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&res.stderr).trim().to_string();
-    if !res.status.success() && !stderr.is_empty() {
-        return Err(format!("命令 [{}] 执行返回错误: {}", program, stderr));
+    if !res.status.success() {
+        return Err(format!("命令 [{}] 执行返回错误（{}）: {}", program, res.status, if stderr.is_empty() { &stdout } else { &stderr }));
     }
     Ok(stdout)
 }
@@ -47,24 +50,7 @@ async fn run_hidden_cmd_async(_program: &str, _args: &[&str], _timeout_secs: u64
 pub async fn get_active_interface_alias() -> Result<String, String> {
     #[cfg(windows)]
     {
-        let ps_cmd = "Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null } | Select-Object -ExpandProperty InterfaceAlias";
-        if let Ok(out) = run_hidden_cmd_async("powershell", &["-NoProfile", "-NonInteractive", "-Command", ps_cmd], 5).await {
-            for line in out.lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    return Ok(trimmed.to_string());
-                }
-            }
-        }
-        // 若 PowerShell 未获取到，尝试使用 netsh 获取首个处于已连接状态的接口
-        let netsh_out = run_hidden_cmd_async("netsh", &["interface", "ipv4", "show", "interfaces"], 4).await?;
-        for line in netsh_out.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 5 && parts[1] == "connected" {
-                return Ok(parts[4..].join(" "));
-            }
-        }
-        Err("未找到活跃的上网网卡接口".into())
+        tokio::task::spawn_blocking(|| native::read(None).map(|value| value.alias)).await.map_err(|_| "读取网卡任务失败")?
     }
     #[cfg(not(windows))]
     {
@@ -76,26 +62,9 @@ pub async fn get_active_interface_alias() -> Result<String, String> {
 pub async fn get_interface_dns_info(alias: &str) -> Result<(bool, Vec<String>), String> {
     #[cfg(windows)]
     {
-        let ps_cmd = format!(
-            "(Get-DnsClientServerAddress -InterfaceAlias '{}' -AddressFamily IPv4).ServerAddresses",
-            alias.replace('\'', "''")
-        );
-        let servers = match run_hidden_cmd_async("powershell", &["-NoProfile", "-NonInteractive", "-Command", &ps_cmd], 5).await {
-            Ok(out) => out
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|s| !s.is_empty() && s.contains('.'))
-                .collect(),
-            Err(_) => Vec::new(),
-        };
-
-        // 查看 netsh 确认是否为 DHCP
-        let netsh_out = run_hidden_cmd_async("netsh", &["interface", "ipv4", "show", "dnsservers", &format!("name={}", alias)], 4)
-            .await
-            .unwrap_or_default();
-        let was_dhcp = netsh_out.contains("DHCP") || servers.is_empty();
-
-        Ok((was_dhcp, servers))
+        let alias = alias.to_owned();
+        tokio::task::spawn_blocking(move || native::read(Some(&alias)).map(|value| (value.automatic, value.servers)))
+            .await.map_err(|_| "读取网卡 DNS 任务失败")?
     }
     #[cfg(not(windows))]
     {
@@ -111,32 +80,10 @@ pub async fn check_dns_service_ready() -> Result<(), String> {
         return Err("Mihomo 核心当前未运行，无法启用 DNS 护航。请先启动核心。".into());
     }
 
-    // 探测 127.0.0.1:53 是否开放并响应
-    // 构造基础 DNS 查询包探测 localhost
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.map_err(|e| format!("绑定测试 UDP 端口失败: {}", e))?;
-    let probe_query = [
-        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x09, b'l', b'o', b'c',
-        b'a', b'l', b'h', b'o', b's', b't', 0x00, 0x00,
-        0x01, 0x00, 0x01
-    ];
-    let _ = socket.send_to(&probe_query, "127.0.0.1:53").await;
-    let mut buf = [0u8; 512];
-    let udp_recv = tokio::time::timeout(std::time::Duration::from_millis(500), socket.recv_from(&mut buf)).await;
-
-    if udp_recv.is_err() {
-        // UDP 未快速响应，进一步探测 TCP 53 端口是否可连接
-        let tcp_probe = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            tokio::net::TcpStream::connect("127.0.0.1:53")
-        ).await;
-
-        if tcp_probe.is_err() || tcp_probe.unwrap().is_err() {
-            return Err("未检测到 127.0.0.1:53 的 DNS 服务响应。Windows 系统 DNS 仅支持 53 端口，若核心使用 1053 等自定义端口或 53 端口被占用，请在 DNS 设置中检查配置。".into());
-        }
-    }
-
-    Ok(())
+    let raw = std::fs::read_to_string(crate::storage::data_dir().join("core_data/config.yaml"))
+        .map_err(|_| "读取核心 DNS 运行配置失败，未启用护航")?;
+    let pid = super::process::PID.load(std::sync::atomic::Ordering::SeqCst);
+    super::dns_runtime::confirm_guard(&raw, pid).await
 }
 
 /// 启用本地 DNS 护航（将网卡首选 DNS 指向 127.0.0.1）
@@ -148,8 +95,8 @@ pub async fn enable_dns_guard() -> Result<(), String> {
         // C03: 严格校验本地 DNS 服务就绪后再修改系统网卡
         check_dns_service_ready().await?;
 
-        let alias = get_active_interface_alias().await?;
-        let (was_dhcp, static_dns) = get_interface_dns_info(&alias).await?;
+        let adapter = tokio::task::spawn_blocking(|| native::read(None)).await.map_err(|_| "读取网卡任务失败")??;
+        let (alias, was_dhcp, static_dns) = (adapter.alias, adapter.automatic, adapter.servers);
 
         // 如果已经是指向 127.0.0.1，说明已处于护航状态
         if static_dns.first().map(|s| s.as_str()) == Some("127.0.0.1") {
@@ -164,11 +111,9 @@ pub async fn enable_dns_guard() -> Result<(), String> {
 
         // 保存恢复快照凭证
         let path = recovery_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let json = serde_json::to_vec_pretty(&record).map_err(|e| e.to_string())?;
-        crate::storage::replace(&path, &json)?;
+        let save_path = path.clone();
+        tokio::task::spawn_blocking(move || crate::storage::replace(&save_path, &json)).await.map_err(|_| "保存 DNS 恢复记录失败")??;
 
         // 将网卡首选 DNS 设为 127.0.0.1 (带超时防护)
         let set_res = run_hidden_cmd_async(
@@ -178,19 +123,17 @@ pub async fn enable_dns_guard() -> Result<(), String> {
         ).await;
 
         if let Err(e) = set_res {
-            // 设置失败，尝试清除恢复记录并报错
-            let _ = std::fs::remove_file(&path);
-            return Err(format!("修改网卡 DNS 失败: {}", e));
+            // A timeout can occur after Windows accepted the write. Preserve recovery.
+            return Err(format!("修改网卡 DNS 失败: {}；已保留恢复记录", e));
         }
 
         // 刷新系统 DNS 解析缓存
         let _ = run_hidden_cmd_async("ipconfig", &["/flushdns"], 4).await;
 
         // 回读核验修改结果
-        if let Ok((_, current_dns)) = get_interface_dns_info(&alias).await {
-            if current_dns.first().map(|s| s.as_str()) != Some("127.0.0.1") {
-                eprintln!("[DnsAdapter] 警告: 修改网卡 DNS 后回读未立即生效，可能受外部安全软件拦截");
-            }
+        let (automatic, current_dns) = get_interface_dns_info(&alias).await?;
+        if automatic || current_dns.first().map(|s| s.as_str()) != Some("127.0.0.1") {
+            return Err("网卡 DNS 回读未确认护航生效，已保留恢复记录，请重试或恢复 DNS".into());
         }
 
         Ok(())
@@ -211,7 +154,7 @@ pub async fn restore_dns_guard() -> Result<(), String> {
             return Ok(());
         }
 
-        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
         let record: DnsAdapterRecovery = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
 
         let alias = &record.interface_alias;
@@ -231,11 +174,11 @@ pub async fn restore_dns_guard() -> Result<(), String> {
             if prim_res.is_ok() {
                 for (idx, secondary) in record.static_dns.iter().skip(1).enumerate() {
                     let index_arg = format!("index={}", idx + 2);
-                    let _ = run_hidden_cmd_async(
+                    run_hidden_cmd_async(
                         "netsh",
                         &["interface", "ipv4", "add", "dnsservers", &format!("name={}", alias), secondary, &index_arg],
                         4
-                    ).await;
+                    ).await.map_err(|e| format!("恢复备用 DNS 失败：{e}；已保留恢复记录"))?;
                 }
             }
             prim_res
@@ -247,19 +190,38 @@ pub async fn restore_dns_guard() -> Result<(), String> {
 
         let _ = run_hidden_cmd_async("ipconfig", &["/flushdns"], 4).await;
 
-        // 回读核验：确认首选 DNS 不再是 127.0.0.1 后，才安全删除凭据文件
-        if let Ok((_, current_servers)) = get_interface_dns_info(alias).await {
-            if current_servers.first().map(|s| s.as_str()) == Some("127.0.0.1") {
-                return Err("已尝试恢复 DNS，但回读网卡仍为 127.0.0.1，保留恢复凭证以便再次恢复".into());
-            }
-        }
-
-        let _ = std::fs::remove_file(&path);
+        let (automatic, current_servers) = get_interface_dns_info(alias).await?;
+        verify_restored(&record, automatic, &current_servers)?;
+        tokio::fs::remove_file(&path).await.map_err(|_| "DNS 已恢复，但恢复记录清理失败，请重试")?;
         Ok(())
     }
     #[cfg(not(windows))]
     {
         Ok(())
+    }
+}
+
+fn verify_restored(record: &DnsAdapterRecovery, automatic: bool, servers: &[String]) -> Result<(), String> {
+    let expected_automatic = record.was_dhcp || record.static_dns.is_empty();
+    if automatic != expected_automatic || (!expected_automatic && servers != record.static_dns)
+        || servers.first().is_some_and(|ip| ip == "127.0.0.1") {
+        return Err("DNS 回读与恢复目标不一致，已保留恢复记录，请重试".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn performance_restoration_requires_mode_and_all_static_servers() {
+        let mut record = DnsAdapterRecovery { interface_alias: "test".into(), was_dhcp: false, static_dns: vec!["1.1.1.1".into(), "8.8.8.8".into()] };
+        assert!(verify_restored(&record, false, &record.static_dns).is_ok());
+        assert!(verify_restored(&record, false, &record.static_dns[..1]).is_err());
+        assert!(verify_restored(&record, true, &record.static_dns).is_err());
+        record.was_dhcp = true;
+        assert!(verify_restored(&record, true, &["192.0.2.1".into()]).is_ok());
+        assert!(verify_restored(&record, true, &["127.0.0.1".into()]).is_err());
     }
 }
 
@@ -283,10 +245,11 @@ pub async fn auto_recover_dns_on_startup() {
 pub async fn emergency_repair_network() -> Result<String, String> {
     #[cfg(windows)]
     {
+        let _lifecycle = super::process::LIFECYCLE.lock().await;
         let _guard = ADAPTER_LOCK.lock().await;
 
         // 1. 强制重置系统代理
-        let _ = super::sysproxy::reset_system_proxy_emergency();
+        super::sysproxy::reset_system_proxy_emergency()?;
 
         // 2. 尝试将主要网卡复位为 DHCP
         if let Ok(alias) = get_active_interface_alias().await {
@@ -306,7 +269,7 @@ pub async fn emergency_repair_network() -> Result<String, String> {
         // 4. 刷新 DNS 缓存
         let _ = run_hidden_cmd_async("ipconfig", &["/flushdns"], 4).await;
 
-        Ok("网络急救完成：已将网卡 DNS 恢复为自动获取 (DHCP)，并清除系统代理。".into())
+        Ok("网络急救完成：已尝试将网卡 DNS 恢复为自动获取 (DHCP)，并释放本程序接管的系统代理；其他代理配置保持不变。".into())
     }
     #[cfg(not(windows))]
     {
@@ -316,6 +279,8 @@ pub async fn emergency_repair_network() -> Result<String, String> {
 
 #[tauri::command]
 pub async fn toggle_dns_guard(enable: bool) -> Result<bool, String> {
+    let _lifecycle = super::process::LIFECYCLE.lock().await;
+    if crate::shutdown::in_progress() { return Err("正在恢复网络并退出，请稍候".into()); }
     if enable {
         enable_dns_guard().await?;
         Ok(true)

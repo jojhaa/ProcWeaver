@@ -169,6 +169,7 @@ pub fn ensure_bt_pt_and_proxy_group(raw: &str) -> Result<String, String> {
                     && trimmed != "REJECT"
                     && trimmed != "GLOBAL"
                     && trimmed != "PROXY"
+                    && !trimmed.starts_with(super::foreign_targets::PREFIX)
                 {
                     valid_nodes.push(trimmed.to_string());
                 }

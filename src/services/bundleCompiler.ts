@@ -13,7 +13,7 @@ class BundleApplyError extends Error {
 }
 
 // 旧版本只有名称：只允许在当前订阅中唯一解析一次。已保存身份失效时必须显式重绑定。
-export function resolveBundleTargets(instances: BundleLocalInstance[], targets: RoutingTarget[]): BundleLocalInstance[] {
+export function resolveBundleTargets(instances: BundleLocalInstance[], targets: RoutingTarget[], preserved: RoutingTarget[] = []): BundleLocalInstance[] {
   return instances.map(instance => {
     const next = { ...instance, slotTargets: { ...instance.slotTargets } };
     if (!instance.enabled || !instance.slotBindings.main) return next;
@@ -21,7 +21,8 @@ export function resolveBundleTargets(instances: BundleLocalInstance[], targets: 
       const name = instance.slotBindings[slot];
       if (!name || name === "FOLLOW_MAIN") continue;
       const stored = instance.slotTargets?.[slot];
-      const matches = targets.filter(t => t.name === name && (!stored || sameTarget(t, stored)));
+      const candidates = stored ? [...targets, ...preserved.filter(t => !targets.some(current => sameTarget(t, current)))] : targets;
+      const matches = candidates.filter(t => t.name === name && (!stored || sameTarget(t, stored)));
       if (matches.length !== 1) {
         throw new BundleApplyError(`「${instance.definition.packageName}」的${slot === "main" ? "主业务" : "DNS"}出口「${name}」已失效或不唯一，请重新绑定`, [instance.instanceId]);
       }
@@ -85,8 +86,9 @@ export function compileBundlesToDnsRules(instances: BundleLocalInstance[]): DnsR
       if (duplicate) { owners.get(duplicate.id)!.push(instance); continue; }
       const id = `bundle-dns-${instance.instanceId}-${domainKind}-${domain}`;
       owners.set(id, [instance]);
+      // 业务 DNS 随所选出口出站；使用 IP DoH 避免解析器主机名的额外引导查询。
       rules.push({ id, enabled: true,
-        domainKind, domain, resolverUrl: "https://dns.alidns.com/dns-query", target });
+        domainKind, domain, resolverUrl: "https://1.1.1.1/dns-query", target });
     }
   }
   return rules;
@@ -129,7 +131,7 @@ export async function syncBundlesToCore(instances: BundleLocalInstance[], api: P
   let view: RoutingView | undefined;
   try {
     view = await api.read();
-    const resolved = resolveBundleTargets(instances, view.targets);
+    const resolved = resolveBundleTargets(instances, view.targets, view.preservedTargets);
     const processes = compileBundlesToProcessRules(resolved);
     const dns = compileBundlesToDnsRules(resolved);
     const existing = view.config;
@@ -148,6 +150,11 @@ export async function syncBundlesToCore(instances: BundleLocalInstance[], api: P
       processRules: [...processes, ...manualProcesses], dnsRules: [...dns, ...manualDns],
       bundles,
     };
+    // 已保存业务规则的自动恢复/迁移不重新开启总开关；首次配置和显式应用仍可开启。
+    if (restoring) {
+      if (existing.processRules.some(r => r.id.startsWith("bundle-"))) next.processEnabled = existing.processEnabled;
+      if (existing.dnsRules.some(r => r.id.startsWith("bundle-dns-"))) next.dnsEnabled = existing.dnsEnabled;
+    }
     // 重开时已有相同规则则尊重用户手动关闭的总开关；显式应用才重新开启。
     if (restoring && ruleSignature(existing.processRules) === ruleSignature(next.processRules) &&
       ruleSignature(existing.dnsRules) === ruleSignature(next.dnsRules) && routeSignature(existing.bundles) === routeSignature(next.bundles)) {

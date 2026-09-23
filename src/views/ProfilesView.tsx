@@ -4,7 +4,6 @@ import {
   getProfiles,
   addProfile,
   updateProfile,
-  selectProfile,
   deleteProfile,
   editProfileMetadata,
   getProfileContent,
@@ -29,6 +28,8 @@ import {
   X,
 } from "lucide-react";
 import QRCode from "qrcode";
+import { useProfileSwitch } from "../hooks/useProfileSwitch";
+import { ProfileSwitchDialog } from "../components/ProfileSwitchDialog";
 
 // 格式化字节为易读格式 (GB / MB / KB)
 function formatBytes(bytes?: number): string {
@@ -51,6 +52,7 @@ function formatExpireDate(expire?: number): string {
 }
 
 export const ProfilesView: React.FC = () => {
+  const profileSwitch = useProfileSwitch();
   const [profiles, setProfiles] = useState<ProfileItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
@@ -164,7 +166,7 @@ export const ProfilesView: React.FC = () => {
   const handleSelect = async (id: string) => {
     setActionLoading(`sel_${id}`);
     try {
-      await selectProfile(id);
+      if (!await profileSwitch.requestSwitch(id)) return;
       showNotification("已切换并应用该订阅配置");
       await loadData();
       window.dispatchEvent(new CustomEvent("procweaver-profile-changed"));
@@ -791,6 +793,7 @@ export const ProfilesView: React.FC = () => {
           </div>
         </div>
       )}
+      <ProfileSwitchDialog state={profileSwitch.state} actions={profileSwitch.actions} />
     </div>
   );
 };

@@ -102,7 +102,9 @@ pub async fn run_arbiter() {
             .as_secs();
 
         // 获取系统当前活跃进程快照
-        let tracker_processes = crate::routing_overrides::native::snapshot().unwrap_or_default();
+        // Arbitration needs executable names only; do not open every process or read paths.
+        let tracker_processes = tokio::task::spawn_blocking(crate::routing_overrides::native::process_list)
+            .await.ok().and_then(Result::ok).unwrap_or_default();
         let mut game_found = false;
 
         // 收集所有需要升维的目标游戏名（包括预设高阶游戏与用户在游戏业务通道中自定义的进程）

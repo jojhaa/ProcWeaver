@@ -5,13 +5,11 @@ import { fetchProxies, switchProxy, testDelay, getPreferredSpeedTestUrl } from "
 import { logInfo, logWarn, logError } from "../api/logs";
 import {
   getSmartGroups,
-  saveSmartGroups,
   syncSmartGroupsToCore,
   getProfiles,
   addProfile,
   updateProfile,
   deleteProfile,
-  selectProfile,
 } from "../api";
 import {
   probeNodeHealthBatch,
@@ -19,6 +17,8 @@ import {
   savePersistedHealthCache,
   getPersistedNodeRegions,
   savePersistedNodeRegions,
+  flushHealthCache,
+  flushNodeRegions,
   getIgnoredNodes,
   saveIgnoredNodes,
 } from "../api/nodeHealth";
@@ -34,6 +34,11 @@ import {
 import { setGlobalTrayGroups } from "../hooks/useTrayManager";
 import { buildCategorizedTrayGroups, RawNodeForTray } from "../utils/trayGroups";
 import { SmartGroupModal } from "../components/SmartGroupModal";
+import { VirtualGrid, VirtualGridScroller } from "../components/VirtualGrid";
+import { createBatchUpdates } from "../utils/batchUpdates";
+import { useDebouncedValue } from "../hooks/useDebouncedValue";
+import { useProfileSwitch } from "../hooks/useProfileSwitch";
+import { ProfileSwitchDialog } from "../components/ProfileSwitchDialog";
 import {
   Search,
   RefreshCw,
@@ -41,6 +46,7 @@ import {
   Radio,
   Zap,
   Link2,
+  Pencil,
   Trash2,
   CheckSquare,
   Square,
@@ -64,13 +70,31 @@ function formatBytes(bytes?: number): string {
   return `${parseFloat(val.toFixed(1))} ${sizes[i]}`;
 }
 
-export const LinesManagementView: React.FC = () => {
+export const LinesManagementView: React.FC = React.memo(() => {
+  const profileSwitch = useProfileSwitch();
   const [groups, setGroups] = useState<ProxyGroup[]>([]);
   const [proxies, setProxies] = useState<Record<string, ProxyItem>>({});
   const [delayMap, setDelayMap] = useState<Record<string, number | null>>({});
   const [testingAll, setTestingAll] = useState(false);
   const [testingNodes, setTestingNodes] = useState<Record<string, boolean>>({});
   const [searchKeyword, setSearchKeyword] = useState("");
+  const search = useDebouncedValue(searchKeyword, 180);
+  const pendingBatches = useRef(new Set<() => void>());
+  const pendingJobs = useRef(new Set<AbortController>());
+  useEffect(() => {
+    const flush = () => {
+      pendingBatches.current.forEach(commit => commit());
+      flushNodeRegions();
+      void flushHealthCache().catch(error => logError("IP健康", `保存体检缓存失败：${String(error)}`));
+    };
+    const hidden = () => { if (document.hidden) flush(); };
+    document.addEventListener("visibilitychange", hidden);
+    return () => {
+      pendingJobs.current.forEach(job => job.abort()); pendingJobs.current.clear();
+      flush(); pendingBatches.current.clear();
+      document.removeEventListener("visibilitychange", hidden);
+    };
+  }, []);
   const [hideTimeout, setHideTimeout] = useState<boolean>(() => {
     try {
       const saved = localStorage.getItem("netbox_hide_timeout_nodes");
@@ -85,9 +109,11 @@ export const LinesManagementView: React.FC = () => {
   const [smartRules, setSmartRules] = useState<SmartGroupRule[]>([]);
   const [smartModalOpen, setSmartModalOpen] = useState(false);
   const [editingRule, setEditingRule] = useState<SmartGroupRule | null>(null);
+  const smartTrigger = useRef<HTMLButtonElement | null>(null);
 
   // 节点多选打包
   const [selectedNodes, setSelectedNodes] = useState<string[]>([]);
+  const selectedSet = useMemo(() => new Set(selectedNodes), [selectedNodes]);
   const [packModalType, setPackModalType] = useState<"url-test" | "relay" | null>(null);
   const [packName, setPackName] = useState("");
 
@@ -133,6 +159,8 @@ export const LinesManagementView: React.FC = () => {
   const [healthCache, setHealthCache] = useState<Record<string, IpHealthInfo>>({});
   const [probingNodes, setProbingNodes] = useState<Record<string, boolean>>({});
   const [probingAll, setProbingAll] = useState(false);
+  const singleProbeBusy = useRef(false);
+  const anySingleProbe = Object.values(probingNodes).some(Boolean);
   const [probeProgress, setProbeProgress] = useState<{ completed: number; total: number } | null>(null);
 
   // 节点归属国家/地区持久化字典 (nodeName -> "🇯🇵 日本")
@@ -140,6 +168,7 @@ export const LinesManagementView: React.FC = () => {
 
   // 用户主动忽略的节点名称列表 (本地持久化)
   const [ignoredNodes, setIgnoredNodes] = useState<string[]>(() => getIgnoredNodes());
+  const ignoredSet = useMemo(() => new Set(ignoredNodes), [ignoredNodes]);
   const [showIgnoredDrawer, setShowIgnoredDrawer] = useState(false);
 
   // 初始加载
@@ -180,7 +209,12 @@ export const LinesManagementView: React.FC = () => {
 
   useEffect(() => {
     loadData();
-    const handleProfileChange = () => loadData();
+    const handleProfileChange = () => {
+      pendingJobs.current.forEach(job => job.abort());
+      pendingBatches.current.forEach(flush => flush());
+      setTestingNodes({});
+      void loadData();
+    };
     const handleHealthUpdated = (e: any) => {
       const { node, health } = e.detail || {};
       if (node && health) {
@@ -215,6 +249,10 @@ export const LinesManagementView: React.FC = () => {
 
   const realNodeNames = useMemo(() => realNodes.map((n) => n.name), [realNodes]);
   const smartFallbackOptions = useMemo(() => ["DIRECT", "REJECT", ...realNodeNames], [realNodeNames]);
+  const smartCounts = useMemo(() => Object.fromEntries(smartRules.map(rule => [rule.id,
+    rule.type === "relay" ? (rule.relayEntry && rule.relayExit ? 2 : 0)
+      : rule.nodeSelectionMode === "manual" ? rule.manualNodes?.length || 0 : filterAndSortProxies(realNodeNames, rule, healthCache, delayMap).length,
+  ])), [smartRules, realNodeNames, healthCache, delayMap]);
 
   // 从所有节点中提炼账号订阅状态 (剩余流量、套餐到期日、重置倒计时)
   const subMeta = useMemo(() => {
@@ -258,6 +296,7 @@ export const LinesManagementView: React.FC = () => {
   const handleTestAll = async () => {
     if (testingAll || realNodes.length === 0) return;
     setTestingAll(true);
+    const job = new AbortController(); pendingJobs.current.add(job);
     const targetNodes = realNodes.map((n) => n.name);
     const concurrency = getStoredConcurrency();
     const testEndpoint = getPreferredSpeedTestUrl() || "https://cp.cloudflare.com/generate_204";
@@ -273,17 +312,28 @@ export const LinesManagementView: React.FC = () => {
     let totalDelay = 0;
     let fastestNode = "";
     let fastestDelay = Infinity;
+    const batch = createBatchUpdates<{ node: string; testing: boolean; delay?: number | null }>(results => {
+      const statuses: Record<string, boolean> = {}, delays: Record<string, number | null> = {};
+      for (const result of results) {
+        statuses[result.node] = result.testing;
+        if (result.delay !== undefined) delays[result.node] = result.delay;
+      }
+      setTestingNodes(previous => ({ ...previous, ...statuses }));
+      if (Object.keys(delays).length) setDelayMap(previous => ({ ...previous, ...delays }));
+    });
+    pendingBatches.current.add(batch.flush);
 
     // 分批受控并发测速（使用用户设置的并发度，防止 20000ms 超时）
     const queue = [...targetNodes];
     const runWorker = async () => {
-      while (queue.length > 0) {
+      while (queue.length > 0 && !job.signal.aborted) {
         const node = queue.shift();
         if (!node) break;
-        setTestingNodes((prev) => ({ ...prev, [node]: true }));
+        batch.add({ node, testing: true });
         try {
           const delay = await testDelay(node, testEndpoint, 3000);
-          setDelayMap((prev) => ({ ...prev, [node]: delay }));
+          if (job.signal.aborted) break;
+          batch.add({ node, testing: false, delay });
           if (delay !== null && delay !== undefined) {
             successCount++;
             totalDelay += delay;
@@ -295,16 +345,20 @@ export const LinesManagementView: React.FC = () => {
             timeoutCount++;
           }
         } catch {
-          setDelayMap((prev) => ({ ...prev, [node]: null }));
+          if (job.signal.aborted) break;
+          batch.add({ node, testing: false, delay: null });
           timeoutCount++;
         } finally {
-          setTestingNodes((prev) => ({ ...prev, [node]: false }));
+          if (!job.signal.aborted) batch.add({ node, testing: false });
         }
       }
     };
 
     const workers = Array.from({ length: Math.min(concurrency, queue.length) }, () => runWorker());
     await Promise.all(workers);
+    batch.flush();
+    pendingBatches.current.delete(batch.flush);
+    pendingJobs.current.delete(job);
     setTestingAll(false);
 
     const costBatchMs = Math.round(performance.now() - startBatchTime);
@@ -313,14 +367,14 @@ export const LinesManagementView: React.FC = () => {
 
     logInfo(
       "批量测速",
-      `批量测速全部完成 [总耗时: ${costBatchMs}ms]: 成功 ${successCount} 个, 超时 ${timeoutCount} 个 | ${fastestSummary} | 平均延迟: ${avgDelay}ms`
+      `批量测速${job.signal.aborted ? "已停止" : "全部完成"} [总耗时: ${costBatchMs}ms]: 成功 ${successCount} 个, 超时 ${timeoutCount} 个 | ${fastestSummary} | 平均延迟: ${avgDelay}ms`
     );
   };
 
   // 单节点测速
   const handleTestNode = async (name: string, e?: React.MouseEvent) => {
     e?.stopPropagation();
-    if (testingNodes[name]) return;
+    if (testingAll || testingNodes[name]) return;
     setTestingNodes((prev) => ({ ...prev, [name]: true }));
     const testEndpoint = getPreferredSpeedTestUrl() || "https://cp.cloudflare.com/generate_204";
     logInfo("节点测速", `发起单节点延迟测速: [${name}] -> 目标: ${testEndpoint}`);
@@ -351,7 +405,8 @@ export const LinesManagementView: React.FC = () => {
   // 单节点深度 IP 体检 (体检完成立即将真实出口国家持久化)
   const handleProbeHealth = async (name: string, e?: React.MouseEvent) => {
     e?.stopPropagation();
-    if (probingNodes[name]) return;
+    if (probingAll || singleProbeBusy.current) return;
+    singleProbeBusy.current = true;
     setProbingNodes((prev) => ({ ...prev, [name]: true }));
     logInfo("IP健康", `发起单节点深度体检: [${name}]`);
     try {
@@ -362,7 +417,7 @@ export const LinesManagementView: React.FC = () => {
       if (resultItem) {
         const next = { ...healthCache, [name]: resultItem };
         setHealthCache(next);
-        savePersistedHealthCache(next, true);
+        await savePersistedHealthCache(next, true);
 
         // 核心：一旦获得真实出口 IP，即刻根据权威国家归类并持久化锁定！
         const realRegion = formatCountryRegionTitle(
@@ -386,6 +441,7 @@ export const LinesManagementView: React.FC = () => {
       console.error("单节点体检失败:", err);
       logError("IP健康", `节点 [${name}] 深度体检失败: ${err?.message || String(err)}`);
     } finally {
+      singleProbeBusy.current = false;
       setProbingNodes((prev) => ({ ...prev, [name]: false }));
     }
   };
@@ -393,9 +449,10 @@ export const LinesManagementView: React.FC = () => {
   // 全量 IP 纯净体检与真实地区重排
   const handleProbeAllHealth = async () => {
     const targetNames = realNodes.map((n) => n.name);
-    if (targetNames.length === 0 || probingAll) return;
+    if (targetNames.length === 0 || probingAll || singleProbeBusy.current) return;
 
     setProbingAll(true);
+    const job = new AbortController(); pendingJobs.current.add(job);
     setProbeProgress({ completed: 0, total: targetNames.length });
 
     const probeConcurrency = getStoredHealthProbeConcurrency();
@@ -406,34 +463,46 @@ export const LinesManagementView: React.FC = () => {
     const startAllTime = performance.now();
     let successCount = 0;
 
-    let currentCache = { ...healthCache };
-    let currentRegions = { ...persistedNodeRegions };
+    const currentCache = { ...healthCache };
+    const currentRegions = { ...persistedNodeRegions };
+    const batch = createBatchUpdates<{ node: string; result: IpHealthInfo | null; completed: number; total: number }>(results => {
+      let changed = false;
+      for (const { node, result } of results) if (result) {
+        currentCache[node] = result;
+        currentRegions[node] = formatCountryRegionTitle(result.countryCode, result.country);
+        changed = true;
+      }
+      const last = results[results.length - 1];
+      setProbeProgress({ completed: last.completed, total: last.total });
+      if (changed) {
+        const cache = { ...currentCache }, regions = { ...currentRegions };
+        setHealthCache(cache); setPersistedNodeRegions(regions);
+        void savePersistedHealthCache(cache);
+        savePersistedNodeRegions(regions);
+      }
+    });
+    pendingBatches.current.add(batch.flush);
 
     try {
       await probeNodeHealthBatch(targetNames, (node, result, completed, total) => {
-        setProbeProgress({ completed, total });
-        if (result) {
-          successCount++;
-          currentCache = { ...currentCache, [node]: result };
-          setHealthCache({ ...currentCache });
-          savePersistedHealthCache(currentCache);
-
-          // 核心：体检完一个节点，立即锁定其真实出口地区并持久化
-          const realRegion = formatCountryRegionTitle(result.countryCode, result.country);
-          currentRegions = { ...currentRegions, [node]: realRegion };
-          setPersistedNodeRegions({ ...currentRegions });
-          savePersistedNodeRegions(currentRegions);
-        }
-      });
+        if (result) successCount++;
+        batch.add({ node, result, completed, total });
+      }, job.signal);
       const costMs = Math.round(performance.now() - startAllTime);
       logInfo(
         "IP健康",
-        `全量节点深度体检完成 [总耗时: ${costMs}ms]: 成功获取画像 ${successCount}/${targetNames.length} 个节点`
+        `全量节点深度体检${job.signal.aborted ? "已停止" : "完成"} [总耗时: ${costMs}ms]: 成功获取画像 ${successCount}/${targetNames.length} 个节点`
       );
     } catch (err: any) {
       console.error("全量 IP 健康体检出错:", err);
       logError("IP健康", `全量 IP 健康体检异常中断: ${err?.message || String(err)}`);
     } finally {
+      batch.flush();
+      pendingBatches.current.delete(batch.flush);
+      pendingJobs.current.delete(job);
+      try { if (!job.signal.aborted) await savePersistedHealthCache({ ...currentCache }, true); }
+      catch (error) { logError("IP健康", `保存体检结果失败：${String(error)}`); }
+      if (!job.signal.aborted) savePersistedNodeRegions({ ...currentRegions }, true);
       setProbingAll(false);
       setProbeProgress(null);
     }
@@ -536,7 +605,7 @@ export const LinesManagementView: React.FC = () => {
         tolerance: r.tolerance,
       };
     });
-    await syncSmartGroupsToCore(specs);
+    await syncSmartGroupsToCore(specs, undefined, rules);
   };
 
   // 打包为优选组或中继
@@ -558,7 +627,6 @@ export const LinesManagementView: React.FC = () => {
       };
 
       const updated = [...smartRules, newRule];
-      await saveSmartGroups(updated);
       await syncRules(updated);
       setSmartRules(updated);
       setSelectedNodes([]);
@@ -574,7 +642,6 @@ export const LinesManagementView: React.FC = () => {
   const handleDeleteSmartRule = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     const updated = smartRules.filter((r) => r.id !== id);
-    await saveSmartGroups(updated);
     await syncRules(updated);
     setSmartRules(updated);
   };
@@ -634,7 +701,7 @@ export const LinesManagementView: React.FC = () => {
     if (profiles.find(profile => profile.id === id)?.isSelected) return;
     await runSubscriptionAction(async () => {
       setSwitchingProfileId(id);
-      if (!await selectProfile(id)) throw new Error("订阅未能应用，请重试");
+      if (!await profileSwitch.requestSwitch(id)) return;
       // The backend has applied the configuration; never switch this marker optimistically.
       setProfiles(current => current.map(profile => ({ ...profile, isSelected: profile.id === id })));
       setSelectedNodes([]);
@@ -656,10 +723,10 @@ export const LinesManagementView: React.FC = () => {
     return realNodes
       .filter((n) => {
         // 排除用户主动忽略的节点
-        if (ignoredNodes.includes(n.name)) {
+        if (ignoredSet.has(n.name)) {
           return false;
         }
-        if (searchKeyword && !n.name.toLowerCase().includes(searchKeyword.toLowerCase())) {
+        if (search && !n.name.toLowerCase().includes(search.toLowerCase())) {
           return false;
         }
         const delay = delayMap[n.name] ?? n.history?.[n.history.length - 1]?.delay ?? null;
@@ -676,7 +743,7 @@ export const LinesManagementView: React.FC = () => {
         if (sortBy === "name-asc") return a.name.localeCompare(b.name);
         return 0;
       });
-  }, [realNodes, searchKeyword, hideTimeout, sortBy, delayMap]);
+  }, [realNodes, search, hideTimeout, sortBy, delayMap, ignoredSet]);
 
   // 按地区自动归类：优先使用基于真实 IP 体检的持久化结果，未体检的归入待确认真实出口
   const { regionGroups, unprobedCount } = useMemo(() => {
@@ -824,7 +891,7 @@ export const LinesManagementView: React.FC = () => {
           <button
             type="button"
             onClick={handleProbeAllHealth}
-            disabled={probingAll || realNodes.length === 0}
+            disabled={probingAll || anySingleProbe || realNodes.length === 0}
             className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-purple-50 hover:bg-purple-100 text-purple-700 dark:bg-purple-600/15 dark:hover:bg-purple-600/25 dark:text-purple-300 border border-purple-200 dark:border-purple-800/60 text-xs font-semibold transition shadow-2xs disabled:opacity-50 cursor-pointer"
             title="通过真实出口检测各个节点的实际落地国家、原生性与欺诈风险并持久化归类"
           >
@@ -872,7 +939,8 @@ export const LinesManagementView: React.FC = () => {
           {/* 新建智能线路 */}
           <button
             type="button"
-            onClick={() => {
+            onClick={(event) => {
+              smartTrigger.current = event.currentTarget;
               setEditingRule(null);
               setSmartModalOpen(true);
             }}
@@ -885,7 +953,7 @@ export const LinesManagementView: React.FC = () => {
       </div>
 
       {/* 主工作区滚动面板 */}
-      <div className="flex-1 overflow-y-auto p-6 space-y-6">
+      <VirtualGridScroller className="flex-1 min-h-0 overflow-y-auto p-6 space-y-6" resetKey={`${search}:${hideTimeout}`}>
         {/* 节点订阅账号状态看板 (由伪节点提炼为纯净看板) */}
         {(subMeta.remainingTraffic || subMeta.expireDate || subMeta.resetDays) && (
           <div className="p-3.5 rounded-2xl bg-gradient-to-r from-indigo-500/10 via-purple-500/10 to-sky-500/10 border border-indigo-200/80 dark:border-indigo-500/30 flex flex-wrap items-center justify-between gap-3 shadow-2xs">
@@ -943,13 +1011,7 @@ export const LinesManagementView: React.FC = () => {
               {smartRules.map((rule) => {
                 const isRelay = rule.type === "relay";
                 const isActive = activeNodeName === rule.name;
-                const matchedCount = isRelay
-                  ? rule.relayEntry && rule.relayExit
-                    ? 2
-                    : 0
-                  : rule.nodeSelectionMode === "manual"
-                  ? rule.manualNodes?.length || 0
-                  : filterAndSortProxies(realNodeNames, rule, healthCache, delayMap).length;
+                const matchedCount = smartCounts[rule.id] || 0;
 
                 return (
                   <div
@@ -988,6 +1050,20 @@ export const LinesManagementView: React.FC = () => {
                               点击启用
                             </span>
                           )}
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              smartTrigger.current = e.currentTarget;
+                              setEditingRule(rule);
+                              setSmartModalOpen(true);
+                            }}
+                            title="编辑该自建线路"
+                            aria-label={`编辑自建线路：${rule.name}`}
+                            className="p-1 rounded-md text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 dark:hover:bg-indigo-500/10 transition"
+                          >
+                            <Pencil className="w-3.5 h-3.5" />
+                          </button>
                           <button
                             type="button"
                             onClick={(e) => {
@@ -1063,7 +1139,7 @@ export const LinesManagementView: React.FC = () => {
               <button
                 type="button"
                 onClick={handleProbeAllHealth}
-                disabled={probingAll}
+                disabled={probingAll || anySingleProbe}
                 className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold transition shadow-xs cursor-pointer shrink-0"
               >
                 <Shield className="w-3.5 h-3.5" />
@@ -1110,9 +1186,8 @@ export const LinesManagementView: React.FC = () => {
                     )}
                   </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2.5">
-                    {nodes.map((node) => {
-                      const isSelected = selectedNodes.includes(node.name);
+                  <VirtualGrid items={nodes} itemKey={node => node.name} label={`${regionTitle}节点`} renderItem={(node) => {
+                      const isSelected = selectedSet.has(node.name);
                       const isActive = activeNodeName === node.name;
                       const delay = delayMap[node.name] ?? node.history?.[node.history.length - 1]?.delay ?? null;
                       const isTesting = testingNodes[node.name];
@@ -1125,7 +1200,7 @@ export const LinesManagementView: React.FC = () => {
                         <div
                           key={node.name}
                           onClick={() => handleSelectProxy(node.name)}
-                          className={`p-3 rounded-2xl border transition-all cursor-pointer relative group flex flex-col justify-between select-none ${
+                          className={`h-full p-3 rounded-2xl border transition-colors cursor-pointer relative group flex flex-col justify-between select-none ${
                             isActive
                               ? "bg-emerald-50/80 border-emerald-500 dark:bg-emerald-600/15 dark:border-emerald-500 shadow-xs ring-1 ring-emerald-500/50"
                               : isSelected
@@ -1233,7 +1308,7 @@ export const LinesManagementView: React.FC = () => {
                               <button
                                 type="button"
                                 onClick={(e) => handleProbeHealth(node.name, e)}
-                                disabled={isProbing}
+                                disabled={isProbing || probingAll || anySingleProbe}
                                 title="单节点 IP 深度体检并锁定真实出口国家"
                                 className="p-1 rounded-md text-slate-400 hover:text-purple-600 hover:bg-purple-50 dark:hover:bg-purple-950/40 transition cursor-pointer"
                               >
@@ -1253,8 +1328,7 @@ export const LinesManagementView: React.FC = () => {
                           </div>
                         </div>
                       );
-                    })}
-                  </div>
+                    }} />
                 </div>
               ))}
             </div>
@@ -1315,7 +1389,7 @@ export const LinesManagementView: React.FC = () => {
             </div>
           )}
         </div>
-      </div>
+      </VirtualGridScroller>
 
       {/* 底部悬浮操作栏：当勾选多节点时出现 */}
       {selectedNodes.length >= 2 && (
@@ -1578,22 +1652,22 @@ export const LinesManagementView: React.FC = () => {
       {/* 新建/编辑智能线路高级弹窗 */}
       <SmartGroupModal
         isOpen={smartModalOpen}
-        onClose={() => setSmartModalOpen(false)}
+        onClose={() => { setSmartModalOpen(false); smartTrigger.current?.focus(); }}
         editingRule={editingRule}
         allProxyNames={realNodeNames}
         fallbackOptions={smartFallbackOptions}
+        otherSmartGroupNames={smartRules.filter(rule => rule.id !== editingRule?.id).map(rule => rule.name)}
         onSave={async (savedRule) => {
           const exists = smartRules.some((r) => r.id === savedRule.id);
           const next = exists
             ? smartRules.map((r) => (r.id === savedRule.id ? savedRule : r))
             : [...smartRules, savedRule];
-          await saveSmartGroups(next);
           await syncRules(next);
           setSmartRules(next);
-          setSmartModalOpen(false);
-          loadData();
+          void loadData();
         }}
       />
+      <ProfileSwitchDialog state={profileSwitch.state} actions={profileSwitch.actions} />
     </div>
   );
-};
+});

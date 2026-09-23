@@ -1,4 +1,6 @@
 use serde_json::Value;
+mod monitor;
+pub(crate) fn invalidate_monitor_types() { monitor::invalidate(); }
 
 fn is_proxy_connection(leaf: &str, kind: &str) -> bool {
     !leaf.is_empty() && !kind.is_empty()
@@ -7,22 +9,8 @@ fn is_proxy_connection(leaf: &str, kind: &str) -> bool {
 }
 
 #[tauri::command]
-pub async fn get_traffic_snapshot(state: tauri::State<'_, super::process::CoreStateMutex>) -> Result<Value, String> {
-    let epoch = state.lock().map_err(|_| "读取核心状态失败")?.child.as_ref().map(|child| child.id());
-    let client = controller_client().timeout(std::time::Duration::from_secs(3)).build().map_err(|_| "统计客户端初始化失败")?;
-    let base = base_url()?;
-    let connections = client.get(format!("{base}/connections")).send().await.map_err(|_| "读取流量统计失败")?
-        .error_for_status().map_err(|_| "内核拒绝统计请求")?.json::<Value>().await.map_err(|_| "统计响应无效")?;
-    let proxies = client.get(format!("{base}/proxies")).send().await.map_err(|_| "读取出站类型失败")?
-        .error_for_status().map_err(|_| "内核拒绝出站类型请求")?.json::<Value>().await.map_err(|_| "出站类型响应无效")?;
-    // 仅返回统计字段；不向 UI 下发连接中的域名、进程路径、来源地址等信息。
-    let entries: Vec<_> = connections["connections"].as_array().into_iter().flatten().map(|c| {
-        let leaf = c["chains"][0].as_str().unwrap_or("");
-        let kind = proxies["proxies"][leaf]["type"].as_str().unwrap_or("").to_ascii_lowercase();
-        let proxied = is_proxy_connection(leaf, &kind);
-        serde_json::json!({"id": c["id"], "upload": c["upload"], "download": c["download"], "proxied": proxied})
-    }).collect();
-    Ok(serde_json::json!({"epoch": epoch, "uploadTotal": connections["uploadTotal"], "downloadTotal": connections["downloadTotal"], "connections": entries}))
+pub async fn get_traffic_snapshot(state: tauri::State<'_, super::process::CoreStateMutex>, include_connections: Option<bool>) -> Result<Value, String> {
+    monitor::snapshot(&state, include_connections.unwrap_or(false)).await
 }
 
 /// 本地控制接口必须直连，避免系统代理形成回环或返回代理网关错误。

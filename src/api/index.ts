@@ -5,6 +5,11 @@ export const isTauri = () => {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 };
 
+export async function getWindowMonitorVisible(): Promise<boolean> {
+  if (!isTauri()) return true;
+  return invokeTauri<boolean>("window_monitor_visible");
+}
+
 async function invokeTauri<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   if (isTauri()) {
     const { invoke } = await import("@tauri-apps/api/core");
@@ -138,9 +143,9 @@ export async function updateProfile(id: string): Promise<ProfileItem> {
   return found;
 }
 
-export async function selectProfile(id: string): Promise<boolean> {
+export async function selectProfile(id: string, bindingDecision?: import("./profileSwitch").BindingDecision): Promise<boolean> {
   if (isTauri()) {
-    return await invokeTauri<boolean>("select_profile", { id });
+    return await invokeTauri<boolean>("select_profile", { id, bindingDecision: bindingDecision ?? null });
   }
   const list = await getProfiles();
   list.forEach(p => p.isSelected = (p.id === id));
@@ -244,11 +249,14 @@ export interface SmartGroupInjectSpec {
 
 export async function syncSmartGroupsToCore(
   groups: SmartGroupInjectSpec[],
-  channels?: import("../types/smartGroup").BusinessChannelConfig[]
+  channels?: import("../types/smartGroup").BusinessChannelConfig[],
+  rules?: import("../types/smartGroup").SmartGroupRule[],
 ): Promise<boolean> {
   if (isTauri()) {
-    return await invokeTauri<boolean>("sync_smart_groups_to_core", { groups, channels });
+    const saved = await invokeTauri<boolean>("sync_smart_groups_to_core", { groups, channels, rules });
+    if (!saved) throw new Error("自建线路保存或应用未成功，请重试。");
   }
+  if (rules) { try { localStorage.setItem("netbox_smart_rules", JSON.stringify(rules)); } catch {} }
   return true;
 }
 
@@ -622,4 +630,3 @@ export async function createDedicatedAppShortcut(appId: string): Promise<string>
   }
   return "网页预览：已生成专属快捷方式";
 }
-

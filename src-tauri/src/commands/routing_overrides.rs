@@ -2,8 +2,11 @@ use crate::routing_overrides::{self as service, model::Overrides, Selection, Vie
 
 #[tauri::command]
 pub async fn get_routing_overrides() -> Result<View, String> {
-    let _lock = super::process::LIFECYCLE.lock().await;
-    service::view()
+    let lock = super::process::LIFECYCLE.lock().await;
+    tokio::task::spawn_blocking(move || {
+        let _lock = lock;
+        service::view()
+    }).await.map_err(|_| "读取分流状态任务失败")?
 }
 #[tauri::command]
 pub async fn save_routing_overrides(config: Overrides, selections: Vec<Selection>) -> Result<View, String> { service::save(config, selections).await }

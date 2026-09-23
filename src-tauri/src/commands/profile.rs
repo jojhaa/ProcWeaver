@@ -224,7 +224,7 @@ pub(crate) fn read_profiles_index() -> Vec<ProfileItem> {
     }
 }
 
-fn write_profiles_index(list: &[ProfileItem]) -> Result<(), String> {
+pub(crate) fn write_profiles_index(list: &[ProfileItem]) -> Result<(), String> {
     let json = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
     let index_file = get_profiles_index_file();
     if let Some(parent) = index_file.parent() {
@@ -411,10 +411,11 @@ pub async fn update_profile(id: String) -> Result<ProfileItem, String> {
     let node_count = count_proxies(&raw_content);
     let final_content = super::settings::prepare_with(&raw_content, &super::settings::get_general_settings()?)?;
     validate_config(&final_content)?;
+    let runtime_source = super::profile_switch::runtime_source_for_change(&list[idx])?;
     let previous = fs::read(&full_path).map_err(|e| e.to_string())?;
     crate::storage::replace(&full_path, final_content.as_bytes())?;
-    if list[idx].is_selected {
-        if let Err(error) = apply_profile_to_core(&full_path.to_string_lossy()).await {
+    if let Some(runtime_source) = &runtime_source {
+        if let Err(error) = apply_profile_to_core(&runtime_source.to_string_lossy()).await {
             crate::storage::replace(&full_path, &previous)?;
             return Err(error);
         }
@@ -434,44 +435,21 @@ pub async fn update_profile(id: String) -> Result<ProfileItem, String> {
         list[idx].expire = expire;
     }
 
-    write_profiles_index(&list)?;
+    if let Err(error) = write_profiles_index(&list) {
+        crate::storage::replace(&full_path, &previous)?;
+        if let Some(runtime_source) = &runtime_source {
+            apply_profile_to_core(&runtime_source.to_string_lossy()).await
+                .map_err(|restore| format!("保存订阅索引失败：{error}；恢复运行配置失败：{restore}"))?;
+        }
+        return Err(format!("保存订阅索引失败，已恢复原配置：{error}"));
+    }
 
     Ok(list[idx].clone())
 }
 
 #[tauri::command]
-pub async fn select_profile(id: String) -> Result<bool, String> {
-    let _write = PROFILE_WRITE.lock().await;
-    let mut list = read_profiles_index();
-    if !list.iter().any(|item| item.id == id) { return Err("订阅不存在".into()); }
-    let mut selected_file = None;
-
-    for item in list.iter_mut() {
-        if item.id == id {
-            item.is_selected = true;
-            let p = Path::new(&item.file_path);
-            let full_path = if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                get_base_dir().join(p)
-            };
-            selected_file = Some(full_path);
-        } else {
-            item.is_selected = false;
-        }
-    }
-
-    if let Some(path) = selected_file {
-        apply_profile_to_core(&path.to_string_lossy()).await?;
-    }
-    if let Err(error) = write_profiles_index(&list) {
-        let (_, old_source) = crate::routing_overrides::current_source();
-        apply_profile_to_core(&old_source.to_string_lossy()).await
-            .map_err(|restore| format!("订阅索引保存失败：{error}；核心恢复失败：{restore}"))?;
-        return Err(format!("订阅索引保存失败，已恢复原核心配置：{error}"));
-    }
-
-    Ok(true)
+pub async fn select_profile(id: String, binding_decision: Option<super::profile_switch::BindingDecision>) -> Result<bool, String> {
+    super::profile_switch::select(id, binding_decision).await
 }
 
 #[tauri::command]
@@ -479,8 +457,15 @@ pub async fn delete_profile(id: String) -> Result<bool, String> {
     let _write = PROFILE_WRITE.lock().await;
     let mut list = read_profiles_index();
     if let Some(pos) = list.iter().position(|p| p.id == id) {
+        if super::profile_switch::uses_saved_source(&crate::routing_overrides::read()?, &id) {
+            return Err("此订阅仍用于分流规则的原出口，请先换绑或停用相关规则后再删除".into());
+        }
         let is_selected = list[pos].is_selected;
         if is_selected {
+            if crate::routing_overrides::foreign_targets::bindings(&crate::routing_overrides::read()?, "")
+                .iter().any(|target| target.profile_id == id) {
+                return Err("当前订阅仍有启用的分流绑定，请先切换订阅并选择原出口处理方式，再删除".into());
+            }
             // 如果仅剩一个订阅且正在生效，禁止直接删除
             if list.len() <= 1 {
                 return Err("无法删除当前正在生效的唯一订阅。请先添加或切换至其他可用订阅后再删除。".into());
@@ -568,11 +553,12 @@ pub async fn save_profile_content(id: String, content: String) -> Result<Profile
     validate_config(&content)?;
 
     let node_count = count_proxies(&content);
+    let runtime_source = super::profile_switch::runtime_source_for_change(&list[idx])?;
     let previous = fs::read(&full_path).map_err(|e| e.to_string())?;
     crate::storage::replace(&full_path, content.as_bytes())?;
 
-    if list[idx].is_selected {
-        if let Err(error) = apply_profile_to_core(&full_path.to_string_lossy()).await {
+    if let Some(runtime_source) = &runtime_source {
+        if let Err(error) = apply_profile_to_core(&runtime_source.to_string_lossy()).await {
             crate::storage::replace(&full_path, &previous)?;
             return Err(format!("保存后核心重载失败: {}", error));
         }
@@ -582,8 +568,9 @@ pub async fn save_profile_content(id: String, content: String) -> Result<Profile
     list[idx].updated_at = chrono_or_simple_date();
     if let Err(error) = write_profiles_index(&list) {
         crate::storage::replace(&full_path, &previous)?;
-        if list[idx].is_selected {
-            let _ = apply_profile_to_core(&full_path.to_string_lossy()).await;
+        if let Some(runtime_source) = &runtime_source {
+            apply_profile_to_core(&runtime_source.to_string_lossy()).await
+                .map_err(|restore| format!("保存订阅索引失败：{error}；恢复运行配置失败：{restore}"))?;
         }
         return Err(format!("保存订阅索引失败，已回滚文件: {}", error));
     }
@@ -642,6 +629,9 @@ pub async fn run_profile_scheduler() {
 }
 
 pub async fn apply_profile_to_core(yaml_path: &str) -> Result<(), String> {
+    apply_profile_with_overrides(yaml_path, &crate::routing_overrides::read()?).await
+}
+pub(crate) async fn apply_profile_with_overrides(yaml_path: &str, config: &crate::routing_overrides::model::Overrides) -> Result<(), String> {
     let base_dir = get_base_dir();
     let p = Path::new(yaml_path);
     let actual_path = if p.is_absolute() {
@@ -668,8 +658,7 @@ pub async fn apply_profile_to_core(yaml_path: &str) -> Result<(), String> {
     // 切换时索引尚未提交，必须使用候选文件的订阅身份，不能绑定旧订阅同名节点。
     let profile_id = read_profiles_index().iter().find(|item| get_base_dir().join(&item.file_path) == actual_path)
         .map(|item| item.id.clone()).unwrap_or_else(|| "default".into());
-    let config = crate::routing_overrides::read()?;
-    let prepared = crate::routing_overrides::prepare(&cleaned_raw, &config, &profile_id)?;
+    let prepared = crate::routing_overrides::prepare(&cleaned_raw, config, &profile_id)?;
     validate_config(&prepared)?;
     crate::routing_overrides::apply_runtime(&prepared).await?;
     crate::routing_overrides::set_applied(config.revision, crate::routing_overrides::tracker::status(&config).generation);
@@ -796,7 +785,7 @@ mod validation_tests {
             let start = super::super::process::start_core_transaction(Some("compatible".into()), &state);
             let switch = async {
                 read.wait().await;
-                let selected = select_profile("new".into());
+                let selected = select_profile("new".into(), None);
                 tokio::pin!(selected);
                 assert!(tokio::time::timeout(std::time::Duration::from_millis(50), &mut selected).await.is_err(), "启动读取旧订阅后，切换不能提前提交");
                 resume.wait().await;
@@ -1063,7 +1052,7 @@ pub fn get_smart_groups() -> Result<Vec<serde_json::Value>, String> {
     let file = get_smart_groups_file();
     if file.exists() {
         let content = fs::read_to_string(&file).map_err(|e| e.to_string())?;
-        let val: Vec<serde_json::Value> = serde_json::from_str(&content).unwrap_or_default();
+        let val: Vec<serde_json::Value> = serde_json::from_str(&content).map_err(|_| "自建线路配置损坏，未覆盖原文件")?;
         Ok(val)
     } else {
         Ok(Vec::new())
@@ -1299,8 +1288,30 @@ pub fn compose_business_channels(raw: &str, channels: &[BusinessChannelSpec]) ->
 pub async fn sync_smart_groups_to_core(
     groups: Vec<SmartGroupInjectSpec>,
     channels: Option<Vec<BusinessChannelSpec>>,
+    rules: Option<Vec<serde_json::Value>>,
 ) -> Result<bool, String> {
     let _write = PROFILE_WRITE.lock().await;
+    let saved_groups = get_smart_groups()?;
+    let rules_file = get_smart_groups_file();
+    let previous_rules = match fs::read(&rules_file) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err("读取原自建线路失败，未修改配置".into()),
+    };
+    let next_rules = rules.as_ref().map(|rules| {
+        let mut ids = std::collections::HashSet::new();
+        let mut names = std::collections::HashSet::new();
+        for rule in rules {
+            let id = rule["id"].as_str().filter(|v| !v.trim().is_empty()).ok_or("自建线路缺少标识")?;
+            let name = rule["name"].as_str().ok_or("自建线路缺少名称")?;
+            if !ids.insert(id) || !names.insert(name) { return Err("自建线路标识或名称重复".to_string()); }
+            if !groups.iter().any(|g| g.name == name && Some(g.group_type.as_str()) == rule["type"].as_str()) {
+                return Err("自建线路定义与核心配置不一致".into());
+            }
+        }
+        if rules.len() != groups.len() { return Err("自建线路数量与核心配置不一致".into()); }
+        serde_json::to_vec_pretty(rules).map_err(|error| error.to_string())
+    }).transpose()?;
 
     // 前端传入 channels 时立即持久化保存并作为当前生效配置
     let _effective_channels = if let Some(chs) = channels {
@@ -1324,14 +1335,20 @@ pub async fn sync_smart_groups_to_core(
         .or_insert(serde_yaml::Value::Sequence(Vec::new()))
         .as_sequence_mut().ok_or("proxy-groups 必须为数组")?;
     // 收集所有已知与历史自建组名称（包括持久化存储与本次传入），以实现按完整期望集合差异更新，避免改名或删除残留
-    let mut known_smart_names: std::collections::HashSet<String> = groups.iter().map(|g| g.name.clone()).collect();
-    if let Ok(saved_groups) = get_smart_groups() {
-        for sg in saved_groups {
-            if let Some(n) = sg.get("name").and_then(|v| v.as_str()) {
-                known_smart_names.insert(n.to_string());
-            }
+    let mut known_smart_names = std::collections::HashSet::new();
+    for sg in saved_groups {
+        if let Some(n) = sg.get("name").and_then(|v| v.as_str()) {
+            known_smart_names.insert(n.to_string());
         }
     }
+    let mut requested_names = std::collections::HashSet::new();
+    for group in &groups {
+        if !requested_names.insert(&group.name) { return Err("自建线路名称重复".into()); }
+        if !known_smart_names.contains(&group.name) && entries.iter().any(|item| item["name"].as_str() == Some(group.name.as_str())) {
+            return Err(format!("自建线路名称“{}”与订阅策略组重名，请更换名称", group.name));
+        }
+    }
+    known_smart_names.extend(groups.iter().map(|g| g.name.clone()));
 
     // 1. 先从 proxy-groups 中彻底清理所有已知自建组
     entries.retain(|item| {
@@ -1403,9 +1420,25 @@ pub async fn sync_smart_groups_to_core(
 
     validate_config(&super::settings::prepare_config(&content)?)?;
     crate::storage::replace(&full_path, content.as_bytes())?;
-    if let Err(error) = apply_profile_to_core(&full_path.to_string_lossy()).await {
-        crate::storage::replace(&full_path, &previous)?;
-        return Err(error);
+    let applied = async {
+        if let Some(bytes) = next_rules.as_ref() { crate::storage::replace_atomic(&rules_file, bytes)?; }
+        apply_profile_to_core(&full_path.to_string_lossy()).await
+    }.await;
+    if let Err(error) = applied {
+        let mut failures = Vec::new();
+        if let Err(e) = crate::storage::replace(&full_path, &previous) { failures.push(format!("订阅恢复失败：{e}")); }
+        if next_rules.is_some() {
+            let restored = match previous_rules {
+                Some(bytes) => crate::storage::replace_atomic(&rules_file, &bytes),
+                None => match fs::remove_file(&rules_file) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e.to_string()),
+                },
+            };
+            if let Err(e) = restored { failures.push(format!("线路定义恢复失败：{e}")); }
+        }
+        return Err(format!("保存并应用自建线路失败：{error}；{}", if failures.is_empty() { "已恢复原配置".into() } else { failures.join("；") }));
     }
     Ok(true)
 }
@@ -1413,6 +1446,53 @@ pub async fn sync_smart_groups_to_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smart_group_edit_renames_and_rolls_back_both_files() {
+        const NAME: &str = "commands::profile::tests::smart_group_edit_renames_and_rolls_back_both_files";
+        const FLAG: &str = "PROCWEAVER_SMART_EDIT_TEST";
+        if std::env::var_os(FLAG).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", NAME, "--nocapture"])
+                .env(FLAG, "1").status().unwrap().success());
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("procweaver-smart-edit-{}", std::process::id()));
+        crate::storage::initialize_test(root.clone(), PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf());
+        let profile = ProfileItem { id: "edit-test".into(), file_path: "config/edit-test.yaml".into(), is_selected: true, ..Default::default() };
+        write_profiles_index(&[profile.clone()]).unwrap();
+        let source = root.join(profile.file_path);
+        let initial = "proxies:\n- {name: node-a, type: http, server: 127.0.0.1, port: 9}\n- {name: node-b, type: http, server: 127.0.0.1, port: 9}\nproxy-groups:\n- {name: PROXY, type: select, proxies: [node-a, node-b]}\nrules: ['MATCH,PROXY']\n";
+        fs::write(&source, initial).unwrap();
+        let specs = |name: &str, node: &str| vec![SmartGroupInjectSpec { name: name.into(), group_type: "select".into(), proxies: vec![node.into()], tolerance: None }];
+        let rules = |name: &str, node: &str| vec![serde_json::json!({"id":"stable-id","name":name,"type":"select","nodeSelectionMode":"manual","manualNodes":[node],"desc":"preserve","maxMultiplier":2})];
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            // Simulate an unavailable runtime before any group exists; no real core is started.
+            super::super::process::ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+            let failed = sync_smart_groups_to_core(specs("original", "node-a"), None, Some(rules("original", "node-a"))).await;
+            super::super::process::ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+            assert!(failed.is_err()); assert_eq!(fs::read_to_string(&source).unwrap(), initial); assert!(!get_smart_groups_file().exists());
+            sync_smart_groups_to_core(specs("original", "node-a"), None, Some(rules("original", "node-a"))).await.unwrap();
+            sync_smart_groups_to_core(specs("renamed", "node-b"), None, Some(rules("renamed", "node-b"))).await.unwrap();
+            let saved = get_smart_groups().unwrap();
+            assert_eq!(saved[0]["id"], "stable-id"); assert_eq!(saved[0]["name"], "renamed"); assert_eq!(saved[0]["desc"], "preserve");
+            let yaml: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(&source).unwrap()).unwrap();
+            let groups = yaml["proxy-groups"].as_sequence().unwrap();
+            assert_eq!(groups.len(), 2); assert!(!groups.iter().any(|g| g["name"].as_str() == Some("original")));
+            assert_eq!(groups.iter().find(|g| g["name"].as_str() == Some("renamed")).unwrap()["proxies"][0].as_str(), Some("node-b"));
+            assert!(!groups[0]["proxies"].as_sequence().unwrap().iter().any(|p| p.as_str() == Some("original")));
+            let before_yaml = fs::read(&source).unwrap(); let before_rules = fs::read(get_smart_groups_file()).unwrap();
+            super::super::process::ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+            let failed = sync_smart_groups_to_core(specs("failed-edit", "node-a"), None, Some(rules("failed-edit", "node-a"))).await;
+            super::super::process::ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+            assert!(failed.unwrap_err().contains("已恢复原配置"));
+            assert_eq!(fs::read(&source).unwrap(), before_yaml); assert_eq!(fs::read(get_smart_groups_file()).unwrap(), before_rules);
+            assert!(sync_smart_groups_to_core(specs("PROXY", "node-a"), None, Some(rules("PROXY", "node-a"))).await.unwrap_err().contains("重名"));
+            fs::write(get_smart_groups_file(), "{").unwrap();
+            assert!(sync_smart_groups_to_core(specs("broken", "node-a"), None, Some(rules("broken", "node-a"))).await.unwrap_err().contains("损坏"));
+            assert_eq!(fs::read(&source).unwrap(), before_yaml); assert_eq!(fs::read_to_string(get_smart_groups_file()).unwrap(), "{");
+        });
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn test_compose_business_channels_clean_rules() {
@@ -1561,4 +1641,3 @@ rules:
         assert_eq!(rules[1].as_str(), Some("MATCH,PROXY"));
     }
 }
-

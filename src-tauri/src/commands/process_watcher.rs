@@ -11,7 +11,8 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 static WATCHER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CURRENT_MODE: Mutex<WatcherMode> = Mutex::new(WatcherMode::AutoRelaunch);
-static HANDLED_PIDS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+static HANDLED_PIDS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static COMMANDS: std::sync::LazyLock<Mutex<HashMap<String, String>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static LAST_HANDLED_APP: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
 static TRIGGER_HISTORY: Mutex<Option<HashMap<String, Vec<Instant>>>> = Mutex::new(None);
 static APP_HANDLE: Mutex<Option<tauri::AppHandle>> = Mutex::new(None);
@@ -199,34 +200,29 @@ fn scan_and_handle_bare_processes() {
             return;
         }
 
-        // 构建单条高效 WMI 联合查询，一次性扫描所有受监控进程
-        // 例如: name = 'ChatGPT.exe' or name = 'Claude.exe' or ...
-        let filters: Vec<String> = MONITORED_APPS
-            .iter()
-            .map(|a| format!("name = '{}'", a.process_name))
-            .collect();
-        let filter_expr = filters.join(" or ");
-        let ps_cmd = format!(
-            "Get-CimInstance Win32_Process -Filter \"{}\" | Select-Object ProcessId, Name, CommandLine | ConvertTo-Json -Compress",
-            filter_expr
-        );
-
-        let out = match run_hidden("powershell", &["-NoProfile", "-NonInteractive", "-Command", &ps_cmd]) {
-            Ok(s) => s.trim().to_string(),
-            Err(_) => return,
-        };
-
-        if out.is_empty() || out == "null" {
-            return;
+        let Ok(records) = crate::routing_overrides::native::process_list() else { return; };
+        let items: Vec<_> = records.into_iter()
+            .filter(|p| MONITORED_APPS.iter().any(|app| app.process_name.eq_ignore_ascii_case(&p.name)))
+            .map(|p| crate::routing_overrides::native::inspect(p.pid, p.parent_pid, p.name))
+            .filter(|p| !p.identity.is_empty()).collect();
+        let live: HashSet<_> = items.iter().map(|p| p.identity.clone()).collect();
+        let mut commands = COMMANDS.lock().unwrap_or_else(|p| p.into_inner());
+        commands.retain(|id, _| live.contains(id));
+        if let Ok(mut handled) = HANDLED_PIDS.lock() {
+            handled.get_or_insert_with(HashSet::new).retain(|id| live.contains(id));
         }
-
-        let items: Vec<serde_json::Value> = if out.starts_with('[') {
-            serde_json::from_str(&out).unwrap_or_default()
-        } else if let Ok(single) = serde_json::from_str::<serde_json::Value>(&out) {
-            vec![single]
-        } else {
-            Vec::new()
-        };
+        // Command lines are immutable launch data. Query WMI only for new identities;
+        // steady-state polling uses the lightweight native list without shell processes.
+        let names: HashSet<_> = items.iter().filter(|p| !commands.contains_key(&p.identity)).map(|p| p.name.as_str()).collect();
+        if !names.is_empty() {
+            let Ok(rows) = super::windows_integration::process_command_lines(&names.into_iter().collect::<Vec<_>>()) else { return; };
+            for row in rows {
+                if let Some(item) = items.iter().find(|p| p.pid == row.pid && p.name.eq_ignore_ascii_case(&row.name)) {
+                    let current = crate::routing_overrides::native::inspect(row.pid, 0, String::new());
+                    if current.identity == item.identity && !row.command.trim().is_empty() { commands.insert(item.identity.clone(), row.command); }
+                }
+            }
+        }
 
         let now = Instant::now();
         // Business bundles own their stable entry and explicit restart confirmation.
@@ -235,13 +231,10 @@ fn scan_and_handle_bare_processes() {
             .map(|b| std::path::Path::new(&b.main_exe).file_name().unwrap_or_default().to_string_lossy().to_lowercase()).collect()).unwrap_or_default();
 
         for item in items {
-            let pid = match item.get("ProcessId").and_then(|p| p.as_u64()).map(|p| p as u32) {
-                Some(p) => p,
-                None => continue,
-            };
-            let proc_name = item.get("Name").and_then(|n| n.as_str()).unwrap_or("");
+            let pid = item.pid;
+            let proc_name = item.name.as_str();
             if bundle_names.iter().any(|name| name.eq_ignore_ascii_case(proc_name)) { continue; }
-            let cmd = item.get("CommandLine").and_then(|c| c.as_str()).unwrap_or("");
+            let cmd = commands.get(&item.identity).map(String::as_str).unwrap_or("");
 
             // 【第一道铁锁】：严格过滤 Chromium/Electron 内部辅助子进程
             // 带有 --type=crashpad-handler、--type=gpu-process、--type=renderer、--type=utility 的进程坚决不碰！
@@ -273,10 +266,10 @@ fn scan_and_handle_bare_processes() {
                     Err(_) => continue,
                 };
                 let set = pids_lock.get_or_insert_with(HashSet::new);
-                if set.contains(&pid) {
+                if set.contains(&item.identity) {
                     continue;
                 }
-                set.insert(pid);
+                set.insert(item.identity.clone());
             }
 
             // 【第三道铁锁】：30 秒强制冷却防抖窗口（单应用独立）
@@ -344,7 +337,8 @@ fn scan_and_handle_bare_processes() {
             } else if mode == WatcherMode::AutoRelaunch {
                 // 模式 A（自动热替换接管）
                 // 1. 结束裸跑主进程
-                let _ = run_hidden("taskkill", &["/F", "/PID", &pid.to_string()]);
+                if crate::routing_overrides::native::inspect(pid, 0, String::new()).identity != item.identity { continue; }
+                if run_hidden("taskkill", &["/F", "/PID", &pid.to_string()]).is_err() { continue; }
 
                 // 2. 稍作延时等待文件句柄释放
                 std::thread::sleep(Duration::from_millis(250));

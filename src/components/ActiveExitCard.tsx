@@ -32,9 +32,9 @@ export const ActiveExitCard: React.FC<Props> = ({ proxyPort, corePid, activeNode
   useEffect(() => {
     if (data && activeNodeName) {
       getPersistedHealthCache()
-        .then((currentCache) => {
+        .then(async (currentCache) => {
           currentCache[activeNodeName] = data;
-          savePersistedHealthCache(currentCache, true);
+          await savePersistedHealthCache(currentCache, true);
           window.dispatchEvent(
             new CustomEvent("netbox-node-health-updated", {
               detail: { node: activeNodeName, health: data },

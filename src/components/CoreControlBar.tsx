@@ -1,43 +1,26 @@
 import React, { useState, useEffect } from "react";
-import { CoreStatus, CpuInfo } from "../types";
-import { getCoreStatus, getCpuInfo, toggleCore, toggleSystemProxy } from "../api";
+import { CpuInfo } from "../types";
+import { getCpuInfo, toggleCore, toggleSystemProxy } from "../api";
 import { Play, Square, Globe, RefreshCw, Cpu, Zap } from "lucide-react";
 
+import { useCoreStatus } from "../hooks/useCoreStatus";
+import { proxyStateLabel } from "../utils/coreStatusStore";
+
 interface Props {
-  onStatusChange?: (status: CoreStatus) => void;
   extraAction?: React.ReactNode;
 }
 
-export const CoreControlBar: React.FC<Props> = ({ onStatusChange, extraAction }) => {
-  const [status, setStatus] = useState<CoreStatus>({
-    running: false,
-    systemProxyEnabled: false,
-    mixedPort: 7890,
-    controllerPort: 9090,
-  });
+export const CoreControlBar: React.FC<Props> = ({ extraAction }) => {
+  const { status, pending: loading, run, refresh } = useCoreStatus();
+  const proxy = status.systemProxy!;
   const [cpuInfo, setCpuInfo] = useState<CpuInfo | null>(null);
   const [coreMode, setCoreMode] = useState<"auto" | "v3" | "compatible">("auto");
-  const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [uptimeSeconds, setUptimeSeconds] = useState(0);
   const [localStartTime, setLocalStartTime] = useState<number | null>(null);
 
-  const refreshStatus = async () => {
-    try {
-      const res = await getCoreStatus();
-      setStatus(res);
-      onStatusChange?.(res);
-    } catch (e) {
-      console.error(e);
-    }
-  };
-
   useEffect(() => {
-    refreshStatus();
     getCpuInfo().then(setCpuInfo).catch(console.error);
-
-    const interval = setInterval(refreshStatus, 3000);
-    return () => clearInterval(interval);
   }, []);
 
   // 运行耗时秒级自增计时器 (几时几分几秒)
@@ -73,29 +56,21 @@ export const CoreControlBar: React.FC<Props> = ({ onStatusChange, extraAction })
   };
 
   const handleToggleCore = async () => {
-    setLoading(true);
     setError("");
     try {
-      const next = await toggleCore(!status.running, coreMode);
-      setStatus(next);
-      onStatusChange?.(next);
+      await run(() => toggleCore(!status.running, coreMode));
     } catch (e) {
       console.error("切换内核失败", e);
       setError(String(e));
-    } finally {
-      setLoading(false);
     }
   };
 
   const handleToggleSystemProxy = async () => {
+    setError("");
+    if (proxy.state === "unknown") { await refresh(); return; }
     try {
-      const nextEnabled = !status.systemProxyEnabled;
-      await toggleSystemProxy(nextEnabled, status.mixedPort);
-      const nextStatus = { ...status, systemProxyEnabled: nextEnabled };
-      setStatus(nextStatus);
-      onStatusChange?.(nextStatus);
+      await run(() => toggleSystemProxy(proxy.state !== "enabled", status.mixedPort));
     } catch (e) {
-      console.error("切换系统代理失败", e);
       setError(String(e));
     }
   };
@@ -153,7 +128,8 @@ export const CoreControlBar: React.FC<Props> = ({ onStatusChange, extraAction })
           {/* 系统代理开关 */}
           <button
             onClick={handleToggleSystemProxy}
-            disabled={!status.running && !status.systemProxyEnabled}
+            title={proxy.state === "external" ? "点击将系统代理接入本核心" : proxy.message}
+            disabled={loading || (!status.running && proxy.state !== "enabled" && proxy.state !== "unknown")}
             className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl text-xs font-semibold border transition shadow-sm ${
               status.systemProxyEnabled
                 ? "bg-indigo-600 hover:bg-indigo-500 text-white border-indigo-500 shadow-indigo-600/30"
@@ -161,7 +137,7 @@ export const CoreControlBar: React.FC<Props> = ({ onStatusChange, extraAction })
             }`}
           >
             <Globe className="w-3.5 h-3.5" />
-            <span>系统代理: {status.systemProxyEnabled ? "已开启" : "已关闭"}</span>
+            <span>系统代理: {loading ? "切换中…" : proxyStateLabel(proxy.state)}</span>
           </button>
 
           {/* 内核启动/关闭 */}
@@ -186,6 +162,14 @@ export const CoreControlBar: React.FC<Props> = ({ onStatusChange, extraAction })
         </div>
       </div>
 
+      {(proxy.bypassChanged || proxy.state === "unknown" || proxy.state === "external") && (
+        <p role="status" className="text-xs text-amber-700 dark:text-amber-400">{proxy.message}{proxy.state === "unknown" ? "；点击系统代理按钮重试" : ""}</p>
+      )}
+      {proxy.lastChange && (
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          最近变更 {new Date(proxy.lastChange.timestamp).toLocaleTimeString()}：{proxy.lastChange.reason}
+        </p>
+      )}
       {/* 内核版本与 CPU 架构选择器 */}
       <div className="pt-3 border-t border-slate-200 dark:border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs">
         <div className="flex items-center space-x-2 text-slate-500 dark:text-slate-400">

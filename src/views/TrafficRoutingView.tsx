@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { RulesView } from "./RulesView";
 import { BusinessBundleView } from "./BusinessBundleView";
 import { Layers, Sparkles, Package } from "lucide-react";
-import { useRoutingOverrides } from "../hooks/useRoutingOverrides";
+import { useBusinessBundles } from "../hooks/useBusinessBundles";
 
 interface Props {
   mode: string | null;
@@ -12,10 +12,8 @@ interface Props {
 const STORAGE_KEY = "netbox_routing_active_tab";
 
 export const TrafficRoutingView: React.FC<Props> = ({ mode, coreMode }) => {
-  const { state: routingState } = useRoutingOverrides();
-  const isProcessEnabled = Boolean(
-    routingState.draft?.processEnabled ?? routingState.view?.config?.processEnabled
-  );
+  const routingState = useBusinessBundles();
+  const isProcessEnabled = Boolean(routingState.view?.config?.processEnabled);
 
   const [activeTab, setActiveTab] = useState<"rules" | "apps">(() => {
     try {

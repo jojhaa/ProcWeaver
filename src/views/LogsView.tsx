@@ -28,14 +28,20 @@ import {
   appendAppLog,
   subscribeLogs,
   clearGlobalLogs,
+  getLogBufferStats,
 } from "../api/logs";
 import { getGeneralSettings, saveGeneralSettings } from "../api/settings";
+
+import { VirtualList } from "../components/VirtualList";
+import { useDebouncedValue } from "../hooks/useDebouncedValue";
+import { useMonitorVisible } from "../hooks/useMonitorVisible";
+import { MonitorPerformanceControl } from "../components/MonitorPerformanceControl";
 
 interface LogsViewProps {
   controllerPort?: number;
 }
 
-export const LogsView: React.FC<LogsViewProps> = ({ controllerPort = 9090 }) => {
+export const LogsView: React.FC<LogsViewProps> = React.memo(({ controllerPort = 9090 }) => {
   // 日志捕获总控开关状态
   const [logCaptureEnabled, setLogCaptureEnabled] = useState<boolean>(true);
   const [isEnablingCapture, setIsEnablingCapture] = useState(false);
@@ -51,9 +57,12 @@ export const LogsView: React.FC<LogsViewProps> = ({ controllerPort = 9090 }) => 
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
+  const visible = useMonitorVisible();
+  const settledQuery = useDebouncedValue(searchQuery);
+  const [bufferStats, setBufferStats] = useState(getLogBufferStats);
+  const [selectedLog, setSelectedLog] = useState<LogEntry | null>(null);
+
   // DOM 与滚动引用
-  const terminalEndRef = useRef<HTMLDivElement | null>(null);
-  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<any>(null);
 
@@ -122,11 +131,11 @@ export const LogsView: React.FC<LogsViewProps> = ({ controllerPort = 9090 }) => 
         };
 
         ws.onmessage = (event) => {
-          if (!isMounted || isPaused) return;
+          if (!isMounted) return;
           try {
             const data = JSON.parse(event.data);
             const level = data.type ? (data.type.toLowerCase() as any) : "info";
-            const payload = data.payload || "";
+            const payload = typeof data.payload === "string" ? data.payload : String(data.payload ?? "");
             // 同时汇入全局日志总线
             appendAppLog(level, payload);
           } catch (e) {
@@ -165,33 +174,21 @@ export const LogsView: React.FC<LogsViewProps> = ({ controllerPort = 9090 }) => 
         wsRef.current = null;
       }
     };
-  }, [logCaptureEnabled, controllerPort, isPaused]);
+  }, [logCaptureEnabled, controllerPort]);
 
-  // 3.1 订阅全局应用业务日志流 (IP健康、节点测速、分流策略等)
+  // 暂停仅冻结显示；恢复时一次读取有界缓存，不重建日志连接。
   useEffect(() => {
-    const unsubscribe = subscribeLogs((entry) => {
-      if (isPaused) return;
-      setLogs((prev) => {
-        // 去重防止由于 websocket/event 导致重复
-        if (prev.some((l) => l.id === entry.id)) return prev;
-        const updated = [...prev, entry];
-        return updated.length > 2000 ? updated.slice(-2000) : updated;
-      });
-    });
-    return unsubscribe;
-  }, [isPaused]);
-
-  // 4. 自动平滑滚动到底部
-  useEffect(() => {
-    if (autoScroll && terminalEndRef.current) {
-      terminalEndRef.current.scrollIntoView({ behavior: "smooth" });
-    }
-  }, [logs, autoScroll]);
+    if (isPaused || !visible) return;
+    const refresh = () => { setLogs(getGlobalLogs()); setBufferStats(getLogBufferStats()); };
+    refresh();
+    return subscribeLogs(refresh);
+  }, [isPaused, visible]);
 
   // 5. 清空日志
   const handleClearLogs = () => {
     clearGlobalLogs();
     setLogs([]);
+    setBufferStats(getLogBufferStats());
   };
 
   // 6. 导出为 .log 文件
@@ -224,7 +221,7 @@ export const LogsView: React.FC<LogsViewProps> = ({ controllerPort = 9090 }) => 
 
   // 7. 过滤逻辑
   const filteredLogs = useMemo(() => {
-    const query = searchQuery.trim().toLowerCase();
+    const query = settledQuery.trim().toLowerCase();
     return logs.filter((log) => {
       if (selectedLevel !== "all" && log.level !== selectedLevel) {
         return false;
@@ -232,7 +229,7 @@ export const LogsView: React.FC<LogsViewProps> = ({ controllerPort = 9090 }) => 
       if (!query) return true;
       return log.payload.toLowerCase().includes(query) || log.time.includes(query);
     });
-  }, [logs, selectedLevel, searchQuery]);
+  }, [logs, selectedLevel, settledQuery]);
 
   // 8. 统计各个级别的条数
   const levelCounts = useMemo(() => {
@@ -393,11 +390,12 @@ export const LogsView: React.FC<LogsViewProps> = ({ controllerPort = 9090 }) => 
           </div>
 
           {/* 右侧：动作按钮组 */}
-          <div className="flex items-center space-x-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <MonitorPerformanceControl />
             {/* 暂停 / 实时 */}
             <button
               onClick={() => setIsPaused(!isPaused)}
-              title={isPaused ? "恢复日志流滚动接收" : "暂停接收新日志"}
+              title={isPaused ? "恢复显示缓存中的最新日志" : "暂停显示，继续接收到有界缓存"}
               className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors ${
                 isPaused
                   ? "bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30 font-semibold"
@@ -533,6 +531,9 @@ export const LogsView: React.FC<LogsViewProps> = ({ controllerPort = 9090 }) => 
         </div>
       )}
 
+      {(bufferStats.evicted > 0 || bufferStats.truncated > 0) && <p className="text-xs text-amber-600 dark:text-amber-400">
+        缓存已淘汰 {bufferStats.evicted} 条旧日志，截断 {bufferStats.truncated} 条超长日志；导出仅包含当前显示缓存。
+      </p>}
       {/* 日志记录流水卡片大盘 */}
       <div className="bg-white dark:bg-slate-900/90 border border-slate-200 dark:border-slate-800 rounded-2xl overflow-hidden shadow-sm flex flex-col h-[580px]">
         {/* 表头大盘状态信息栏 */}
@@ -548,24 +549,23 @@ export const LogsView: React.FC<LogsViewProps> = ({ controllerPort = 9090 }) => 
           </div>
 
           <div className="flex items-center space-x-3 text-[11px] font-mono">
-            {autoScroll && (
+            {autoScroll && !isPaused && visible && (
               <span className="hidden sm:inline-flex items-center space-x-1 text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/50 px-2 py-0.5 rounded-full border border-emerald-200/60 dark:border-emerald-800/60">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
                 <span>实时追踪中</span>
               </span>
             )}
             <span>
-              已呈现: <strong className="text-slate-700 dark:text-slate-300">{filteredLogs.length}</strong> 行
+              匹配: <strong className="text-slate-700 dark:text-slate-300">{filteredLogs.length}</strong> 行
             </span>
             <span className="text-slate-300 dark:text-slate-700">|</span>
-            <span>缓存容量: 2000 行</span>
+            <span title="缓存最多 2000 行 / 2 MiB，单条最多 32 KiB">缓存: 2000 行 / 2 MiB</span>
           </div>
         </div>
 
         {/* 现代卡片式日志流水列表 */}
         <div
-          ref={scrollContainerRef}
-          className="flex-1 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800/70 select-text scrollbar-thin scrollbar-thumb-slate-200 dark:scrollbar-thumb-slate-700 scrollbar-track-transparent"
+          className="flex-1 min-h-0 select-text"
         >
           {filteredLogs.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center text-center p-12">
@@ -592,7 +592,8 @@ export const LogsView: React.FC<LogsViewProps> = ({ controllerPort = 9090 }) => 
               )}
             </div>
           ) : (
-            filteredLogs.map((log) => (
+            <VirtualList items={filteredLogs} itemKey={log => log.id} rowHeight={64} className="h-full"
+              label="运行日志" followEnd={autoScroll} preserveAnchor onLeaveEnd={() => setAutoScroll(false)} renderRow={(log) => (
               <div
                 key={log.id}
                 className="group px-4 py-2 hover:bg-slate-50 dark:hover:bg-slate-800/40 transition-colors flex items-start space-x-3 text-xs"
@@ -609,7 +610,10 @@ export const LogsView: React.FC<LogsViewProps> = ({ controllerPort = 9090 }) => 
                 </div>
 
                 {/* 日志主体内容 */}
-                {renderLogPayload(log.payload, log.level)}
+                <button type="button" onClick={() => setSelectedLog(log)} title="查看完整日志"
+                  className="min-w-0 flex-1 text-left h-11 overflow-hidden focus:outline-indigo-500">
+                  <span className="line-clamp-2 break-all">{renderLogPayload(log.payload, log.level)}</span>
+                </button>
 
                 {/* 行内悬浮快捷复制按钮 */}
                 <div className="flex-shrink-0 select-none">
@@ -629,12 +633,19 @@ export const LogsView: React.FC<LogsViewProps> = ({ controllerPort = 9090 }) => 
                   </button>
                 </div>
               </div>
-            ))
+            )} />
           )}
-          <div ref={terminalEndRef} />
         </div>
       </div>
+      {selectedLog && <div className="fixed inset-0 z-[100] bg-black/40 flex items-center justify-center p-6"
+        onClick={() => setSelectedLog(null)} onKeyDown={e => { if (e.key === "Escape") setSelectedLog(null); }}>
+        <div role="dialog" aria-modal="true" aria-label="日志详情" className="bg-white dark:bg-slate-900 rounded-xl p-5 max-w-3xl w-full" onClick={e => e.stopPropagation()}>
+          <div className="flex justify-between mb-3"><strong>日志详情 · {selectedLog.time}</strong>
+            <button autoFocus onClick={() => setSelectedLog(null)} aria-label="关闭日志详情"><X className="w-5 h-5" /></button></div>
+          <pre className="text-xs whitespace-pre-wrap break-all max-h-[65vh] overflow-auto">{selectedLog.payload}</pre>
+          <button className="mt-3 text-indigo-600" onClick={() => handleCopyLog(selectedLog)}>复制日志</button>
+        </div>
+      </div>}
     </div>
   );
-};
-
+});

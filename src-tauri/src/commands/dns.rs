@@ -124,20 +124,7 @@ pub fn get_dns_settings() -> Result<DnsSettings, String> {
 
 impl DnsSettings {
     pub fn validate(&self) -> Result<(), String> {
-        if self.listen.trim().is_empty() {
-            return Err("DNS 监听地址不能为空".into());
-        }
-        if let Some((_, port_str)) = self.listen.split_once(':') {
-            if let Ok(port) = port_str.parse::<u16>() {
-                if port == 0 {
-                    return Err("DNS 监听端口必须在 1~65535 之间".into());
-                }
-            } else {
-                return Err(format!("非法 DNS 监听端口: {}", port_str));
-            }
-        } else if self.listen.parse::<u16>().is_err() {
-            return Err("DNS 监听格式无效，应形如 0.0.0.0:1053 或 1053".into());
-        }
+        super::dns_runtime::parse_listen(&self.listen)?;
 
         if !matches!(self.enhanced_mode.as_str(), "fake-ip" | "redir-host" | "normal") {
             return Err(format!("未知的增强模式: {}", self.enhanced_mode));
@@ -153,17 +140,25 @@ impl DnsSettings {
 
 #[tauri::command]
 pub async fn save_dns_settings(
-    settings: DnsSettings,
+    mut settings: DnsSettings,
     state: tauri::State<'_, super::process::CoreStateMutex>,
 ) -> Result<DnsSettings, String> {
     settings.validate()?;
+    settings.listen = super::dns_runtime::parse_listen(&settings.listen)?.to_string();
 
     let _lifecycle = super::process::LIFECYCLE.lock().await;
     let path = crate::storage::data_dir().join("config/dns-preferences.json");
-    let previous_bytes = std::fs::read(&path).ok();
-
     let bytes = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
-    crate::storage::replace(&path, &bytes)?;
+    let write_path = path.clone();
+    let previous_bytes = tokio::task::spawn_blocking(move || {
+        let previous = match std::fs::read(&write_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err("无法读取原 DNS 配置，未覆盖".to_string()),
+        };
+        crate::storage::replace(&write_path, &bytes)?;
+        Ok(previous)
+    }).await.map_err(|_| "保存 DNS 配置任务失败")??;
 
     // 若核心当前正在运行，由于 DNS 覆写影响底层网络，重启核心以应用新 DNS
     let (running, mode) = {
@@ -183,13 +178,13 @@ pub async fn save_dns_settings(
         }
         if let Err(e) = super::process::start_core_locked(mode.clone(), &state).await {
             // 核心加载新配置失败，回滚原始 DNS 配置
-            if let Some(prev) = previous_bytes {
-                let _ = crate::storage::replace(&path, &prev);
-                let _ = super::process::start_core_locked(mode, &state).await;
-            } else {
-                let _ = std::fs::remove_file(&path);
-            }
-            return Err(format!("应用新 DNS 配置失败，核心启动异常: {}；已自动回滚原配置", e));
+            let rollback = tokio::task::spawn_blocking(move || match previous_bytes {
+                Some(previous) => crate::storage::replace(&path, &previous),
+                None => std::fs::remove_file(&path).map_err(|error| error.to_string()),
+            }).await.map_err(|_| "DNS 配置回滚任务失败")?;
+            if let Err(error) = rollback { return Err(format!("应用新 DNS 配置失败：{e}；回滚失败：{error}")); }
+            let restored = super::process::start_core_locked(mode, &state).await;
+            return Err(format!("应用新 DNS 配置失败：{e}；原配置已回滚{}", restored.err().map(|error| format!("，但核心恢复失败：{error}")).unwrap_or_default()));
         }
     }
 

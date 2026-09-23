@@ -31,6 +31,7 @@ interface TrayMenuPayload {
   running: boolean;
   mode: string;
   sysProxyEnabled: boolean;
+  sysProxyState?: "enabled" | "disabled" | "external" | "unknown";
   autoRun: boolean;
   processEnabled: boolean;
   activeNode?: string;
@@ -97,6 +98,10 @@ export const TrayContextMenuView: React.FC = () => {
       }
     });
 
+    const unlistenTraffic = listen<{ downSpeed: number; upSpeed: number }>("tray-traffic-updated", e => {
+      setPayload(previous => ({ ...previous, ...e.payload }));
+    });
+
     const unlistenDir = listen<string>("tray-direction-changed", (e) => {
       if (e.payload === "right" || e.payload === "left") {
         setDirection(e.payload);
@@ -119,6 +124,7 @@ export const TrayContextMenuView: React.FC = () => {
 
     return () => {
       unlistenUpdated.then((u) => u());
+      unlistenTraffic.then(u => u());
       unlistenDir.then((u) => u());
       window.removeEventListener("focus", fetchLatestPayload);
       window.removeEventListener("blur", handleBlur);
@@ -488,7 +494,9 @@ export const TrayContextMenuView: React.FC = () => {
                     : "bg-white/5 text-slate-400"
                 }`}
               >
-                {payload.sysProxyEnabled ? "● 已开启" : "○ 已关闭"}
+                {payload.sysProxyState === "unknown" || !payload.sysProxyState ? "状态未知"
+                  : payload.sysProxyState === "external" ? "其他代理"
+                  : payload.sysProxyEnabled ? "● 已开启" : "○ 已关闭"}
               </span>
             </button>
 

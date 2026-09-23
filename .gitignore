@@ -55,7 +55,7 @@ playwright-report/
 *.log
 
 # Binary/distribution artifacts belong only in GitHub Releases, never Git
-# https://github.com/jojhaa/ProcWeaver-Rules/releases
+# https://github.com/jojhaa/ProcWeaver/releases
 *.[eE][xX][eE]
 *.[mM][sS][iI]
 *.msix

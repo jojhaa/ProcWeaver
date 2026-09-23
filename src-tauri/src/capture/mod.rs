@@ -367,39 +367,41 @@ pub(crate) fn contains_port(value: &Value, port: u16) -> bool {
     })
 }
 pub async fn run() {
-    let mut previous = String::new();
+    let mut previous: Option<String> = None;
+    let mut previous_has_plan = false;
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let _lock = crate::commands::process::LIFECYCLE.lock().await;
         if !crate::commands::process::ACTIVE.load(Ordering::SeqCst) {
             stop();
-            previous.clear();
+            previous = None;
             continue;
         }
         let active_driver = smart_arbiter::get_active_driver_name();
         if active_driver == "tun" {
             stop();
-            previous.clear();
+            previous = None;
             continue;
         }
         let result = async {
             let raw =
-                std::fs::read_to_string(crate::storage::data_dir().join("core_data/config.yaml"))
+                tokio::fs::read_to_string(crate::storage::data_dir().join("core_data/config.yaml")).await
                     .map_err(|_| "读取接管计划失败".to_string())?;
+            // Re-read the file so external changes are still noticed immediately,
+            // but avoid parsing unchanged subscription YAML on every heartbeat.
+            if previous.as_deref() == Some(raw.as_str()) && (!previous_has_plan || status().active) {
+                return Ok(());
+            }
             let yaml: Value = serde_yaml::from_str(&raw).map_err(|_| "接管计划无效".to_string())?;
             if yaml["netbox-capture"].is_null() {
                 stop();
-                previous.clear();
-                return Ok(());
-            }
-            let plan: Plan = serde_yaml::from_value(yaml["netbox-capture"].clone())
-                .map_err(|_| "接管计划无效".to_string())?;
-            let signature = serde_json::to_string(&plan).map_err(|_| "接管计划无效".to_string())?;
-            if signature == previous && status().active {
+                previous = Some(raw);
+                previous_has_plan = false;
                 return Ok(());
             }
             confirm_runtime(&raw).await?;
-            previous = signature;
+            previous = Some(raw);
+            previous_has_plan = true;
             Ok::<(), String>(())
         }
         .await;

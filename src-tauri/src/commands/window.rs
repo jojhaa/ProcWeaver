@@ -7,6 +7,13 @@ fn get_main_window(app: &AppHandle) -> Result<WebviewWindow, String> {
 }
 
 #[tauri::command]
+pub fn window_monitor_visible(app: AppHandle) -> Result<bool, String> {
+    let window = get_main_window(&app)?;
+    Ok(window.is_visible().map_err(|e| e.to_string())?
+        && !window.is_minimized().map_err(|e| e.to_string())?)
+}
+
+#[tauri::command]
 pub fn window_minimize(app: AppHandle) -> Result<(), String> {
     let window = get_main_window(&app)?;
     window.minimize().map_err(|e| e.to_string())

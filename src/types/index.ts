@@ -27,12 +27,20 @@ export interface CpuInfo {
 }
 
 // 内核运行状态
+export interface SystemProxyStatus {
+  state: "enabled" | "disabled" | "external" | "unknown";
+  bypassChanged: boolean;
+  message: string;
+  lastChange?: { timestamp: number; state: string; reason: string } | null;
+}
+
 export interface CoreStatus {
   running: boolean;
   pid?: number;
   uptimeSeconds?: number;
   version?: string;
   systemProxyEnabled: boolean;
+  systemProxy?: SystemProxyStatus;
   mixedPort: number;
   controllerPort: number;
   activeCore?: string;
@@ -225,4 +233,3 @@ export interface CoreRulesUpdateInfo {
 }
 
 export * from "./smartGroup";
-

@@ -276,6 +276,7 @@ export function formatCountryRegionTitle(countryCode?: string, fallbackName?: st
 export function isInformationalNode(name: string, type?: string): boolean {
   if (!name) return false;
   const n = name.trim();
+  if (n.startsWith("PW-X-")) return true; // 保留旧订阅出口只供原绑定规则使用。
 
   // 1. 类型特征过滤 (如 Compatible 占位符)
   if (type && /^(compatible|unknown)$/i.test(type.trim())) {

@@ -54,7 +54,10 @@ export function getBundleStatus(instance: BundleLocalInstance, state: BundleStat
   }
   if (!state.view) return result("pending", "尚未核实核心状态");
   try {
-    const resolved = resolveBundleTargets([instance], state.view.targets);
+    if (state.view.unavailableRules?.some(id => rules.some(r => r.id === id) || id === `bundle:${instance.instanceId}` || id.startsWith(`bundle-dns-${instance.instanceId}-`))) {
+      return result("error", "原出口不可用或已选择稍后换绑；绑定信息保留，匹配流量暂时阻断，请选择可用出口重新绑定");
+    }
+    const resolved = resolveBundleTargets([instance], state.view.targets, state.view.preservedTargets);
     const expected = compileBundlesToProcessRules(resolved);
     const dns = compileBundlesToDnsRules(resolved);
     const config = state.view.config;
@@ -89,6 +92,7 @@ export function createBundleController(api: Pick<RoutingApi, "read" | "save">, s
   const listeners = new Set<() => void>();
   let sequence = 0;
   let readSequence = 0;
+  let reading: Promise<void> | undefined;
   let tail: Promise<unknown> = Promise.resolve();
   let confirmed: BundleLocalInstance[] | undefined;
   const publish = (patch: Partial<BundleState>) => {
@@ -136,18 +140,23 @@ export function createBundleController(api: Pick<RoutingApi, "read" | "save">, s
     tail = work;
     return work;
   };
-  const refresh = async () => {
-    if (state.pending) return;
+  const refresh = (): Promise<void> => {
+    if (state.pending) return Promise.resolve();
+    if (reading) return reading;
     const ticket = ++readSequence;
-    try {
-      const view = await api.read();
-      if (ticket !== readSequence || state.pending) return;
-      const restarted = state.view?.running === false && view.running;
-      publish({ view, readError: "" });
-      if (restarted) await apply(state.instances, true);
-    } catch (error) {
-      if (ticket === readSequence) publish({ readError: error instanceof Error ? error.message : String(error) });
-    }
+    reading = (async () => {
+      try {
+        const view = await api.read();
+        if (ticket !== readSequence || state.pending) return;
+        const restarted = state.view?.running === false && view.running;
+        if (state.readError || JSON.stringify(view) !== JSON.stringify(state.view)) publish({ view, readError: "" });
+        if (restarted) await apply(state.instances, true);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (ticket === readSequence && state.readError !== message) publish({ readError: message });
+      }
+    })().finally(() => { reading = undefined; });
+    return reading;
   };
   return {
     getSnapshot: () => state,

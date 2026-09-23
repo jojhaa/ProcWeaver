@@ -97,27 +97,23 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
   useEffect(() => {
     void bundleController.refresh();
 
-    getDnsGuardStatus()
-      .then((status) => setDnsGuardEnabled(status))
-      .catch(() => {});
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    const refreshDns = () => { void getDnsGuardStatus().then(status => { if (!disposed) setDnsGuardEnabled(status); }).catch(() => {}); };
+    refreshDns();
+    window.addEventListener("focus", refreshDns);
+    if (isTauri()) void import("@tauri-apps/api/event").then(({ listen }) => listen("procweaver-dns-guard-changed", refreshDns))
+      .then(remove => { if (disposed) remove(); else unlisten = remove; }).catch(() => {});
 
     loadRepoBundles();
+    return () => { disposed = true; unlisten?.(); window.removeEventListener("focus", refreshDns); };
   }, []);
 
-  // 2. 状态改变时自动持久化并同步到底层核心与后端守护
+  // 2. 业务包守护由独立入口检测负责，不修改其他进程使用的旧版全局守护。
   const persistAndSync = useCallback((nextInstances: BundleLocalInstance[]) => {
     void bundleController.apply(nextInstances).then(async success => {
       if (!success) { setBannerToast(""); return; }
-      if (!isTauri()) return;
-      const active = nextInstances.filter(i => i.enabled && i.slotBindings.main);
-      const mode = active.some(i => i.watcherMode === "auto") ? "auto_relaunch"
-        : active.some(i => i.watcherMode === "notify") ? "notify_only" : "disabled";
-      try {
-        const { invoke } = await import("@tauri-apps/api/core");
-        await invoke("set_watcher_mode", { mode });
-      } catch {
-        showToast("分流规则已保存，但守护模式更新失败，请重试");
-      }
+      if (isTauri()) await bundleTools.refreshEntries();
     });
   }, []);
 
@@ -521,6 +517,10 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
                   onLaunch={() => void bundleTools.launch({ instanceId: instance.instanceId })}
                   onShortcuts={() => void bundleTools.shortcuts(instance.instanceId)}
                   availableProxies={availableProxies}
+                  preservedBinding={bundleState.view?.preservedTargets?.some(target => {
+                    const stored = instance.slotTargets?.main;
+                    return stored && target.profileId === stored.profileId && target.kind === stored.kind && target.name === stored.name;
+                  })}
                   isExpanded={Boolean(expandedMap[instance.instanceId])}
                   onToggleExpand={() => handleToggleExpand(instance.instanceId)}
                   onToggleSwitch={handleToggleSwitch}

@@ -17,18 +17,22 @@ import {
   ChevronRight,
 } from "lucide-react";
 import {
-  getActiveConnections,
   closeConnection,
   closeAllConnections,
   ConnectionItem,
-  ConnectionsSnapshot,
 } from "../api/connections";
+
+import { monitorStore } from "../api/traffic";
+import { VirtualList } from "../components/VirtualList";
+import { useDebouncedValue } from "../hooks/useDebouncedValue";
+import { useMonitorVisible } from "../hooks/useMonitorVisible";
+import { MonitorPerformanceControl } from "../components/MonitorPerformanceControl";
 
 interface ConnectionsViewProps {
   controllerPort?: number;
 }
 
-export const ConnectionsView: React.FC<ConnectionsViewProps> = ({ controllerPort: _controllerPort }) => {
+export const ConnectionsView: React.FC<ConnectionsViewProps> = React.memo(({ controllerPort: _controllerPort }) => {
   // 视图模式：活跃连接 vs 历史请求流水
   const [viewMode, setViewMode] = useState<"active" | "closed">("active");
 
@@ -48,6 +52,11 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({ controllerPort
   const [selectedConnection, setSelectedConnection] = useState<ConnectionItem | null>(null);
   const [showCloseAllConfirm, setShowCloseAllConfirm] = useState(false);
   const [closingIds, setClosingIds] = useState<Set<string>>(new Set());
+
+  const visible = useMonitorVisible();
+  const settledQuery = useDebouncedValue(searchQuery);
+  const [monitorError, setMonitorError] = useState("");
+  const epochRef = useRef<number | null | undefined>(undefined);
 
   // 引用追踪：用于计算连接瞬时速率与发现关闭的连接
   const prevConnectionsMapRef = useRef<Map<string, { upload: number; download: number; time: number; item: ConnectionItem }>>(new Map());
@@ -79,18 +88,22 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({ controllerPort
     return `${Math.floor(diffSec / 3600)}时${Math.floor((diffSec % 3600) / 60)}分`;
   };
 
-  // 轮询拉取连接数据
+  // 订阅与流量统计共用的快照，暂停或不可见时不请求连接详情。
   useEffect(() => {
-    if (isPaused) return;
+    if (isPaused || !visible) return;
 
-    let isMounted = true;
-
-    const fetchSnapshot = async () => {
-      try {
-        const snap: ConnectionsSnapshot = await getActiveConnections();
-        if (!isMounted) return;
-
-        const now = Date.now();
+    const receive = () => {
+        const snap = monitorStore.getConnections();
+        if (!snap) return;
+        if (epochRef.current !== snap.epoch) {
+          epochRef.current = snap.epoch;
+          prevConnectionsMapRef.current.clear();
+          prevTotalRef.current = { download: 0, upload: 0, time: snap.timestamp };
+          setClosedRequests([]);
+          setAggregateDownSpeed(0);
+          setAggregateUpSpeed(0);
+        }
+        const now = snap.timestamp;
         const prevMap = prevConnectionsMapRef.current;
         const currentMap = new Map<string, { upload: number; download: number; time: number; item: ConnectionItem }>();
         const enrichedConnections: ConnectionItem[] = [];
@@ -154,18 +167,12 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({ controllerPort
 
         prevConnectionsMapRef.current = currentMap;
         setActiveConnections(enrichedConnections);
-      } catch (err) {
-        console.warn("读取活动连接失败:", err);
-      }
     };
-
-    fetchSnapshot();
-    const interval = setInterval(fetchSnapshot, 1500);
-    return () => {
-      isMounted = false;
-      clearInterval(interval);
-    };
-  }, [isPaused]);
+    const unsubscribe = monitorStore.subscribeConnections(receive);
+    const unsubscribeError = monitorStore.subscribeTraffic(() => setMonitorError(monitorStore.getTraffic().error));
+    receive();
+    return () => { unsubscribe(); unsubscribeError(); };
+  }, [isPaused, visible]);
 
   // 断开单个连接 (D02: 真实校验结果，拒绝断开时不假消失)
   const handleCloseOne = async (id: string, e?: React.MouseEvent) => {
@@ -177,6 +184,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({ controllerPort
         alert("断开连接失败：核心拒绝了关闭该连接的请求");
         return;
       }
+      monitorStore.invalidate();
       setActiveConnections((prev) => prev.filter((c) => c.id !== id));
       const removed = prevConnectionsMapRef.current.get(id);
       if (removed) {
@@ -211,6 +219,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({ controllerPort
       const nowTime = new Date().toLocaleTimeString();
       const newClosed = activeConnections.map((c) => ({ ...c, closedAt: nowTime }));
       setClosedRequests((prev) => [...newClosed, ...prev].slice(0, 500));
+      monitorStore.invalidate();
       setActiveConnections([]);
       prevConnectionsMapRef.current.clear();
     } catch (err: any) {
@@ -227,7 +236,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({ controllerPort
   // 列表过滤与排序
   const displayList = useMemo(() => {
     const list = viewMode === "active" ? activeConnections : closedRequests;
-    const query = searchQuery.trim().toLowerCase();
+    const query = settledQuery.trim().toLowerCase();
 
     return list
       .filter((c) => {
@@ -264,7 +273,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({ controllerPort
         }
         return 0;
       });
-  }, [viewMode, activeConnections, closedRequests, searchQuery, networkFilter, sortBy]);
+  }, [viewMode, activeConnections, closedRequests, settledQuery, networkFilter, sortBy]);
 
   return (
     <div className="space-y-4">
@@ -466,6 +475,8 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({ controllerPort
         </div>
       </div>
 
+      {monitorError && <p role="status" className="text-xs text-amber-600">{monitorError}；当前列表为上次采样。</p>}
+      <div className="flex justify-end"><MonitorPerformanceControl /></div>
       {/* 连接列表区域 */}
       {displayList.length === 0 ? (
         <div className="bg-white/80 dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 rounded-2xl p-12 text-center shadow-sm">
@@ -477,14 +488,14 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({ controllerPort
           </h3>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 max-w-sm mx-auto">
             {viewMode === "active"
-              ? "当系统或应用程序产生网络连接时，将在此处以毫秒级刷新展示。"
-              : "已断开或完成的连接将自动记录在此，供您追溯网络分流与审计。"}
+              ? "连接数据按周期采样，刷新期间可继续搜索和查看详情。"
+              : "仅保留采样中观察到的最近 500 条已关闭连接；短连接可能未被采样。"}
           </p>
         </div>
       ) : (
         <div className="bg-white dark:bg-slate-900/90 border border-slate-200 dark:border-slate-800 rounded-2xl overflow-hidden shadow-sm">
-          <div className="divide-y divide-slate-100 dark:divide-slate-800/80">
-            {displayList.map((conn) => {
+          <VirtualList items={displayList} itemKey={conn => conn.id} rowHeight={100} narrowRowHeight={156}
+            label="连接追踪" renderRow={(conn) => {
               const isClosing = closingIds.has(conn.id);
               const processName = conn.metadata.process || conn.metadata.processPath?.split("\\").pop() || "";
               const hostTitle = conn.metadata.host || conn.metadata.destinationIP || "未知主机";
@@ -494,7 +505,9 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({ controllerPort
                 <div
                   key={conn.id}
                   onClick={() => setSelectedConnection(conn)}
-                  className="p-3.5 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors cursor-pointer flex flex-col md:flex-row md:items-center justify-between gap-3 group"
+                  role="button" tabIndex={0} aria-label={`查看连接 ${hostTitle}`}
+                  onKeyDown={event => { if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); setSelectedConnection(conn); } }}
+                  className="h-full overflow-hidden p-3.5 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors cursor-pointer flex flex-col md:flex-row md:items-center justify-between gap-3 group"
                 >
                   {/* 左侧：主机、IP、进程与协议 */}
                   <div className="flex-1 min-w-0">
@@ -575,8 +588,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({ controllerPort
                   </div>
                 </div>
               );
-            })}
-          </div>
+            }} />
         </div>
       )}
 
@@ -721,4 +733,4 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({ controllerPort
       )}
     </div>
   );
-};
+});

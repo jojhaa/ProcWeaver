@@ -1,16 +1,22 @@
 pub mod commands;
 pub mod storage;
 mod app_lifecycle;
+#[cfg(windows)]
+mod windows_identity;
+mod shutdown;
 pub mod routing_overrides;
 pub mod capture;
 
 use std::sync::Mutex;
 use commands::process::{CoreState, CoreStateMutex};
-use commands::sysproxy::set_system_proxy_raw;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let context = tauri::generate_context!();
+    #[cfg(windows)]
+    windows_identity::initialize(&context.config().identifier)
+        .expect("无法设置 ProcWeaver 的 Windows 任务栏身份");
     let core_state: CoreStateMutex = Mutex::new(CoreState {
         child: None,
         mixed_port: 7890,
@@ -29,11 +35,17 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(core_state)
         .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                window.set_icon(tauri::include_image!("icons/128x128.png"))?;
+            }
             storage::initialize(app)?;
             commands::bundle_launch::dispatch(app.handle(), std::env::args().collect());
             commands::sysproxy::recover_stale_proxy().map_err(std::io::Error::other)?;
-            tauri::async_runtime::spawn(async {
+            let dns_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
                 commands::dns_adapter::auto_recover_dns_on_startup().await;
+                use tauri::Emitter;
+                let _ = dns_app.emit("procweaver-dns-guard-changed", ());
             });
             commands::process_watcher::init_watcher_on_startup();
             commands::local_rules::initialize()?;
@@ -58,7 +70,7 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    if let Err(e) = commands::process::get_core_status(handle.state()).await {
+                    if let Err(e) = commands::process::monitor_core(handle.state()).await {
                         eprintln!("内核监控失败：{e}");
                     }
                 }
@@ -67,9 +79,10 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" && commands::settings::get_general_settings().is_ok_and(|s| s.minimize_on_close) {
-                    // 隐藏失败时允许正常退出，不能留下无法找回的窗口。
-                    if window.hide().is_ok() { api.prevent_close(); }
+                if window.label() == "main" && !shutdown::ready() {
+                    api.prevent_close();
+                    if commands::settings::get_general_settings().is_ok_and(|s| s.minimize_on_close) && window.hide().is_ok() { return; }
+                    shutdown::request(window.app_handle(), 0);
                 }
             }
         })
@@ -103,6 +116,7 @@ pub fn run() {
             commands::profile::add_profile,
             commands::profile::update_profile,
             commands::profile::select_profile,
+            commands::profile_switch::preview_profile_switch,
             commands::profile::delete_profile,
             commands::profile::edit_profile_metadata,
             commands::profile::get_profile_content,
@@ -174,6 +188,8 @@ pub fn run() {
             commands::maintenance::check_core_rules_update,
             commands::maintenance::download_core_rules_update,
             app_lifecycle::update_tray_menu,
+            app_lifecycle::update_tray_traffic,
+            commands::window::window_monitor_visible,
             app_lifecycle::get_tray_payload,
             app_lifecycle::execute_tray_menu_action,
             app_lifecycle::hide_tray_menu,
@@ -186,21 +202,14 @@ pub fn run() {
                 }
             }
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while running tauri application")
         .run(|app_handle, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                capture::stop();
-                commands::process_watcher::stop_watcher_loop();
-                commands::health_probe::shutdown();
-                // 应用程序退出时，自动清理系统代理，并杀掉所有内核进程防止变成孤儿进程
-                if let Ok(mut state) = app_handle.state::<CoreStateMutex>().lock() {
-                    if let Err(e) = commands::process::stop_owned_child(&mut state) {
-                        eprintln!("退出清理失败：{e}");
-                    }
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                if !shutdown::ready() {
+                    api.prevent_exit();
+                    shutdown::request(app_handle, code.unwrap_or(0));
                 }
-                let _ = set_system_proxy_raw(false, None);
-                let _ = commands::dns_adapter::restore_dns_guard();
             }
         });
 }

@@ -4,6 +4,7 @@ import { getStoredHealthProbeConcurrency } from "../utils/taskQueue";
 export async function probeNodeHealthBatch(
   names: string[],
   onResult: (node: string, result: IpHealthInfo | null, completed: number, total: number) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   const unique = [...new Set(names)];
   if (!unique.length) return;
@@ -16,6 +17,7 @@ export async function probeNodeHealthBatch(
   const total = unique.length;
 
   for (let start = 0; start < total; start += chunkSize) {
+    if (signal?.aborted) break;
     const chunk = unique.slice(start, start + chunkSize);
     let session: string | null = null;
     try {
@@ -27,6 +29,7 @@ export async function probeNodeHealthBatch(
           if (index > 0) {
             await new Promise((r) => setTimeout(r, index * 50));
           }
+          if (signal?.aborted) return;
           let result: IpHealthInfo | null = null;
           try {
             result = await invoke<IpHealthInfo>("probe_node_health", { session, node });
@@ -35,7 +38,7 @@ export async function probeNodeHealthBatch(
             console.warn(`节点 [${node}] 体检失败:`, e);
           }
           completed++;
-          onResult(node, result, completed, total);
+          if (!signal?.aborted) onResult(node, result, completed, total);
         })
       );
     } finally {
@@ -58,6 +61,7 @@ export async function probeNodeHealthBatch(
 
 // 读取持久化的健康检测缓存（双保险：磁盘文件 config/health_cache.json + localStorage 互为备份与平滑迁移）
 export async function getPersistedHealthCache(): Promise<Record<string, IpHealthInfo>> {
+  await flushHealthCache().catch(error => console.error("读取前保存体检缓存失败:", error));
   let fileCache: Record<string, IpHealthInfo> = {};
   try {
     const { invoke } = await import("@tauri-apps/api/core");
@@ -80,7 +84,7 @@ export async function getPersistedHealthCache(): Promise<Record<string, IpHealth
   }
 
   // 合并两者（互相兜底，确保万无一失）
-  const merged: Record<string, IpHealthInfo> = { ...localCache, ...fileCache };
+  const merged: Record<string, IpHealthInfo> = { ...localCache, ...fileCache, ...latestCacheToSave };
 
   // 同步两端状态
   try {
@@ -90,50 +94,47 @@ export async function getPersistedHealthCache(): Promise<Record<string, IpHealth
   // 如果本地文件之前为空但 localStorage 里有历史数据，自动同步写入磁盘持久化文件
   if (Object.keys(fileCache).length === 0 && Object.keys(localCache).length > 0) {
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      void invoke("save_health_cache", { cache: merged }).catch(console.error);
+      await savePersistedHealthCache(merged, true);
     } catch {}
   }
 
   return merged;
 }
 
-// 保存持久化健康检测缓存（带节流自动刷盘至本地文件，保障批量并发与随时退出零丢数）
-let pendingSaveTimer: any = null;
+// 合并批量写入；任务结束和离页主动刷盘，失败保留待重试结果。
+let pendingSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let latestCacheToSave: Record<string, IpHealthInfo> | null = null;
+let savingCache: Promise<void> | null = null;
 
-export function savePersistedHealthCache(cache: Record<string, IpHealthInfo>, flushImmediate = false): void {
+export function flushHealthCache(): Promise<void> {
+  if (pendingSaveTimer) clearTimeout(pendingSaveTimer);
+  pendingSaveTimer = null;
+  if (savingCache) return savingCache;
+  savingCache = (async () => {
+    while (latestCacheToSave) {
+      const data = latestCacheToSave;
+      latestCacheToSave = null;
+      try {
+        try { localStorage.setItem("netbox_health_cache", JSON.stringify(data)); } catch {}
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("save_health_cache", { cache: data });
+      } catch (error) {
+        latestCacheToSave ??= data;
+        throw error;
+      }
+    }
+  })().finally(() => { savingCache = null; });
+  return savingCache;
+}
+export function savePersistedHealthCache(cache: Record<string, IpHealthInfo>, flushImmediate = false): Promise<void> {
   latestCacheToSave = cache;
-  try {
-    localStorage.setItem("netbox_health_cache", JSON.stringify(cache));
-  } catch {}
-
-  const doSave = async (data: Record<string, IpHealthInfo>) => {
-    try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("save_health_cache", { cache: data });
-    } catch (e) {
-      console.error("保存健康检测缓存至磁盘失败:", e);
-    }
-  };
-
-  if (flushImmediate) {
-    if (pendingSaveTimer) {
-      clearTimeout(pendingSaveTimer);
-      pendingSaveTimer = null;
-    }
-    void doSave(cache);
-    return;
-  }
-
+  if (flushImmediate) return flushHealthCache();
   if (!pendingSaveTimer) {
     pendingSaveTimer = setTimeout(() => {
-      pendingSaveTimer = null;
-      if (latestCacheToSave) {
-        void doSave(latestCacheToSave);
-      }
+      void flushHealthCache().catch(error => console.error("保存健康检测缓存失败:", error));
     }, 1000);
   }
+  return Promise.resolve();
 }
 
 // 读取持久化的节点地区归属映射（双保险：localStorage 极速恢复）
@@ -141,17 +142,25 @@ export async function getPersistedNodeRegions(): Promise<Record<string, string>>
   try {
     const saved = localStorage.getItem("netbox_node_regions");
     if (saved) {
-      return JSON.parse(saved);
+      return { ...JSON.parse(saved), ...pendingRegions };
     }
   } catch {}
-  return {};
+  return pendingRegions ? { ...pendingRegions } : {};
 }
 
 // 保存持久化的节点地区归属映射
-export function savePersistedNodeRegions(regions: Record<string, string>): void {
-  try {
-    localStorage.setItem("netbox_node_regions", JSON.stringify(regions));
-  } catch {}
+let pendingRegions: Record<string, string> | null = null;
+let regionTimer: ReturnType<typeof setTimeout> | undefined;
+export function flushNodeRegions() {
+  if (regionTimer !== undefined) clearTimeout(regionTimer);
+  regionTimer = undefined;
+  if (!pendingRegions) return;
+  try { localStorage.setItem("netbox_node_regions", JSON.stringify(pendingRegions)); pendingRegions = null; } catch {}
+}
+export function savePersistedNodeRegions(regions: Record<string, string>, flushImmediate = false): void {
+  pendingRegions = regions;
+  if (flushImmediate) flushNodeRegions();
+  else regionTimer ??= setTimeout(flushNodeRegions, 1000);
 }
 
 // 读取已忽略节点名称列表
@@ -171,4 +180,3 @@ export function saveIgnoredNodes(nodes: string[]): void {
     localStorage.setItem("netbox_ignored_nodes", JSON.stringify(nodes));
   } catch {}
 }
-

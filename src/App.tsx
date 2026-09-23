@@ -3,9 +3,8 @@ import { version as appVersion } from "../package.json";
 import { CoreControlBar } from "./components/CoreControlBar";
 import { ExclusionsDialog } from "./components/ExclusionsDialog";
 import { useExclusions } from "./hooks/useExclusions";
-import { useTraffic } from "./hooks/useTraffic";
+import { MonitoringRuntime, MonitoredTrafficOverview } from "./components/MonitoringRuntime";
 import { ActiveExitCard } from "./components/ActiveExitCard";
-import { TrafficOverview } from "./components/TrafficOverview";
 import { ChannelDispatcherView } from "./views/ChannelDispatcherView";
 import { TrafficRoutingView } from "./views/TrafficRoutingView";
 import { ProfilesView } from "./views/ProfilesView";
@@ -18,7 +17,8 @@ import { useCoreMode } from "./hooks/useCoreMode";
 import { useBundleRuntime } from "./hooks/useBusinessBundles";
 import { useBundleTools } from "./hooks/useBundleTools";
 import { BundleToolsDialog } from "./components/business-bundle/BundleToolsDialog";
-import { CoreStatus } from "./types";
+import { useCoreStatus } from "./hooks/useCoreStatus";
+import { appendAppLog } from "./api/logs";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { WindowControls } from "./components/WindowControls";
 import { windowToggleMaximize, windowStartDragging, getProfiles, isTauri } from "./api";
@@ -94,15 +94,19 @@ export function App() {
   const exclusions = useExclusions();
   useBundleRuntime();
   const bundleTools = useBundleTools();
-  const traffic = useTraffic();
   const [activeTab, setActiveTab] = useState("dashboard");
   const [profileCount, setProfileCount] = useState<number | null>(null);
-  const [coreStatus, setCoreStatus] = useState<CoreStatus>({
-    running: false,
-    systemProxyEnabled: false,
-    mixedPort: 7890,
-    controllerPort: 9090,
-  });
+  const { status: coreStatus, refresh: refreshCoreStatus } = useCoreStatus();
+  const lastProxyEvent = React.useRef<number | undefined>();
+  React.useEffect(() => {
+    const event = coreStatus.systemProxy?.lastChange;
+    if (event && event.timestamp !== lastProxyEvent.current) {
+      lastProxyEvent.current = event.timestamp;
+      appendAppLog(event.state === "unknown" || event.state === "external" ? "warning" : "info",
+        `[系统代理] ${event.reason}（${new Date(event.timestamp).toLocaleTimeString()}）`);
+    }
+  }, [coreStatus.systemProxy?.lastChange]);
+
   const coreMode = useCoreMode(coreStatus.pid);
   const mode = coreMode.mode;
   const [activeNodeName, setActiveNodeName] = useState<string>(() => {
@@ -129,7 +133,6 @@ export function App() {
     coreStatus,
     mode,
     activeNodeName,
-    trafficReading: traffic.reading,
   });
 
   React.useEffect(() => {
@@ -170,13 +173,7 @@ export function App() {
     isStartingRef.current = true;
 
     // 启动行为由原生应用按持久化设置执行，页面仅读取状态。
-    import("./api").then(({ getCoreStatus }) => {
-      getCoreStatus()
-        .then((res) => {
-          setCoreStatus(res);
-        })
-        .catch(console.error);
-    });
+    void refreshCoreStatus();
   }, []);
 
   React.useEffect(() => {
@@ -210,7 +207,7 @@ export function App() {
       import("@tauri-apps/api/event").then(({ listen }) => {
         // 1. 系统代理开关联动
         listen<boolean>("netbox-sysproxy-changed", (event) => {
-          setCoreStatus((prev) => ({ ...prev, systemProxyEnabled: event.payload }));
+          void refreshCoreStatus();
           window.dispatchEvent(new CustomEvent("netbox-sysproxy-changed", { detail: event.payload }));
         }).then((un) => unlisteners.push(un));
         listen<string>("netbox-sysproxy-error", (event) => {
@@ -219,11 +216,7 @@ export function App() {
 
         // 2. 核心路由/模式变更联动
         listen("netbox-route-changed", () => {
-          import("./api").then(({ getCoreStatus }) => {
-            getCoreStatus()
-              .then(setCoreStatus)
-              .catch(() => {});
-          });
+          void refreshCoreStatus();
           window.dispatchEvent(new CustomEvent("netbox-route-changed"));
         }).then((un) => unlisteners.push(un));
 
@@ -327,6 +320,7 @@ export function App() {
 
   return (
     <div className="flex h-screen w-screen bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-100 overflow-hidden font-sans transition-colors duration-200 border border-slate-200/80 dark:border-slate-800/80">
+      <MonitoringRuntime />
       {/* 左侧侧边栏 */}
       <aside className="w-60 bg-white/90 dark:bg-slate-900/60 border-r border-slate-200/90 dark:border-slate-800/80 flex flex-col justify-between p-4 backdrop-blur-xl shrink-0 transition-colors duration-200">
         <div>
@@ -637,7 +631,6 @@ export function App() {
                     </div>
                   )}
                   <CoreControlBar
-                    onStatusChange={setCoreStatus}
                     extraAction={
                       <ExclusionsDialog
                         state={exclusions.state}
@@ -656,7 +649,7 @@ export function App() {
                       />
                     }
                   />
-                  <TrafficOverview {...traffic} />
+                  <MonitoredTrafficOverview />
                   <ActiveExitCard
                     proxyPort={coreStatus.running ? coreStatus.mixedPort : undefined}
                     corePid={coreStatus.pid}

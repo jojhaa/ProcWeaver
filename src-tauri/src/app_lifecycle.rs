@@ -31,6 +31,8 @@ pub struct TrayMenuPayload {
     pub mode: String,
     #[serde(rename = "sysProxyEnabled")]
     pub sys_proxy_enabled: bool,
+    #[serde(rename = "sysProxyState", default)]
+    pub sys_proxy_state: String,
     #[serde(rename = "tunEnabled", default)]
     pub tun_enabled: bool,
     #[serde(rename = "autoRun", default)]
@@ -101,13 +103,15 @@ pub fn rebuild_tray_in_place(app: &tauri::AppHandle) {
     }
 }
 
-pub fn notify_sysproxy_changed(app: &tauri::AppHandle, enabled: bool) {
+pub fn notify_sysproxy_changed(app: &tauri::AppHandle, _enabled: bool) {
+    let actual = crate::commands::sysproxy::system_proxy_snapshot();
     if let Ok(mut guard) = CURRENT_TRAY_PAYLOAD.lock() {
         if let Some(payload) = guard.as_mut() {
-            payload.sys_proxy_enabled = enabled;
+            payload.sys_proxy_enabled = actual.enabled();
+            payload.sys_proxy_state = actual.state.clone();
         }
     }
-    let _ = app.emit("netbox-sysproxy-changed", enabled);
+    let _ = app.emit("netbox-sysproxy-changed", actual.enabled());
     rebuild_tray_in_place(app);
 }
 
@@ -165,8 +169,7 @@ pub fn handle_menu_event(app: &tauri::AppHandle, id: &str) {
             let _ = app.emit("procweaver-navigate-tab", "proxies");
         }
         "quit" => {
-            let _ = crate::commands::dns_adapter::restore_dns_guard();
-            app.exit(0);
+            crate::shutdown::request(app, 0);
         }
         "toggle_sysproxy" => {
             let app = app.clone();
@@ -352,14 +355,16 @@ pub fn handle_menu_event(app: &tauri::AppHandle, id: &str) {
             }
         }
         "tool:emergency_reset" => {
-            let _ = crate::commands::dns_adapter::emergency_repair_network();
-            if let Ok(mut guard) = CURRENT_TRAY_PAYLOAD.lock() {
-                if let Some(payload) = guard.as_mut() {
-                    payload.sys_proxy_enabled = false;
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                match crate::commands::dns_adapter::emergency_repair_network().await {
+                    Ok(message) => {
+                        notify_sysproxy_changed(&app, false);
+                        let _ = app.emit("notify-network-repaired", message);
+                    }
+                    Err(error) => { show(&app); let _ = app.emit("netbox-sysproxy-error", error); }
                 }
-            }
-            rebuild_tray_in_place(app);
-            let _ = app.emit("notify-network-repaired", "网络急救完成：已重置网卡 DNS 为 DHCP，并清空系统代理。");
+            });
         }
         "tool:restart_core" => {
             let app_handle = app.clone();
@@ -486,7 +491,7 @@ pub fn build_tray_menu(
     // 4. 核心快捷开关：系统代理 与 进程分流总开关
     let sysproxy_text = format!(
         "系统代理: {}",
-        if payload.sys_proxy_enabled { "✅ 已开启" } else { "❌ 已关闭" }
+        match payload.sys_proxy_state.as_str() { "enabled" => "✅ 已开启", "disabled" => "❌ 已关闭", "external" => "其他代理", _ => "状态未知" }
     );
     let sysproxy_item = MenuItem::with_id(app, "toggle_sysproxy", &sysproxy_text, true, None::<&str>)?;
 
@@ -660,12 +665,54 @@ pub fn build_tray_menu(
     Ok(menu)
 }
 
+fn tray_tooltip(payload: &TrayMenuPayload) -> String {
+        let mode_zh = match payload.mode.as_str() {
+            "global" => "全局",
+            "direct" => "直连",
+            _ => "规则",
+        };
+        let node_str = payload.active_node.as_deref().unwrap_or("未选择");
+        format!(
+            "ProcWeaver V{}\n状态: {}\n出口: {}\n流量: ↓ {} | ↑ {}",
+            env!("CARGO_PKG_VERSION"),
+            if payload.running { mode_zh } else { "已停止" },
+            node_str,
+            format_speed(payload.down_speed.unwrap_or(0.0)),
+            format_speed(payload.up_speed.unwrap_or(0.0))
+        )
+}
+
+#[tauri::command]
+pub fn update_tray_traffic(app: tauri::AppHandle, down_speed: f64, up_speed: f64) -> Result<(), String> {
+    let tooltip = {
+        let mut guard = CURRENT_TRAY_PAYLOAD.lock().map_err(|_| "托盘状态暂不可用")?;
+        let payload = guard.as_mut().ok_or("托盘尚未初始化")?;
+        payload.down_speed = Some(if down_speed.is_finite() { down_speed.max(0.0) } else { 0.0 });
+        payload.up_speed = Some(if up_speed.is_finite() { up_speed.max(0.0) } else { 0.0 });
+        tray_tooltip(payload)
+    };
+    if let Some(tray) = app.tray_by_id("procweaver") { let _ = tray.set_tooltip(Some(tooltip)); }
+    if let Some(window) = app.get_webview_window("tray-menu") {
+        if window.is_visible().unwrap_or(false) {
+            let _ = window.emit("tray-traffic-updated", serde_json::json!({"downSpeed": down_speed, "upSpeed": up_speed}));
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn update_tray_menu(
     app: tauri::AppHandle,
-    payload: TrayMenuPayload,
+    mut payload: TrayMenuPayload,
 ) -> Result<(), String> {
+    let proxy = crate::commands::sysproxy::system_proxy_snapshot();
+    payload.sys_proxy_enabled = proxy.enabled();
+    payload.sys_proxy_state = proxy.state;
     if let Ok(mut guard) = CURRENT_TRAY_PAYLOAD.lock() {
+        if let Some(previous) = guard.as_ref() {
+            payload.down_speed = payload.down_speed.or(previous.down_speed);
+            payload.up_speed = payload.up_speed.or(previous.up_speed);
+        }
         *guard = Some(payload.clone());
     }
     let _ = app.emit("tray-payload-updated", payload.clone());
@@ -675,21 +722,7 @@ pub fn update_tray_menu(
         .unwrap_or_else(|_| "modern".into());
 
     if let Some(tray) = app.tray_by_id("procweaver") {
-        let mode_zh = match payload.mode.as_str() {
-            "global" => "全局",
-            "direct" => "直连",
-            _ => "规则",
-        };
-        let node_str = payload.active_node.as_deref().unwrap_or("未选择");
-        let tooltip = format!(
-            "ProcWeaver V{}\n状态: {}\n出口: {}\n流量: ↓ {} | ↑ {}",
-            env!("CARGO_PKG_VERSION"),
-            if payload.running { mode_zh } else { "已停止" },
-            node_str,
-            format_speed(payload.down_speed.unwrap_or(0.0)),
-            format_speed(payload.up_speed.unwrap_or(0.0))
-        );
-        let _ = tray.set_tooltip(Some(tooltip));
+        let _ = tray.set_tooltip(Some(tray_tooltip(&payload)));
         if style == "classic" {
             if let Ok(new_menu) = build_tray_menu(&app, &payload) {
                 let _ = tray.set_menu(Some(new_menu));
@@ -903,6 +936,7 @@ pub async fn get_tray_payload(app: tauri::AppHandle) -> Option<TrayMenuPayload> 
         running: false,
         mode: "rule".into(),
         sys_proxy_enabled: false,
+        sys_proxy_state: "unknown".into(),
         tun_enabled: false,
         auto_run: false,
         process_enabled: true,
@@ -921,9 +955,9 @@ pub async fn get_tray_payload(app: tauri::AppHandle) -> Option<TrayMenuPayload> 
         }
     }
     // 2. 检查系统代理真实状态
-    if let Ok(sp) = crate::commands::sysproxy::get_system_proxy_status() {
-        payload.sys_proxy_enabled = sp;
-    }
+    let sp = crate::commands::sysproxy::system_proxy_snapshot();
+    payload.sys_proxy_enabled = sp.enabled();
+    payload.sys_proxy_state = sp.state;
     // 3. 检查进程分流真实状态
     if let Ok(ro) = crate::routing_overrides::read() {
         payload.process_enabled = ro.process_enabled;

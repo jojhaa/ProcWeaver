@@ -21,6 +21,12 @@ pub struct LaunchOutcome {
 pub struct EntryStatus {
     pub instance_id:String, pub state:String, pub message:String, pub chains:Vec<String>,
     pub connection_state:String, pub connection_message:String,
+    pub instance_key:String,
+}
+fn instance_key(running:&[Instance],port:u16)->String {
+    if running.is_empty() {return String::new();}
+    let mut identities:Vec<_>=running.iter().map(|p|p.identity.as_str()).collect(); identities.sort_unstable();
+    format!("{port}:{}",identities.join("|"))
 }
 fn application_status(running:&[Instance],port:u16)->(&'static str,String) {
     let connected=running.iter().filter(|p|proxy_matches(&p.args,port)).count();
@@ -42,7 +48,8 @@ fn observe_connections(result:&mut [EntryStatus],value:&serde_json::Value)->Resu
                 let host=connection["metadata"]["host"].as_str().filter(|s|!s.is_empty()).or(connection["metadata"]["destinationIP"].as_str()).unwrap_or("未知目标");
                 let rule=connection["rule"].as_str().unwrap_or("未知规则");
                 let line=format!("{host} · {rule} → {}",if chain.is_empty(){"出口未返回"}else{&chain});
-                if !status.chains.contains(&line) && status.chains.len()<4 {status.chains.push(line);}
+                if !status.chains.contains(&line) {status.chains.push(line);}
+                if status.chains.len() == 4 { break; }
             }
         }
         status.connection_state=if status.chains.is_empty(){"idle"}else{"observed"}.into();
@@ -62,14 +69,20 @@ pub async fn get_bundle_entry_states(instance_ids:Vec<String>)->Result<Vec<Entry
     if instance_ids.len()>128{return Err("一次最多检测 128 个业务包".into());}
     let bundles=routing_overrides::read()?.bundles;
     let selected:Vec<_>=bundles.into_iter().filter(|b|instance_ids.contains(&b.id) && b.enabled).collect();
-    let mut result=tokio::task::spawn_blocking(move||selected.into_iter().map(|bundle| {
+    let mut result=tokio::task::spawn_blocking(move|| {
+        let mut checked: HashMap<PathBuf, Result<Vec<Instance>, String>> = HashMap::new();
+        selected.into_iter().map(|bundle| {
         let outcome=(||{
-            let exe=resolve_executable(&bundle)?; let running=instances(&exe,None)?;
-            Ok::<_,String>(application_status(&running,bundle.port))
+            let exe=resolve_executable(&bundle)?;
+            let running=checked.entry(exe.clone()).or_insert_with(|| instances(&exe,None));
+            match running { Ok(running) => {
+                let (state,message)=application_status(running,bundle.port);
+                Ok::<_,String>((state,message,instance_key(running,bundle.port)))
+            }, Err(error) => Err(error.clone()) }
         })();
-        let (state,message)=outcome.unwrap_or_else(|message|("unverified",message));
-        EntryStatus{instance_id:bundle.id,state:state.into(),message,chains:vec![],connection_state:"core_stopped".into(),connection_message:"核心未运行，无法核验连接分流".into()}
-    }).collect::<Vec<_>>()).await.map_err(|_|"应用检测任务失败")?;
+        let (state,message,instance_key)=outcome.unwrap_or_else(|message|("unverified",message,String::new()));
+        EntryStatus{instance_id:bundle.id,state:state.into(),message,instance_key,chains:vec![],connection_state:"core_stopped".into(),connection_message:"核心未运行，无法核验连接分流".into()}
+    }).collect::<Vec<_>>() }).await.map_err(|_|"应用检测任务失败")?;
     if process::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
         let observed=read_connections().await.and_then(|value|observe_connections(&mut result,&value));
         if let Err(error)=observed {
@@ -80,7 +93,13 @@ pub async fn get_bundle_entry_states(instance_ids:Vec<String>)->Result<Vec<Entry
 }
 #[derive(Clone)]
 struct Instance { pid: u32, identity: String, args: Vec<String> }
-struct Confirmation { request: LaunchRequest, exe: PathBuf, directory: String, args: Vec<String>, instances: Vec<Instance>, expires: Instant, port: u16 }
+struct Confirmation { request: LaunchRequest, exe: PathBuf, directory: String, args: Vec<String>, instances: Vec<Instance>, expires: Instant, port: u16, main_exe: String, enabled: bool }
+impl Confirmation {
+    fn matches(&self,request:&LaunchRequest,bundle:&BundleRoute)->bool {
+        self.expires>Instant::now() && self.request==*request && self.port==bundle.port
+            && self.main_exe==bundle.main_exe && self.enabled==bundle.enabled
+    }
+}
 
 pub fn id() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -193,12 +212,13 @@ fn instances(exe:&Path,args:Option<&[String]>)->Result<Vec<Instance>,String> {
         result.push(Instance {pid,identity:entry.identity,args:arguments.into_iter().skip(1).collect()});
     } Ok(result)
 }
-async fn ready(app:&tauri::AppHandle,id:&str)->Result<BundleRoute,String> {
+async fn ready(app:&tauri::AppHandle,id:&str,allow_start:bool)->Result<BundleRoute,String> {
     let _lock=process::LIFECYCLE.lock().await;
     let bundle=route(id)?;
     let config=routing_overrides::read()?;
     if bundle.enabled && !config.process_enabled {return Err("进程分流总开关已关闭，请先应用业务包规则".into());}
-    process::start_core_locked(None,&app.state()).await?;
+    if allow_start {process::start_core_locked(None,&app.state()).await?;}
+    else if !process::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {return Err("核心已停止，未尝试热替换；请启动核心后重新检测".into());}
     let raw=std::fs::read_to_string(crate::storage::data_dir().join("core_data/config.yaml")).map_err(|_|"读取运行配置失败")?;
     crate::capture::confirm_runtime(&raw).await?;
     if bundle.port==0 {return Err("业务包入口未分配".into());}
@@ -208,13 +228,16 @@ async fn ready(app:&tauri::AppHandle,id:&str)->Result<BundleRoute,String> {
 }
 
 #[tauri::command]
-pub async fn launch_bundle_app(app:tauri::AppHandle, request:LaunchRequest, confirmation:Option<String>)->Result<LaunchOutcome,String> {
+pub async fn launch_bundle_app(app:tauri::AppHandle, request:LaunchRequest, confirmation:Option<String>, prepare_only:Option<bool>)->Result<LaunchOutcome,String> {
     let _launch=LAUNCH.lock().await;
-    let bundle=ready(&app,&request.instance_id).await?;
+    let prepare_only=prepare_only.unwrap_or(false);
+    if prepare_only && (confirmation.is_some() || request.shortcut_id.is_some()) {return Err("自动检测只允许准备主程序的重启确认".into());}
+    let bundle=ready(&app,&request.instance_id,!prepare_only && confirmation.is_none()).await?;
+    if prepare_only && !bundle.enabled {return Err("业务包已停用，未尝试热替换".into());}
     let entry=format!("127.0.0.1:{}",bundle.port);
     let mut plan=if let Some(token)=confirmation {
         let plan=CONFIRMATIONS.lock().unwrap_or_else(|p|p.into_inner()).remove(&token).ok_or("重启确认已失效，请重新检测")?;
-        if plan.expires<Instant::now() || plan.request!=request || plan.port!=bundle.port {return Err("配置或确认已改变，请重新检测".into());}
+        if !plan.matches(&request,&bundle) {return Err("配置或确认已改变，请重新检测".into());}
         let exe=plan.exe.clone(); let args=plan.args.clone();
         let current=tokio::task::spawn_blocking(move||instances(&exe,Some(&args))).await.map_err(|_|"检测任务失败")??;
         let mut before:Vec<_>=plan.instances.iter().map(|p|p.identity.clone()).collect(); before.sort();
@@ -235,13 +258,17 @@ pub async fn launch_bundle_app(app:tauri::AppHandle, request:LaunchRequest, conf
         let directory=selected.as_ref().map(|l|l.directory.clone()).unwrap_or_default();
         let probe_exe=exe.clone(); let probe_args=args.clone(); let explicit_profile=selected.is_some();
         let running=tokio::task::spawn_blocking(move||instances(&probe_exe,if explicit_profile{Some(&probe_args)}else{None})).await.map_err(|_|"检测应用任务失败")??;
+        // Background detection must never reopen an app which exited after polling.
+        if prepare_only && running.is_empty() {
+            return Ok(LaunchOutcome{state:"not_running".into(),message:"应用已退出，未自动启动；需要时请手动启动应用".into(),confirmation:None,entry,process_count:0});
+        }
         if !running.is_empty() && running.iter().all(|p|proxy_matches(&p.args,bundle.port)) {
             if selected.is_some() {spawn_application(&exe,&directory,args,bundle.port)?;}
             return Ok(LaunchOutcome{state:"reused".into(),message:"已有实例的启动参数已接入此业务包入口，继续沿用现有资料；实际连接出口仍以连接记录为准".into(),confirmation:None,entry,process_count:running.len()});
         }
         let args=if running.len()==1 {with_shortcut_args(&running[0].args,&args)}else{args};
         if running.len()>1 {return Err("发现多个主实例，无法安全选择资料；请通过对应资料的桌面快捷方式接入，或先正常退出这些实例".into());}
-        let plan=Confirmation{request:request.clone(),exe,directory,args,instances:running,expires:Instant::now()+Duration::from_secs(120),port:bundle.port};
+        let plan=Confirmation{request:request.clone(),exe,directory,args,instances:running,expires:Instant::now()+Duration::from_secs(120),port:bundle.port,main_exe:bundle.main_exe.clone(),enabled:bundle.enabled};
         if !plan.instances.is_empty() {
             let count=plan.instances.len(); let token=id(); let mut confirmations=CONFIRMATIONS.lock().unwrap_or_else(|p|p.into_inner());
             confirmations.retain(|_,p|p.expires>Instant::now()); confirmations.insert(token.clone(),plan);
@@ -249,8 +276,8 @@ pub async fn launch_bundle_app(app:tauri::AppHandle, request:LaunchRequest, conf
         } plan
     };
     // Config may have changed while the user was closing the app. Resolve the entry again.
-    let current=ready(&app,&request.instance_id).await?;
-    if current.port!=plan.port {return Err("业务包入口已改变，请重新启动".into());}
+    let current=ready(&app,&request.instance_id,false).await?;
+    if current.port!=plan.port || current.main_exe!=plan.main_exe || current.enabled!=plan.enabled {return Err("业务包配置已改变，请重新启动".into());}
     let exe=plan.exe.clone(); let args=plan.args.clone();
     if !tokio::task::spawn_blocking(move||instances(&exe,Some(&args))).await.map_err(|_|"启动前核验失败")??.is_empty() {return Err("应用又启动了新实例，请重新检测，未重复启动".into());}
     spawn_application(&plan.exe,&plan.directory,std::mem::take(&mut plan.args),plan.port)?;
@@ -261,7 +288,7 @@ pub async fn launch_bundle_app(app:tauri::AppHandle, request:LaunchRequest, conf
 mod tests {
     use super::*;
     #[test] fn connection_probe_distinguishes_empty_invalid_and_observed() {
-        let mut states=vec![EntryStatus{instance_id:"browser".into(),state:"connected".into(),message:String::new(),chains:vec![],connection_state:String::new(),connection_message:String::new()}];
+        let mut states=vec![EntryStatus{instance_id:"browser".into(),state:"connected".into(),message:String::new(),instance_key:String::new(),chains:vec![],connection_state:String::new(),connection_message:String::new()}];
         assert!(observe_connections(&mut states,&serde_json::json!({"error":"unauthorized"})).is_err());
         observe_connections(&mut states,&serde_json::json!({"connections":[]})).unwrap();
         assert_eq!(states[0].connection_state,"idle");
@@ -273,6 +300,27 @@ mod tests {
         assert_eq!(states[0].connection_state,"observed");assert_eq!(states[0].chains.len(),2);
         assert!(states[0].chains[0].contains("unmatched.example · RuleSet → original-node"));
         assert!(states[0].chains[1].contains("matched.example · AND → chosen-node"));
+    }
+    #[test] fn restart_prompt_identity_tracks_creation_and_entry_not_enumeration_order() {
+        let one=Instance{pid:1,identity:"1:100".into(),args:vec![]};
+        let two=Instance{pid:2,identity:"2:200".into(),args:vec![]};
+        let key=instance_key(&[one.clone(),two.clone()],34000);
+        assert_eq!(key,instance_key(&[two,one.clone()],34000));
+        assert_ne!(instance_key(&[one.clone()],34000),instance_key(&[one.clone()],34001));
+        let reused_pid=Instance{identity:"1:300".into(),..one.clone()};
+        assert_ne!(instance_key(&[one],34000),instance_key(&[reused_pid],34000));
+        assert!(instance_key(&[],34000).is_empty());
+    }
+    #[test] fn restart_confirmation_rejects_changed_app_disabled_bundle_and_expiry() {
+        let request=LaunchRequest{instance_id:"browser".into(),shortcut_id:None};
+        let mut bundle:BundleRoute=serde_json::from_value(serde_json::json!({"id":"browser","name":"浏览器","mainExe":"chrome.exe","enabled":true,"mainTarget":null,"dnsTarget":null,"port":34000})).unwrap();
+        let mut plan=Confirmation{request:request.clone(),exe:PathBuf::from("chrome.exe"),directory:String::new(),args:vec![],instances:vec![],expires:Instant::now()+Duration::from_secs(120),port:34000,main_exe:"chrome.exe".into(),enabled:true};
+        assert!(plan.matches(&request,&bundle));
+        bundle.enabled=false; assert!(!plan.matches(&request,&bundle)); bundle.enabled=true;
+        bundle.main_exe="other.exe".into(); assert!(!plan.matches(&request,&bundle)); bundle.main_exe="chrome.exe".into();
+        bundle.port=34001; assert!(!plan.matches(&request,&bundle)); bundle.port=34000;
+        let other=LaunchRequest{instance_id:"another".into(),shortcut_id:None}; assert!(!plan.matches(&other,&bundle));
+        plan.expires=Instant::now()-Duration::from_secs(1); assert!(!plan.matches(&request,&bundle));
     }
     #[test] fn profiles_with_mixed_entries_are_not_all_connected() {
         let one=Instance{pid:1,identity:"one".into(),args:vec!["--proxy-server=127.0.0.1:34000".into()]};

@@ -1,7 +1,9 @@
 import React, { useState, useEffect } from "react";
 import { Zap, Bot, Shield, RefreshCw, Cpu, Check } from "lucide-react";
 import { getGeneralSettings, saveGeneralSettings, getActiveTrafficDriver, GeneralSettings } from "../api/settings";
-import { getCoreStatus, toggleSystemProxy } from "../api";
+import { toggleSystemProxy } from "../api";
+
+import { useCoreStatus } from "../hooks/useCoreStatus";
 
 export type TrafficModeType = "app_proxy" | "smart_hybrid" | "tun";
 
@@ -13,24 +15,20 @@ interface Props {
 export const TrafficModeSelector: React.FC<Props> = ({ onModeChanged, className = "" }) => {
   const [currentMode, setCurrentMode] = useState<TrafficModeType>("app_proxy");
   const [activeDriver, setActiveDriver] = useState<string>("app_proxy");
-  const [sysProxyEnabled, setSysProxyEnabled] = useState(false);
+  const { status: coreStatus, run, pending } = useCoreStatus();
   const [switching, setSwitching] = useState(false);
   const [feedbackMsg, setFeedbackMsg] = useState<string | null>(null);
 
   // 加载当前设置与底层驱动状态
   const loadDriverStatus = async () => {
     try {
-      const [settings, driver, coreStatus] = await Promise.all([
+      const [settings, driver] = await Promise.all([
         getGeneralSettings(),
         getActiveTrafficDriver(),
-        getCoreStatus().catch(() => ({ systemProxyEnabled: false })),
       ]);
       const mode = (settings.trafficMode as TrafficModeType) || (settings.tunMode ? "tun" : "app_proxy");
       setCurrentMode(mode);
       setActiveDriver(driver);
-      if (coreStatus) {
-        setSysProxyEnabled(coreStatus.systemProxyEnabled);
-      }
     } catch (e) {
       console.error("读取驱动接管模式失败:", e);
     }
@@ -174,7 +172,7 @@ export const TrafficModeSelector: React.FC<Props> = ({ onModeChanged, className 
       </div>
 
       {/* 极简协同小建议 (仅处于纯应用层代理且未开系统代理时温和展示，不喧宾夺主) */}
-      {currentMode === "app_proxy" && !sysProxyEnabled && (
+      {currentMode === "app_proxy" && coreStatus.systemProxy?.state === "disabled" && (
         <div className="mt-2.5 pt-2 border-t border-slate-100 dark:border-slate-800/60 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500 dark:text-slate-400 animate-in fade-in duration-200">
           <div className="flex items-center space-x-1.5">
             <span className="text-amber-500">💡</span>
@@ -182,14 +180,16 @@ export const TrafficModeSelector: React.FC<Props> = ({ onModeChanged, className 
           </div>
           <button
             type="button"
+            disabled={pending || !coreStatus.running}
             onClick={async () => {
               try {
-                await toggleSystemProxy(true);
-                setSysProxyEnabled(true);
-                setFeedbackMsg("已开启系统代理，浏览器域名分流现已接入");
+                const actual = await run(() => toggleSystemProxy(true, coreStatus.mixedPort));
+                setFeedbackMsg(actual.systemProxy?.state === "enabled"
+                  ? "已开启系统代理，浏览器域名分流现已接入"
+                  : actual.systemProxy?.message || "系统代理状态尚未确认");
                 setTimeout(() => setFeedbackMsg(null), 3000);
               } catch (err) {
-                console.error(err);
+                setFeedbackMsg(`开启失败：${String(err)}`);
               }
             }}
             className="px-2.5 py-0.5 rounded-lg bg-indigo-50 dark:bg-indigo-950/50 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 text-indigo-600 dark:text-indigo-400 font-medium transition cursor-pointer text-[11px] shrink-0"
@@ -209,4 +209,3 @@ export const TrafficModeSelector: React.FC<Props> = ({ onModeChanged, className 
     </div>
   );
 };
-

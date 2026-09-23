@@ -40,10 +40,11 @@ pub struct Overrides {
     pub process_rules: Vec<ProcessRule>, pub dns_rules: Vec<DnsRule>,
     #[serde(default)] pub bundles: Vec<BundleRoute>,
     #[serde(default = "first_bundle_port")] pub next_bundle_port: u16,
+    #[serde(default)] pub retain_foreign_targets: bool,
 }
 fn first_bundle_port() -> u16 { 34000 }
 impl Default for Overrides {
-    fn default() -> Self { Self { schema_version: 1, revision: 0, process_enabled: false,
+    fn default() -> Self { Self { retain_foreign_targets: false, schema_version: 1, revision: 0, process_enabled: false,
         dns_enabled: false, process_rules: vec![], dns_rules: vec![], bundles: vec![], next_bundle_port: first_bundle_port() } }
 }
 

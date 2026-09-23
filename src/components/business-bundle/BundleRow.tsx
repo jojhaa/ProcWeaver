@@ -22,6 +22,7 @@ interface Props {
   onLaunch: () => void;
   onShortcuts: () => void;
   availableProxies: string[];
+  preservedBinding?: boolean;
   isExpanded: boolean;
   onToggleExpand: () => void;
   onToggleSwitch: (instanceId: string, nextState: boolean) => void;
@@ -44,6 +45,7 @@ export const BundleRow: React.FC<Props> = ({
   onLaunch,
   onShortcuts,
   availableProxies,
+  preservedBinding = false,
   isExpanded,
   onToggleExpand,
   onToggleSwitch,
@@ -109,7 +111,7 @@ export const BundleRow: React.FC<Props> = ({
       {/* 行头部：双层丰富控制区 (包含开关 + 智能守护设置) */}
       <div
         onClick={onToggleExpand}
-        className="p-4 space-y-3 cursor-pointer select-none hover:bg-slate-50/80 dark:hover:bg-slate-850/70 transition"
+        className="p-4 space-y-3 cursor-pointer select-none hover:bg-slate-50/80 dark:hover:bg-slate-800/50 transition"
       >
         {/* 上层：图标、名称、模式徽章、主业务出口选择 */}
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -156,8 +158,8 @@ export const BundleRow: React.FC<Props> = ({
             <span className="text-xs text-slate-500 dark:text-slate-400 font-medium">主业务出口:</span>
             <select
               aria-label={`${def.packageName}主业务出口`}
-              value={boundNode || ""}
-              onChange={(e) => onSelectNodeChange(instance.instanceId, e.target.value)}
+              value={preservedBinding ? "__pw_preserved_binding__" : boundNode || ""}
+              onChange={(e) => { if (e.target.value !== "__pw_preserved_binding__") onSelectNodeChange(instance.instanceId, e.target.value); }}
               className={`bg-white dark:bg-slate-950 border rounded-lg px-3 py-1.5 text-xs font-bold focus:outline-none cursor-pointer transition ${
                 boundNode
                   ? "border-emerald-500/50 text-emerald-600 dark:text-emerald-400 hover:border-indigo-500"
@@ -165,7 +167,8 @@ export const BundleRow: React.FC<Props> = ({
               }`}
             >
               <option value="">未指定出口 (点击开启以绑定)...</option>
-              {boundNode && !availableProxies.includes(boundNode) && <option value={boundNode}>不可用：{boundNode}</option>}
+              {preservedBinding && <option value="__pw_preserved_binding__">原订阅绑定：{boundNode}</option>}
+              {!preservedBinding && boundNode && !availableProxies.includes(boundNode) && <option value={boundNode}>不可用：{boundNode}</option>}
               {availableProxies.map((node) => (
                 <option key={node} value={node}>
                   {node}
@@ -178,9 +181,9 @@ export const BundleRow: React.FC<Props> = ({
         {/* 下层控制中枢：【智能守护设置】 + 【双击防卡死工具】 + 【主开关】 */}
         <div className="flex flex-wrap items-center justify-between gap-3 pt-2.5 border-t border-slate-100 dark:border-slate-800 text-xs">
           <div className="flex flex-wrap items-center gap-3">
-            {/* 1. 单包智能守护三档设置 */}
+            {/* 1. 单包智能守护；热替换必须显式选择并逐次确认重启 */}
             <div
-              className="flex items-center bg-slate-100/80 dark:bg-slate-950 p-1 rounded-xl border border-slate-200 dark:border-slate-800 shadow-2xs"
+              className="flex flex-wrap items-center bg-slate-100/80 dark:bg-slate-950 p-1 rounded-xl border border-slate-200 dark:border-slate-800 shadow-2xs"
               onClick={(e) => e.stopPropagation()}
             >
               <span className="text-[11px] text-slate-500 dark:text-slate-400 pl-2 pr-1.5 font-medium flex items-center space-x-1">
@@ -190,18 +193,33 @@ export const BundleRow: React.FC<Props> = ({
               <button
                 type="button"
                 onClick={() => onChangeWatcherMode(instance.instanceId, "auto")}
+                aria-pressed={instance.watcherMode === "auto"}
                 className={`px-2.5 py-1 rounded-lg font-bold text-[11px] transition cursor-pointer ${
                   instance.watcherMode === "auto"
                     ? "bg-purple-600 text-white shadow"
                     : "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white"
                 }`}
-                title="自动检测本包应用是否使用正确入口；需要重启时明确提示，保留用户资料"
+                title="自动检测本包入口，在卡片展示结果；不主动请求重启"
               >
                 ⚡ 自动检测
               </button>
               <button
                 type="button"
+                onClick={() => onChangeWatcherMode(instance.instanceId, "hot_swap")}
+                aria-pressed={instance.watcherMode === "hot_swap"}
+                className={`px-2.5 py-1 rounded-lg font-bold text-[11px] transition cursor-pointer ${
+                  instance.watcherMode === "hot_swap"
+                    ? "bg-purple-600 text-white shadow"
+                    : "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white"
+                }`}
+                title="自动检测；已接入应用在线切换出口，入口不正确时提示，确认后正常重启并沿用原资料"
+              >
+                🔄 热替换
+              </button>
+              <button
+                type="button"
                 onClick={() => onChangeWatcherMode(instance.instanceId, "notify")}
+                aria-pressed={instance.watcherMode === "notify"}
                 className={`px-2.5 py-1 rounded-lg font-medium text-[11px] transition cursor-pointer ${
                   instance.watcherMode === "notify"
                     ? "bg-indigo-600 text-white shadow"
@@ -214,6 +232,7 @@ export const BundleRow: React.FC<Props> = ({
               <button
                 type="button"
                 onClick={() => onChangeWatcherMode(instance.instanceId, "disabled")}
+                aria-pressed={instance.watcherMode === "disabled"}
                 className={`px-2.5 py-1 rounded-lg font-medium text-[11px] transition cursor-pointer ${
                   instance.watcherMode === "disabled"
                     ? "bg-slate-300 text-slate-800 dark:bg-slate-700 dark:text-white shadow"
@@ -292,6 +311,9 @@ export const BundleRow: React.FC<Props> = ({
         <p className={entry.connectionState === "error" ? "text-amber-700 dark:text-amber-300" : ""}>连接核验：{entry.connectionMessage}</p>
         {entry.chains.map(chain => <p key={chain}>{chain}</p>)}
       </div>}
+      {instance.watcherMode === "hot_swap" && <p className="px-4 pb-3 text-xs text-slate-500 dark:text-slate-400">
+        热替换：已接入应用的新连接跟随本包出口；入口不正确时提示，确认后正常重启。暂不重启后，可点击“检测并启动应用”重试。
+      </p>}
 
       {/* 展开内容区 (Detail Drawer) */}
       {isExpanded && (
