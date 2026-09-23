@@ -90,15 +90,17 @@ impl Tracker {
             warnings: self.warning.as_ref().map(|(message, _)| vec![message.clone()]).unwrap_or_default() }
     }
 }
-fn is_windows_console_host(path: &str) -> bool {
-    // 只排除系统目录中的控制台宿主本身，不能按文件名排除同名业务程序，
-    // 也不能剪断祖先链：宿主下面的真实业务进程仍须继承根规则。
+fn is_windows_process_bridge(path: &str) -> bool {
+    // 系统控制台宿主和命令启动器只作为继承链中间节点，不自动生成全局路径规则。
+    // 不剪断祖先链、不按文件名放行同名业务程序；显式规则仍由调用方优先处理。
+    // PowerShell、Node 等可直接联网的解释器不属于此例外。
     #[cfg(windows)] {
         let system_root = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()));
         let path = path.replace('/', "\\");
         let path = path.strip_prefix(r"\\?\").unwrap_or(&path);
         return ["System32", "SysWOW64"].iter().any(|dir|
-            path.eq_ignore_ascii_case(&system_root.join(dir).join("conhost.exe").to_string_lossy()));
+            ["conhost.exe", "cmd.exe"].iter().any(|exe|
+                path.eq_ignore_ascii_case(&system_root.join(dir).join(exe).to_string_lossy())));
     }
     #[cfg(not(windows))] { let _ = path; false }
 }
@@ -122,7 +124,7 @@ pub fn derive(config: &Overrides, entries: &[ProcessEntry]) -> (Vec<ProcessRule>
     for p in entries {
         let Some(path) = &p.executable_path else { continue; };
         if rules.iter().any(|r| if r.match_kind == "path" { r.match_value.eq_ignore_ascii_case(path) } else { r.match_value.eq_ignore_ascii_case(&p.name) }) { continue; }
-        if is_windows_console_host(path) { continue; }
+        if is_windows_process_bridge(path) { continue; }
         let root = p.ancestors.iter().find_map(|(_, ancestor_path)| {
             let file_name = std::path::Path::new(ancestor_path).file_name().and_then(|f| f.to_str()).unwrap_or("");
             rules.iter().find(|r| {

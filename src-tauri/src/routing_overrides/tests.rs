@@ -256,6 +256,57 @@ fn shared_system_console_hosts_do_not_conflict_or_break_business_descendants() {
     assert!(value["rules"].as_sequence().unwrap().iter().any(|r| r.as_str() == Some(&format!("PROCESS-PATH,{console},DIRECT"))));
 }
 
+#[cfg(windows)]
+#[test]
+fn shared_system_cmd_keeps_each_business_descendant_and_explicit_rules() {
+    let system_root = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+    let mut first = rule("codex.exe"); first.match_kind = "name".into(); first.target = Some(target("JP02"));
+    let mut second = rule("language_server.exe"); second.match_kind = "name".into(); second.target = Some(target("JP03"));
+    let c = Overrides { process_enabled: true, process_rules: vec![first, second], ..Overrides::default() };
+    let raw = "proxies:\n- {name: JP02, type: socks5, server: 127.0.0.1, port: 1}\n- {name: JP03, type: socks5, server: 127.0.0.1, port: 2}\nrules: ['MATCH,DIRECT']\n";
+    for directory in ["System32", "SysWOW64"] {
+        let cmd = system_root.join(directory).join("cmd.exe").to_string_lossy().into_owned();
+        let other_spelling = format!(r"\\?\{}", cmd.to_uppercase());
+        let mut entries = vec![
+            entry("cmd-a", &cmd, &[r"C:\apps\codex.exe"]),
+            entry("cmd-b", &cmd, &[r"C:\apps\language_server.exe"]),
+            entry("cmd-c", &other_spelling, &[r"C:\apps\codex.exe"]),
+            entry("cmd-d", &other_spelling.replace('\\', "/"), &[r"C:\apps\language_server.exe"]),
+            entry("worker-a", r"C:\openai\worker.exe", &[&cmd, r"C:\apps\codex.exe"]),
+            entry("worker-b", r"C:\antigravity\worker.exe", &[&cmd, r"C:\apps\language_server.exe"]),
+        ];
+        for (i, item) in entries.iter_mut().enumerate() { item.pid = 100 + i as u32; }
+        // 即使根进程或中间 cmd 已退出，已确认的祖先链仍须保留各自出口。
+        let (derived, errors) = tracker::derive(&c, &entries);
+        assert!(errors.is_empty(), "{errors:?}"); assert_eq!(derived.len(), 2);
+        let yaml: Value = serde_yaml::from_str(&composer::compose(raw, &c, "default", &derived).unwrap()).unwrap();
+        let rules = yaml["rules"].as_sequence().unwrap();
+        for expected in [r"PROCESS-PATH,C:\openai\worker.exe,JP02", r"PROCESS-PATH,C:\antigravity\worker.exe,JP03"] {
+            assert!(rules.iter().any(|r| r.as_str() == Some(expected)), "{rules:?}");
+        }
+        assert!(!rules.iter().any(|r| r.as_str().unwrap().to_lowercase().contains("cmd.exe,")));
+        // 例外只影响自动派生，用户显式的路径/名称规则仍有效。
+        for kind in ["path", "name"] {
+            let mut explicit = rule(if kind == "path" { &cmd } else { "cmd.exe" });
+            explicit.match_kind = kind.into(); explicit.action = "direct".into(); explicit.target = None;
+            explicit.include_descendants = false;
+            let mut configured = c.clone(); configured.process_rules.push(explicit);
+            let (derived, errors) = tracker::derive(&configured, &entries);
+            assert!(errors.is_empty()); assert_eq!(derived.len(), 2);
+            let yaml: Value = serde_yaml::from_str(&composer::compose(raw, &configured, "default", &derived).unwrap()).unwrap();
+            let expected = if kind == "path" { format!("PROCESS-PATH,{cmd},DIRECT") } else { "PROCESS-NAME,cmd.exe,DIRECT".into() };
+            assert!(yaml["rules"].as_sequence().unwrap().iter().any(|r| r.as_str() == Some(&expected)));
+        }
+        // 不能借此放行系统 cmd 下真正冲突的联网后代或任意同名程序。
+        for path in [r"C:\apps\cmd.exe", r"C:\apps\node.exe", r"C:\Program Files\PowerShell\7\pwsh.exe"] {
+            let shared = [entry("shared-a", path, &[&cmd, r"C:\apps\codex.exe"]),
+                entry("shared-b", path, &[&cmd, r"C:\apps\language_server.exe"])];
+            let (derived, errors) = tracker::derive(&c, &shared);
+            assert_eq!(errors.len(), 1); assert_eq!(derived[0].action, "reject");
+        }
+    }
+}
+
 #[test]
 fn test_ensure_bt_pt_and_proxy_group() {
     let raw = r#"

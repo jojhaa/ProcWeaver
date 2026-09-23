@@ -2869,7 +2869,7 @@ dependencies = [
 
 [[package]]
 name = "proc-weaver"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
