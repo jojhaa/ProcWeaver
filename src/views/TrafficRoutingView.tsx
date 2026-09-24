@@ -13,7 +13,7 @@ const STORAGE_KEY = "netbox_routing_active_tab";
 
 export const TrafficRoutingView: React.FC<Props> = ({ mode, coreMode }) => {
   const routingState = useBusinessBundles();
-  const isProcessEnabled = Boolean(routingState.view?.config?.processEnabled);
+  const isProcessEnabled = Boolean(routingState.view && routingState.view.config.bundlesEnabled !== false);
 
   const [activeTab, setActiveTab] = useState<"rules" | "apps">(() => {
     try {
@@ -56,7 +56,7 @@ export const TrafficRoutingView: React.FC<Props> = ({ mode, coreMode }) => {
                   : "bg-slate-200/80 text-slate-500 dark:bg-slate-800 dark:text-slate-400"
               }`}
             >
-              {isProcessEnabled ? "● 已启用" : "○ 默认网络"}
+              {routingState.masterPending ? "切换中" : !routingState.view ? "待确认" : isProcessEnabled ? "● 已启用" : "○ 已暂停"}
             </span>
           </button>
 

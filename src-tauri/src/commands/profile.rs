@@ -1321,9 +1321,7 @@ pub async fn sync_smart_groups_to_core(
         get_business_channels().unwrap_or_default()
     };
 
-    let list = read_profiles_index();
-    let current = list.iter().find(|p| p.is_selected).ok_or("当前未选中任何订阅配置文件")?;
-    let full_path = get_base_dir().join(&current.file_path);
+    let (_, full_path) = crate::routing_overrides::current_source();
     let previous = fs::read(&full_path).map_err(|e| e.to_string())?;
     let previous_str = String::from_utf8_lossy(&previous);
 

@@ -8,6 +8,7 @@ interface Props {
   onSave: (rule: SmartGroupRule) => Promise<void> | void;
   editingRule?: SmartGroupRule | null;
   allProxyNames: string[];
+  proxyLabels?: Record<string, string>;
   fallbackOptions: string[];
   otherSmartGroupNames?: string[];
 }
@@ -18,6 +19,7 @@ export const SmartGroupModal: React.FC<Props> = ({
   onSave,
   editingRule,
   allProxyNames,
+  proxyLabels = {},
   fallbackOptions,
   otherSmartGroupNames = [],
 }) => {
@@ -416,7 +418,7 @@ export const SmartGroupModal: React.FC<Props> = ({
                     <optgroup label="所有原始节点">
                       {allProxyNames.map((node) => (
                         <option key={node} value={node}>
-                          📍 {node}
+                          📍 {proxyLabels[node] || node}
                         </option>
                       ))}
                     </optgroup>
@@ -471,7 +473,7 @@ export const SmartGroupModal: React.FC<Props> = ({
                     <optgroup label="所有原始节点">
                       {allProxyNames.map((node) => (
                         <option key={node} value={node}>
-                          📍 {node}
+                          📍 {proxyLabels[node] || node}
                         </option>
                       ))}
                     </optgroup>
@@ -630,7 +632,7 @@ export const SmartGroupModal: React.FC<Props> = ({
                             <Square className="w-4 h-4 text-slate-400 shrink-0" />
                           )}
                           <span className="truncate" title={name}>
-                            {name}
+                            {proxyLabels[name] || name}
                           </span>
                         </div>
                       </button>

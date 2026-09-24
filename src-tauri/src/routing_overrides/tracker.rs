@@ -117,6 +117,7 @@ pub fn conflict_message(conflicts: &[String]) -> Option<String> {
 }
 
 pub fn derive(config: &Overrides, entries: &[ProcessEntry]) -> (Vec<ProcessRule>, Vec<String>) {
+    let config = config.effective();
     let mut derived = BTreeMap::<String, ProcessRule>::new(); let mut conflicts = Vec::new();
     let mut conflicted_paths = HashSet::new();
     if !config.process_enabled { return (vec![], vec![]); }
@@ -165,7 +166,7 @@ pub async fn run() {
         let config = match super::read() { Ok(c) => c, Err(e) => {
             TRACKER.lock().unwrap_or_else(|p| p.into_inner()).apply_error = Some(e); continue;
         } };
-        let enabled = crate::commands::process::ACTIVE.load(Ordering::SeqCst) && config.process_enabled && config.process_rules.iter().any(|r| r.enabled && r.include_descendants);
+        let enabled = crate::commands::process::ACTIVE.load(Ordering::SeqCst) && config.effective().process_enabled && config.effective().process_rules.iter().any(|r| r.enabled && r.include_descendants);
         ENABLED.store(enabled, Ordering::Release);
         if !enabled {
             if observer.as_ref().is_some_and(|h| h.is_finished()) { if let Some(h) = observer.take() { let _ = h.join(); } }

@@ -6,6 +6,7 @@ interface Props {
   isOpen: boolean;
   bundleInstance: BundleLocalInstance | null;
   availableProxies: string[];
+  proxyLabels?: Record<string, string>;
   onConfirm: (selectedNode: string) => void;
   onCancel: () => void;
 }
@@ -14,6 +15,7 @@ export const QuickBindModal: React.FC<Props> = ({
   isOpen,
   bundleInstance,
   availableProxies,
+  proxyLabels = {},
   onConfirm,
   onCancel,
 }) => {
@@ -85,7 +87,7 @@ export const QuickBindModal: React.FC<Props> = ({
             ) : (
               availableProxies.map((node) => (
                 <option key={node} value={node}>
-                  {node}
+                  {proxyLabels[node] || node}
                 </option>
               ))
             )}

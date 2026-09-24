@@ -1,4 +1,5 @@
 import type { RoutingTarget } from "./routingOverrides";
+import type { BundleRepositoryOrigin } from "./bundleRepository";
 // 业务规则包系统核心数据类型定义 (Business Rule Bundle Types)
 
 export type BundleSlotId = "main" | "dns";
@@ -50,6 +51,7 @@ export interface BundleLocalInstance {
   isModified: boolean;
   createdAt: number;
   updatedAt: number;
+  repositoryOrigin?: BundleRepositoryOrigin; // 本机来源记录，不进入规则包导出
 }
 
 // 规范的 .pwpack.json 纯净脱敏导出文件结构 (白名单脱敏)

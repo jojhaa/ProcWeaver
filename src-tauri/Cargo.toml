@@ -1,6 +1,6 @@
 [package]
 name = "proc-weaver"
-version = "2.0.2"
+version = "2.0.4"
 license = "AGPL-3.0-only"
 description = "Modern Proxy Client powered by Mihomo and Tauri"
 authors = ["ProcWeaver Team"]

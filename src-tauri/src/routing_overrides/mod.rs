@@ -32,9 +32,12 @@ pub fn current_source() -> (String, std::path::PathBuf) {
         .unwrap_or_else(|| ("default".into(), profile::get_base_dir().join("config/default.yaml")))
 }
 pub fn prepare(raw: &str, config: &Overrides, profile_id: &str) -> Result<String, String> {
-    let follows_system = config.bundles.iter().any(|b| b.enabled && b.mode == "sandbox" && b.fallback == "system");
+    prepare_with_nodes(raw, config, profile_id, &crate::local_nodes::read()?)
+}
+pub fn prepare_with_nodes(raw: &str, config: &Overrides, profile_id: &str, nodes: &crate::local_nodes::Store) -> Result<String, String> {
+    let follows_system = config.bundles_enabled && config.bundles.iter().any(|b| b.enabled && b.mode == "sandbox" && b.fallback == "system");
     let enabled = if follows_system { crate::commands::sysproxy::get_system_proxy_status()? } else { false };
-    prepare_with_system_proxy(raw, config, profile_id, enabled)
+    prepare_plan(raw, config, profile_id, enabled, nodes)
 }
 
 /// The lifecycle observer calls this under LIFECYCLE. Unknown reads never change routing.
@@ -47,7 +50,7 @@ pub(crate) async fn reconcile_system_proxy(status: &crate::commands::sysproxy::S
     let enabled = status.enabled();
     if *SYSTEM_PROXY_ROUTED.lock().map_err(|_| "系统代理分流状态锁不可用")? == Some(enabled) { return Ok(()); }
     let config = read()?;
-    if config.process_enabled && config.bundles.iter().any(|b| b.enabled && b.mode == "sandbox" && b.fallback == "system") {
+    if config.bundles_enabled && config.bundles.iter().any(|b| b.enabled && b.mode == "sandbox" && b.fallback == "system") {
         let (id, source) = current_source();
         let raw = std::fs::read_to_string(source).map_err(|_| "读取系统代理联动配置失败")?;
         let prepared = prepare_with_system_proxy(&raw, &config, &id, enabled)?;
@@ -58,10 +61,17 @@ pub(crate) async fn reconcile_system_proxy(status: &crate::commands::sysproxy::S
     Ok(())
 }
 fn prepare_with_system_proxy(raw: &str, config: &Overrides, profile_id: &str, system_proxy: bool) -> Result<String, String> {
+    prepare_plan(raw, config, profile_id, system_proxy, &crate::local_nodes::read()?)
+}
+fn prepare_plan(raw: &str, config: &Overrides, profile_id: &str, system_proxy: bool, nodes: &crate::local_nodes::Store) -> Result<String, String> {
+    let effective = config.effective();
+    let config = &effective;
     let general = settings::get_general_settings()?;
     let base = settings::prepare_with(raw, &general)?;
+    let base = crate::local_nodes::compose(&base, nodes)?;
     let base = local_rules::compose(&base, &local_rules::get_local_rule_plan()?)?;
-    let (base, foreign_mapped) = foreign_targets::materialize(&base, config, profile_id)?;
+    let locals = crate::local_nodes::map_config(config, profile_id);
+    let (base, foreign_mapped) = foreign_targets::materialize(&base, &locals, profile_id)?;
     let (base, mut mapped) = bundles::materialize(&base, &foreign_mapped, profile_id)?;
     // 仅解析本次运行计划，持久化定义仍保留 system，重启和后续重应用会读取真实开关。
     for bundle in &mut mapped.bundles {
@@ -70,14 +80,14 @@ fn prepare_with_system_proxy(raw: &str, config: &Overrides, profile_id: &str, sy
     let channels = profile::get_business_channels().unwrap_or_default();
     let mut state = tracker::status(config);
     for rule in &mut state.derived {
-        if let Some(target) = &mut rule.target { foreign_targets::remap(target, config, profile_id); }
+        if let Some(target) = &mut rule.target { crate::local_nodes::remap(target, profile_id); foreign_targets::remap(target, config, profile_id); }
         bundles::map_process(rule, &config.bundles, profile_id);
     }
     let config = &mapped;
     // 业务包的显式进程绑定优先于公共域名/节点选择；普通手动规则仍遵循原优先级设置。
     let mut manual = config.clone();
-    manual.process_rules.retain(|r| !r.id.starts_with("bundle-"));
-    let manual_derived: Vec<_> = state.derived.iter().filter(|r| !r.id.starts_with("derived:bundle-")).cloned().collect();
+    manual.process_rules.retain(|r| bundles::owner(&r.id, &config.bundles).is_none());
+    let manual_derived: Vec<_> = state.derived.iter().filter(|r| bundles::owner(&r.id, &config.bundles).is_none()).cloned().collect();
 
     // 严密控制规则入栈顺序：后插入 0..0 者位于 rules 最终序列更顶层
     let base = match general.routing_priority.as_str() {
@@ -110,11 +120,11 @@ fn prepare_with_system_proxy(raw: &str, config: &Overrides, profile_id: &str, sy
     let fallback=fallback["rules"].as_sequence().cloned().unwrap_or_default();
     let bundles = Overrides {
         process_enabled: config.process_enabled,
-        process_rules: config.process_rules.iter().filter(|r| r.id.starts_with("bundle-")).cloned().collect(),
+        process_rules: config.process_rules.iter().filter(|r| bundles::owner(&r.id, &config.bundles).is_some()).cloned().collect(),
         bundles: config.bundles.clone(),
         ..Overrides::default()
     };
-    let bundle_derived: Vec<_> = state.derived.iter().filter(|r| r.id.starts_with("derived:bundle-")).cloned().collect();
+    let bundle_derived: Vec<_> = state.derived.iter().filter(|r| bundles::owner(&r.id, &config.bundles).is_some()).cloned().collect();
     let base = composer::compose(&base, &bundles, profile_id, &bundle_derived)?;
     let base = finish(&base)?;
     crate::capture::compose(&base, config, profile_id, &fallback)
@@ -137,7 +147,7 @@ pub async fn reapply(config: &Overrides) -> Result<(), String> {
 pub(crate) async fn change_system_proxy(enable: bool, change: impl FnOnce() -> Result<bool, String>) -> Result<bool, String> {
     if !process::ACTIVE.load(Ordering::SeqCst) { return change(); }
     let config = read()?;
-    if !config.process_enabled || !config.bundles.iter().any(|b| b.enabled && b.mode == "sandbox" && b.fallback == "system") {
+    if !config.bundles_enabled || !config.bundles.iter().any(|b| b.enabled && b.mode == "sandbox" && b.fallback == "system") {
         return change();
     }
     let old = std::fs::read_to_string(crate::storage::data_dir().join("core_data/config.yaml")).map_err(|_| "读取系统代理切换前的运行配置失败")?;
@@ -204,6 +214,7 @@ async fn reload(path: &std::path::Path) -> Result<(), String> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct View {
+    pub target_labels: std::collections::BTreeMap<String, String>,
     pub traffic_driver: String,
     pub capture: crate::capture::Status,
     pub config: Overrides, pub targets: Vec<Target>, pub tracking: tracker::TrackingStatus,
@@ -213,17 +224,21 @@ pub struct View {
 }
 pub fn view() -> Result<View, String> {
     let config = read()?; let (id, source) = current_source();
-    let targets = target_cache::targets(&id, &source)?;
+    let mut targets = target_cache::targets(&id, &source)?;
+    let nodes = crate::local_nodes::read()?;
+    targets.extend(nodes.nodes.iter().map(|n| n.target()));
+    let target_labels = nodes.nodes.iter().map(|n| (n.alias(), format!("{} · 本地", n.name))).collect();
     let preserved_targets = foreign_targets::saved_bindings(&config, &id);
     let mut available = targets.clone();
     if config.retain_foreign_targets { available.extend(foreign_targets::available(&preserved_targets)); }
-    let mut unavailable_rules: Vec<_> = config.process_rules.iter().filter(|r| r.enabled && r.action == "proxy" && r.target.as_ref().is_none_or(|t| !available.contains(t))).map(|r| r.id.clone()).collect();
-    unavailable_rules.extend(config.dns_rules.iter().filter(|r| r.enabled && !available.contains(&r.target)).map(|r| r.id.clone()));
-    unavailable_rules.extend(config.bundles.iter().filter(|b| b.enabled && [&b.main_target, &b.dns_target].into_iter().flatten().any(|t| !available.contains(t))).map(|b| format!("bundle:{}",b.id)));
+    let effective = config.effective();
+    let mut unavailable_rules: Vec<_> = effective.process_rules.iter().filter(|r| r.enabled && r.action == "proxy" && r.target.as_ref().is_none_or(|t| !available.contains(t))).map(|r| r.id.clone()).collect();
+    unavailable_rules.extend(effective.dns_rules.iter().filter(|r| r.enabled && !available.contains(&r.target)).map(|r| r.id.clone()));
+    unavailable_rules.extend(effective.bundles.iter().filter(|b| b.enabled && [&b.main_target, &b.dns_target].into_iter().flatten().any(|t| !available.contains(t))).map(|b| format!("bundle:{}",b.id)));
     let tracking = tracker::status(&config);
     let running = process::ACTIVE.load(Ordering::SeqCst);
     let applied = if running { *APPLIED.lock().unwrap_or_else(|p| p.into_inner()) } else { None };
-    Ok(View { traffic_driver: crate::capture::smart_arbiter::get_active_driver_name(), capture: crate::capture::status(), config, targets, preserved_targets, tracking, running, applied_revision: applied.map(|p| p.0), applied_generation: applied.map(|p| p.1), unavailable_rules })
+    Ok(View { target_labels, traffic_driver: crate::capture::smart_arbiter::get_active_driver_name(), capture: crate::capture::status(), config, targets, preserved_targets, tracking, running, applied_revision: applied.map(|p| p.0), applied_generation: applied.map(|p| p.1), unavailable_rules })
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -240,7 +255,7 @@ pub async fn save(config: Overrides, selections: Vec<Selection>) -> Result<View,
     }
     bundles::assign_ports(&mut config, &old)?;
     if selections.len() > 256 { return Err("一次最多选择 256 个进程".into()); }
-    if !selections.is_empty() || (config.process_enabled && config.process_rules.iter().any(|r| r.enabled && r.include_descendants)) {
+    if !selections.is_empty() || (config.effective().process_enabled && config.effective().process_rules.iter().any(|r| r.enabled && r.include_descendants)) {
         let processes = native::snapshot()?;
         for s in selections { if !processes.iter().any(|p| p.identity == s.identity && p.executable_path.as_deref() == Some(s.executable_path.as_str())) {
             return Err("所选进程已退出或身份改变，请刷新进程树后重新选择".into());

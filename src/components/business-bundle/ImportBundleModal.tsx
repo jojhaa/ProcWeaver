@@ -6,6 +6,7 @@ import { Download, X, Upload, CheckCircle2, AlertCircle } from "lucide-react";
 interface Props {
   isOpen: boolean;
   availableProxies: string[];
+  proxyLabels?: Record<string, string>;
   onConfirm: (bundle: BusinessBundleDefinition, autoEnable: boolean, boundNode: string | null) => void;
   onCancel: () => void;
 }
@@ -13,6 +14,7 @@ interface Props {
 export const ImportBundleModal: React.FC<Props> = ({
   isOpen,
   availableProxies,
+  proxyLabels = {},
   onConfirm,
   onCancel,
 }) => {
@@ -138,7 +140,7 @@ export const ImportBundleModal: React.FC<Props> = ({
                   <option value="">暂不分配（导入后默认停用，跟随系统默认网络）</option>
                   {availableProxies.map((p) => (
                     <option key={p} value={p}>
-                      {p}
+                      {proxyLabels[p] || p}
                     </option>
                   ))}
                 </select>

@@ -31,7 +31,7 @@ async function beforeLaunch(id: string, hotSwap = false) {
   if (hotSwap && (!item.enabled || !item.slotBindings.main || item.watcherMode !== "hot_swap" || status.phase !== "applied")) {
     throw new Error("业务包或热替换状态已改变，未重启应用；请检查核心与本包设置后重试");
   }
-  if (item.enabled && !["applied", "saved"].includes(status.phase)) throw new Error(status.message);
+  if (item.enabled && !["applied", "saved", "paused"].includes(status.phase)) throw new Error(status.message);
 }
 async function launch(request: LaunchRequest, confirmation: string | null = null, hotSwap = false) {
   if (state.busy) return;
@@ -134,16 +134,18 @@ async function prepareHotSwap() {
 }
 function refreshEntries(): Promise<void> {
   if (inspecting) return inspecting;
-  const snapshot = JSON.stringify(bundleController.getSnapshot().instances);
-  const ids = bundleController.getSnapshot().instances.filter(i => i.enabled && i.slotBindings.main && i.watcherMode !== "disabled").map(i => i.instanceId);
+  const fingerprint = () => { const current = bundleController.getSnapshot(); return JSON.stringify([current.instances, current.view?.config.bundlesEnabled]); };
+  const snapshot = fingerprint();
+  const current = bundleController.getSnapshot();
+  const ids = current.view?.config.bundlesEnabled === false ? [] : current.instances.filter(i => i.enabled && i.slotBindings.main && i.watcherMode !== "disabled").map(i => i.instanceId);
   inspecting = (async () => {
     try {
       const result = ids.length ? await bundleToolsApi.entries(ids) : [];
-      if (snapshot !== JSON.stringify(bundleController.getSnapshot().instances)) return;
+      if (snapshot !== fingerprint()) return;
       publish({ entries: Object.fromEntries(result.filter(item => ids.includes(item.instanceId)).map(item => [item.instanceId, item])) });
       await prepareHotSwap();
     } catch (error) {
-      if (snapshot !== JSON.stringify(bundleController.getSnapshot().instances)) return;
+      if (snapshot !== fingerprint()) return;
       publish({ entries: Object.fromEntries(ids.map(instanceId => [instanceId, {
         instanceId, state: "unverified", message: `检测失败：${errorText(error)}`, chains: [],
         connectionState: "error", connectionMessage: "检测未完成，无法核验连接分流；下次检测会重试",

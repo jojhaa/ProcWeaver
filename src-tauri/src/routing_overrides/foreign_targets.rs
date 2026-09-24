@@ -12,7 +12,7 @@ pub fn alias(target: &Target) -> String {
 fn collect_bindings(config: &Overrides, active: &str, enabled_only: bool) -> Vec<Target> {
     let mut targets = Vec::new();
     let mut add = |target: &Target| {
-        if target.profile_id != active && !targets.contains(target) { targets.push(target.clone()); }
+        if target.profile_id != active && target.profile_id != crate::local_nodes::SOURCE && !targets.contains(target) { targets.push(target.clone()); }
     };
     for rule in &config.process_rules { if (!enabled_only || (config.process_enabled && rule.enabled)) && rule.action == "proxy" { if let Some(t) = &rule.target { add(t); } } }
     for rule in &config.dns_rules { if !enabled_only || (config.dns_enabled && rule.enabled) { add(&rule.target); } }
@@ -93,6 +93,10 @@ impl Importer {
     }
     fn dependency(&mut self, owner: &Target, name: &str) -> Result<String, String> {
         if matches!(name, "DIRECT" | "REJECT" | "REJECT-DROP" | "PASS" | "COMPATIBLE") { return Ok(name.into()); }
+        if name.starts_with(crate::local_nodes::PREFIX) {
+            if crate::local_nodes::read()?.nodes.iter().any(|n| n.alias() == name) { return Ok(name.into()); }
+            return Err("原出口引用的本地节点已不存在".into());
+        }
         let source = &self.sources[&owner.profile_id];
         let kind = [("proxies", "node"), ("proxy-groups", "group")].into_iter().find_map(|(key, kind)|
             source[key].as_sequence().into_iter().flatten().any(|p| p["name"].as_str() == Some(name)).then_some(kind))

@@ -5,6 +5,34 @@ fn target(name: &str) -> Target { Target { profile_id: "default".into(), kind: "
 fn config() -> Overrides { Overrides { process_enabled: true, process_rules: vec![rule(r"C:\apps\root.exe")], ..Overrides::default() } }
 const RAW: &str = "proxies:\n- {name: node, type: socks5, server: 127.0.0.1, port: 1, udp: false}\nrules: ['DOMAIN,example.net,DIRECT', 'MATCH,DIRECT']\n";
 
+#[test]
+fn bundle_master_and_manual_switches_are_independent() {
+    let mut c = config();
+    c.process_rules[0].id = "bundle-browser-main".into();
+    let mut manual = rule(r"C:\apps\manual.exe"); manual.id = "bundle-unrelated-manual".into();
+    c.process_rules.push(manual);
+    c.bundles.push(BundleRoute { id: "browser".into(), name: "浏览器".into(), main_exe: "root.exe".into(), enabled: true,
+        main_target: Some(target("node")), dns_target: None, port: 34000, mode: "strict".into(), domains: vec![], fallback: "rules".into() });
+    for id in ["bundle-dns-browser-domain", "manual-dns"] {
+        c.dns_rules.push(DnsRule { id: id.into(), enabled: true, domain_kind: "exact".into(), domain: "example.com".into(), resolver_url: "https://192.0.2.1/dns-query".into(), target: target("node") });
+    }
+    c.process_enabled = false; c.dns_enabled = false;
+    let active = c.effective();
+    assert!(active.process_enabled && active.dns_enabled);
+    assert_eq!(active.process_rules.len(), 1); assert_eq!(active.dns_rules.len(), 1);
+    c.bundles_enabled = false;
+    let paused = c.effective();
+    assert!(!paused.process_enabled && !paused.dns_enabled);
+    assert!(paused.process_rules.is_empty() && paused.dns_rules.is_empty());
+    assert!(c.bundles[0].enabled); assert_eq!(c.process_rules.len(), 2);
+    c.process_enabled = true; c.dns_enabled = true;
+    let manual = c.effective();
+    assert_eq!(manual.process_rules[0].id, "bundle-unrelated-manual");
+    assert_eq!(manual.dns_rules[0].id, "manual-dns");
+    let mut legacy = serde_json::to_value(c).unwrap(); legacy.as_object_mut().unwrap().remove("bundlesEnabled");
+    assert!(serde_json::from_value::<Overrides>(legacy).unwrap().bundles_enabled);
+}
+
 #[cfg(windows)]
 #[test]
 fn native_bundle_outlet_is_independent_of_public_selection() {
@@ -23,7 +51,7 @@ fn native_bundle_outlet_is_independent_of_public_selection() {
     crate::storage::initialize_test(dir.clone(), root.clone());
     std::fs::write(dir.join("config/local-rules.json"), r#"{"enabled":false,"providers":[]}"#).unwrap();
     let reserve = || TcpListener::bind("127.0.0.1:0").unwrap();
-    let mixed = reserve(); let mixed_port = mixed.local_addr().unwrap().port();
+    let mixed = crate::storage::reserve_test_mixed_port(); let mixed_port = mixed.local_addr().unwrap().port();
     let controller = reserve(); let controller_port = controller.local_addr().unwrap().port();
     let done = Arc::new(AtomicBool::new(false));
     struct Finish(Arc<AtomicBool>);

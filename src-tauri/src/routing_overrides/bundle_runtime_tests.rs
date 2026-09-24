@@ -9,15 +9,7 @@ fn native_bundle_entries_switch_only_one_selector_and_rollback() {
     }
     let dir=std::env::temp_dir().join(format!("procweaver-bundle-runtime-{}",std::process::id())); std::fs::create_dir_all(&dir).unwrap();
     crate::storage::initialize_test(dir.clone(),std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf());
-    // Mixed listeners need TCP and UDP; Windows can reserve UDP-only ranges.
-    let free=||{
-        for _ in 0..256 {
-            let tcp=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port=tcp.local_addr().unwrap().port();
-            if std::net::UdpSocket::bind(("127.0.0.1",port)).is_ok(){return port;}
-        }
-        panic!("没有找到同时可用的 TCP/UDP 测试端口");
-    };
+    let free=||crate::storage::reserve_test_mixed_port().local_addr().unwrap().port();
     let preferences=settings::GeneralSettings{mixed_port:free(),controller_port:free(),..Default::default()};
     std::fs::write(dir.join("config/preferences.json"),serde_json::to_vec(&preferences).unwrap()).unwrap();
     std::fs::write(dir.join("config/local-rules.json"),r#"{"enabled":false,"providers":[]}"#).unwrap();
@@ -198,6 +190,19 @@ try {{
         process::start_core_transaction(Some("compatible".into()),&state).await.unwrap();
         let _restarted=connect(ports[0],"node-c").await;let _other=connect(ports[1],"node-b").await;
         let _restart_fallback=connect_to(ports[4],&destination(),"direct").await;
+        // Pausing preserves definitions and ports, while new connections use the
+        // original rules. It must remain paused across a native core restart.
+        let before_pause=read().unwrap(); let mut paused=before_pause.clone(); paused.bundles_enabled=false;
+        let paused=save(paused,vec![]).await.unwrap();
+        assert_eq!(serde_json::to_value(&before_pause.bundles).unwrap(),serde_json::to_value(&paused.config.bundles).unwrap());
+        assert_eq!(before_pause.process_rules,paused.config.process_rules);
+        let _fallback=connect_to(ports[0],"original.example.test:443","node-b").await;
+        assert!(crate::commands::bundle_launch::get_bundle_entry_states(vec!["a".into()]).await.unwrap().is_empty());
+        process::stop_owned_child(&mut state.lock().unwrap()).unwrap();
+        process::start_core_transaction(Some("compatible".into()),&state).await.unwrap();
+        let _paused_restart=connect_to(ports[0],"original.example.test:443","node-b").await;
+        let mut resume=paused.config; resume.bundles_enabled=true; save(resume,vec![]).await.unwrap();
+        let _restored_bundle=connect(ports[0],"node-c").await;
         process::stop_owned_child(&mut state.lock().unwrap()).unwrap();for server in servers {server.abort();}
         println!("三个真实入口独立分流；A 换节点无重载且 B 长连接保持；持久化失败恢复；核心重启恢复选择：通过");
     });

@@ -145,8 +145,8 @@ export async function syncBundlesToCore(instances: BundleLocalInstance[], api: P
       }
     }
     const next: RoutingOverrides = { ...existing,
-      processEnabled: existing.processEnabled || processes.length > 0,
-      dnsEnabled: existing.dnsEnabled || dns.length > 0,
+      processEnabled: existing.processEnabled,
+      dnsEnabled: existing.dnsEnabled,
       processRules: [...processes, ...manualProcesses], dnsRules: [...dns, ...manualDns],
       bundles,
     };

@@ -67,7 +67,7 @@ async fn read_connections()->Result<serde_json::Value,String> {
 #[tauri::command]
 pub async fn get_bundle_entry_states(instance_ids:Vec<String>)->Result<Vec<EntryStatus>,String> {
     if instance_ids.len()>128{return Err("一次最多检测 128 个业务包".into());}
-    let bundles=routing_overrides::read()?.bundles;
+    let bundles=routing_overrides::read()?.effective().bundles;
     let selected:Vec<_>=bundles.into_iter().filter(|b|instance_ids.contains(&b.id) && b.enabled).collect();
     let mut result=tokio::task::spawn_blocking(move|| {
         let mut checked: HashMap<PathBuf, Result<Vec<Instance>, String>> = HashMap::new();
@@ -128,7 +128,7 @@ pub fn dispatch(app: &tauri::AppHandle, args: Vec<String>) {
 #[tauri::command]
 pub fn take_bundle_launch_requests() -> Vec<LaunchRequest> { REQUESTS.lock().unwrap_or_else(|p|p.into_inner()).drain(..).collect() }
 pub fn route(id: &str) -> Result<BundleRoute,String> {
-    routing_overrides::read()?.bundles.into_iter().find(|b| b.id==id).ok_or("业务包尚未保存或已移除，请先在业务包页面应用规则".into())
+    routing_overrides::read()?.effective().bundles.into_iter().find(|b| b.id==id).ok_or("业务包尚未保存或已移除，请先在业务包页面应用规则".into())
 }
 pub fn resolve_executable(bundle: &BundleRoute) -> Result<PathBuf,String> {
     let supplied=PathBuf::from(&bundle.main_exe);
@@ -216,7 +216,7 @@ async fn ready(app:&tauri::AppHandle,id:&str,allow_start:bool)->Result<BundleRou
     let _lock=process::LIFECYCLE.lock().await;
     let bundle=route(id)?;
     let config=routing_overrides::read()?;
-    if bundle.enabled && !config.process_enabled {return Err("进程分流总开关已关闭，请先应用业务包规则".into());}
+    if bundle.enabled && !config.effective().process_enabled {return Err("业务包分流尚未启用，请先应用业务包规则".into());}
     if allow_start {process::start_core_locked(None,&app.state()).await?;}
     else if !process::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {return Err("核心已停止，未尝试热替换；请启动核心后重新检测".into());}
     let raw=std::fs::read_to_string(crate::storage::data_dir().join("core_data/config.yaml")).map_err(|_|"读取运行配置失败")?;

@@ -163,6 +163,16 @@ export function savePersistedNodeRegions(regions: Record<string, string>, flushI
   else regionTimer ??= setTimeout(flushNodeRegions, 1000);
 }
 
+// A local node keeps its alias when edited; observations of the old endpoint must
+// not be presented as measurements of its new configuration.
+export async function invalidateNodeObservations(names: string[]): Promise<void> {
+  if (!names.length) return;
+  const [health, regions] = await Promise.all([getPersistedHealthCache(), getPersistedNodeRegions()]);
+  for (const name of names) { delete health[name]; delete regions[name]; }
+  savePersistedNodeRegions(regions, true);
+  await savePersistedHealthCache(health, true);
+}
+
 // 读取已忽略节点名称列表
 export function getIgnoredNodes(): string[] {
   try {

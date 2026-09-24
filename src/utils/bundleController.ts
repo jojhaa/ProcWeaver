@@ -7,13 +7,14 @@ export interface BundleState {
   instances: BundleLocalInstance[];
   view?: RoutingView;
   pending: boolean;
+  masterPending?: boolean;
   pendingInstanceIds?: string[];
   error: string;
   readError: string;
   errorInstanceIds?: string[];
 }
 export interface BundleStatus {
-  phase: "applied" | "pending" | "saved" | "error" | "disabled" | "unbound";
+  phase: "applied" | "pending" | "saved" | "error" | "disabled" | "unbound" | "paused";
   message: string;
   previousTargets: string[];
 }
@@ -45,7 +46,7 @@ export function getBundleStatus(instance: BundleLocalInstance, state: BundleStat
   const rules = state.view?.config.processRules.filter(r => r.id.startsWith(`bundle-${instance.instanceId}-`)) || [];
   const previousTargets = [...new Set(rules.filter(r => r.enabled && r.target).map(r => r.target!.name))];
   const result = (phase: BundleStatus["phase"], message: string): BundleStatus => ({ phase, message, previousTargets });
-  if (state.pending && (!state.pendingInstanceIds || state.pendingInstanceIds.includes(instance.instanceId))) return result("pending", "正在更新此业务包，其他包保持原配置");
+  if (state.pending && (!state.pendingInstanceIds || state.pendingInstanceIds.includes(instance.instanceId))) return result("pending", state.masterPending ? "正在切换业务包总开关" : "正在更新此业务包，其他包保持原配置");
   if (state.readError) return result("error", state.readError);
   if (state.error && state.errorInstanceIds?.includes(instance.instanceId)) return result("error", state.error);
   if (!instance.enabled || !instance.slotBindings.main) {
@@ -53,6 +54,10 @@ export function getBundleStatus(instance: BundleLocalInstance, state: BundleStat
     return instance.enabled ? result("unbound", "请先绑定本机出口") : result("disabled", "已停用，跟随现有规则");
   }
   if (!state.view) return result("pending", "尚未核实核心状态");
+  if (state.view.config.bundlesEnabled === false) {
+    if (state.view.running && state.view.appliedRevision !== state.view.config.revision) return result("pending", "已保存暂停设置，等待核心确认");
+    return result("paused", "总开关已暂停；保留本包选择，新连接沿用原有规则");
+  }
   try {
     if (state.view.unavailableRules?.some(id => rules.some(r => r.id === id) || id === `bundle:${instance.instanceId}` || id.startsWith(`bundle-dns-${instance.instanceId}-`))) {
       return result("error", "原出口不可用或已选择稍后换绑；绑定信息保留，匹配流量暂时阻断，请选择可用出口重新绑定");
@@ -61,11 +66,10 @@ export function getBundleStatus(instance: BundleLocalInstance, state: BundleStat
     const expected = compileBundlesToProcessRules(resolved);
     const dns = compileBundlesToDnsRules(resolved);
     const config = state.view.config;
-    if (!config.processEnabled) return result("error", state.error ? "本次更新未应用，保留上次规则；请查看失败原因" : "进程分流总开关已关闭；需要启用时请重新应用");
     if (routeSignature(config.bundles?.filter(b => b.id === instance.instanceId)) !== routeSignature(compileBundleRoutes(resolved)) ||
       ruleSignature(rules) !== ruleSignature(expected) ||
-      (dns.length > 0 && (!config.dnsEnabled || dns.some(r => !config.dnsRules.some(actual =>
-        ruleSignature([{ ...actual, id: r.id }]) === ruleSignature([r])))))) {
+      (dns.length > 0 && dns.some(r => !config.dnsRules.some(actual =>
+        ruleSignature([{ ...actual, id: r.id }]) === ruleSignature([r]))))) {
       return result("error", state.error ? "本次更新未应用，保留上次规则；请查看失败原因" : "本次选择尚未应用，核心仍使用已保存的配置");
     }
     if (!state.view.running) return result("saved", "已保存，等待核心启动");
@@ -116,7 +120,7 @@ export function createBundleController(api: Pick<RoutingApi, "read" | "save">, s
       return !restoring && !affected.includes(item.instanceId) && !edited.includes(item.instanceId) && previous
         && networkSignature(previous) !== networkSignature(item) ? previous : item;
     });
-    publish({ instances: snapshot, pending: true, pendingInstanceIds: affected, error: "", readError: "", errorInstanceIds: [] });
+    publish({ instances: snapshot, pending: true, masterPending: false, pendingInstanceIds: affected, error: "", readError: "", errorInstanceIds: [] });
     const work = tail.then(async () => {
       // 尚未开始的过时请求不再热加载核心；运行中的保存完成后才执行下一次。
       if (ticket !== sequence) return false;
@@ -158,9 +162,29 @@ export function createBundleController(api: Pick<RoutingApi, "read" | "save">, s
     })().finally(() => { reading = undefined; });
     return reading;
   };
+  const setMasterEnabled = (enabled: boolean) => {
+    const ticket = ++sequence; ++readSequence;
+    publish({ pending: true, masterPending: true, pendingInstanceIds: undefined, error: "", readError: "", errorInstanceIds: [] });
+    const work = tail.then(async () => {
+      if (ticket !== sequence) return false;
+      try {
+        const before = await api.read();
+        const config = { ...before.config, bundlesEnabled: enabled };
+        const view = await api.save(config, []);
+        if ((view.config.bundlesEnabled !== false) !== enabled) throw new Error("业务包总开关状态未确认");
+        if (ticket === sequence) publish({ view, pending: false, masterPending: false, pendingInstanceIds: [], error: "" });
+        return true;
+      } catch (error) {
+        if (ticket === sequence) publish({ pending: false, masterPending: false, pendingInstanceIds: [], error: error instanceof Error ? error.message : String(error) });
+        return false;
+      }
+    });
+    tail = work;
+    return work;
+  };
   return {
     getSnapshot: () => state,
     subscribe: (fn: () => void) => { listeners.add(fn); return () => { listeners.delete(fn); }; },
-    apply, refresh, restore: () => apply(state.instances, true), whenIdle: () => tail,
+    apply, refresh, setMasterEnabled, restore: () => apply(state.instances, true), whenIdle: () => tail,
   };
 }

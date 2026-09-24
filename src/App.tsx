@@ -23,6 +23,8 @@ import { ThemeToggle } from "./components/ThemeToggle";
 import { WindowControls } from "./components/WindowControls";
 import { windowToggleMaximize, windowStartDragging, getProfiles, isTauri } from "./api";
 import appIcon from "./assets/app-icon.png";
+import { localNodesApi } from "./api/localNodes";
+import type { LocalNodeSummary } from "./types/localNodes";
 import {
   LayoutDashboard,
   Radio,
@@ -96,6 +98,7 @@ export function App() {
   const bundleTools = useBundleTools();
   const [activeTab, setActiveTab] = useState("dashboard");
   const [profileCount, setProfileCount] = useState<number | null>(null);
+  const [localNodeSummaries, setLocalNodeSummaries] = useState<LocalNodeSummary[] | null>(null);
   const { status: coreStatus, refresh: refreshCoreStatus } = useCoreStatus();
   const lastProxyEvent = React.useRef<number | undefined>();
   React.useEffect(() => {
@@ -178,6 +181,7 @@ export function App() {
 
   React.useEffect(() => {
     const checkProfiles = async () => {
+      void localNodesApi.read().then(view => setLocalNodeSummaries(view.nodes)).catch(() => setLocalNodeSummaries(null));
       try {
         const list = await getProfiles();
         setProfileCount(Array.isArray(list) ? list.length : 0);
@@ -601,7 +605,7 @@ export function App() {
               <div className="h-full overflow-y-auto p-6 md:p-8">
                 <div className="max-w-5xl mx-auto space-y-6">
                   {/* 首次使用未添加订阅引导横幅 */}
-                  {profileCount === 0 && (
+                  {profileCount === 0 && localNodeSummaries?.length === 0 && (
                     <div className="p-5 rounded-2xl bg-gradient-to-r from-indigo-500/10 via-purple-500/10 to-pink-500/10 border border-indigo-200 dark:border-indigo-500/30 flex flex-col sm:flex-row items-center justify-between gap-4 shadow-sm">
                       <div className="flex items-center space-x-3.5">
                         <div className="w-10 h-10 rounded-xl bg-indigo-600 text-white flex items-center justify-center shrink-0 shadow-md shadow-indigo-600/20">
@@ -654,6 +658,7 @@ export function App() {
                     proxyPort={coreStatus.running ? coreStatus.mixedPort : undefined}
                     corePid={coreStatus.pid}
                     activeNodeName={activeNodeName}
+                    activeNodeLabel={localNodeSummaries?.find(n => n.alias === activeNodeName)?.name}
                   />
                 </div>
               </div>

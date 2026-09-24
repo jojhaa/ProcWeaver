@@ -5,6 +5,22 @@ static DATA: OnceLock<PathBuf> = OnceLock::new();
 static RESOURCES: OnceLock<PathBuf> = OnceLock::new();
 
 #[cfg(test)]
+pub(crate) fn reserve_test_mixed_port() -> std::net::TcpListener {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    // Windows can reserve long UDP-only ranges inside the ephemeral TCP pool.
+    // Probe both transports across a bounded range instead of requesting port 0.
+    for _ in 0..25000 {
+        let offset = NEXT.fetch_add(1, Ordering::Relaxed).wrapping_add(std::process::id());
+        let port = 20000 + (offset % 25000) as u16;
+        if let Ok(tcp) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() { return tcp; }
+        }
+    }
+    panic!("没有找到同时可用的 TCP/UDP 测试端口");
+}
+
+#[cfg(test)]
 pub(crate) fn initialize_test(data: PathBuf, resources: PathBuf) {
     let _ = fs::create_dir_all(data.join("config"));
     let _ = fs::create_dir_all(data.join("core_data"));

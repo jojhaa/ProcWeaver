@@ -3,7 +3,8 @@ use super::*;
 #[cfg(windows)]
 fn reserve_dns_port() -> (std::net::TcpListener, std::net::UdpSocket) {
     for _ in 0..128 {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // Avoid Windows UDP-excluded ranges in the ephemeral TCP pool.
+        let tcp = crate::storage::reserve_test_mixed_port();
         if let Ok(udp) = std::net::UdpSocket::bind(tcp.local_addr().unwrap()) {
             return (tcp, udp);
         }

@@ -39,6 +39,8 @@ import { createBatchUpdates } from "../utils/batchUpdates";
 import { useDebouncedValue } from "../hooks/useDebouncedValue";
 import { useProfileSwitch } from "../hooks/useProfileSwitch";
 import { ProfileSwitchDialog } from "../components/ProfileSwitchDialog";
+import { LocalNodeDialog } from "../components/LocalNodeDialog";
+import { useLocalNodes } from "../hooks/useLocalNodes";
 import {
   Search,
   RefreshCw,
@@ -72,6 +74,10 @@ function formatBytes(bytes?: number): string {
 
 export const LinesManagementView: React.FC = React.memo(() => {
   const profileSwitch = useProfileSwitch();
+  const localNodes = useLocalNodes();
+  const localByAlias = useMemo(() => new Map(localNodes.view?.nodes.map(n => [n.alias, n]) || []), [localNodes.view]);
+  const nodeLabel = (name: string) => localByAlias.get(name)?.name || name;
+  const [sourceFilter, setSourceFilter] = useState("all");
   const [groups, setGroups] = useState<ProxyGroup[]>([]);
   const [proxies, setProxies] = useState<Record<string, ProxyItem>>({});
   const [delayMap, setDelayMap] = useState<Record<string, number | null>>({});
@@ -244,8 +250,11 @@ export const LinesManagementView: React.FC = React.memo(() => {
         list.push(p);
       }
     });
+    for (const node of localNodes.view?.nodes || []) {
+      if (!list.some(p => p.name === node.alias)) list.push({ name: node.alias, type: node.protocol, udp: false, history: [] });
+    }
     return list;
-  }, [proxies]);
+  }, [proxies, localNodes.view]);
 
   const realNodeNames = useMemo(() => realNodes.map((n) => n.name), [realNodes]);
   const smartFallbackOptions = useMemo(() => ["DIRECT", "REJECT", ...realNodeNames], [realNodeNames]);
@@ -722,11 +731,13 @@ export const LinesManagementView: React.FC = React.memo(() => {
   const filteredNodes = useMemo(() => {
     return realNodes
       .filter((n) => {
+        const local = localByAlias.get(n.name);
+        if (sourceFilter === "local" && !local || sourceFilter === "subscription" && local) return false;
         // 排除用户主动忽略的节点
         if (ignoredSet.has(n.name)) {
           return false;
         }
-        if (search && !n.name.toLowerCase().includes(search.toLowerCase())) {
+        if (search && !`${local?.name || n.name} ${n.type}`.toLowerCase().includes(search.toLowerCase())) {
           return false;
         }
         const delay = delayMap[n.name] ?? n.history?.[n.history.length - 1]?.delay ?? null;
@@ -743,7 +754,7 @@ export const LinesManagementView: React.FC = React.memo(() => {
         if (sortBy === "name-asc") return a.name.localeCompare(b.name);
         return 0;
       });
-  }, [realNodes, search, hideTimeout, sortBy, delayMap, ignoredSet]);
+  }, [realNodes, search, hideTimeout, sortBy, delayMap, ignoredSet, sourceFilter, localByAlias]);
 
   // 按地区自动归类：优先使用基于真实 IP 体检的持久化结果，未体检的归入待确认真实出口
   const { regionGroups, unprobedCount } = useMemo(() => {
@@ -875,7 +886,12 @@ export const LinesManagementView: React.FC = React.memo(() => {
         </div>
 
         {/* 右侧动作区 */}
-        <div className="flex items-center space-x-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <select aria-label="节点来源" value={sourceFilter} onChange={e => setSourceFilter(e.target.value)} className="px-2.5 py-1.5 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800">
+            <option value="all">全部来源</option><option value="subscription">订阅节点</option><option value="local">本地节点</option>
+          </select>
+          <button type="button" disabled={localNodes.busy || !localNodes.view} onClick={localNodes.openNew} className="flex items-center gap-1 px-3 py-1.5 rounded-xl border border-indigo-200 dark:border-indigo-700 text-indigo-600 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950/30 text-xs disabled:opacity-50"><Plus size={14} />新增节点</button>
+          <button type="button" disabled={localNodes.busy || !localNodes.view} onClick={localNodes.openImport} className="px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs">导入节点</button>
           {/* 一键全量测速 */}
           <button
             type="button"
@@ -1223,10 +1239,14 @@ export const LinesManagementView: React.FC = React.memo(() => {
                                   <Square className="w-3.5 h-3.5 opacity-40 group-hover:opacity-100 transition" />
                                 )}
                               </button>
-                              <span className="text-xs font-bold text-slate-800 dark:text-slate-200 truncate flex-1" title={node.name}>
-                                {node.name}
+                              <span className="text-xs font-bold text-slate-800 dark:text-slate-200 truncate flex-1" title={nodeLabel(node.name)}>
+                                {nodeLabel(node.name)}
                               </span>
                             </div>
+                            {localByAlias.has(node.name) && <div className="flex items-center gap-1 shrink-0">
+                              <button type="button" aria-label={`编辑 ${nodeLabel(node.name)}`} title="编辑本地节点" disabled={localNodes.busy} onClick={e => { e.stopPropagation(); void localNodes.edit(localByAlias.get(node.name)!.id); }} className="p-1 text-slate-400 hover:text-indigo-500"><Pencil size={13} /></button>
+                              <button type="button" aria-label={`删除 ${nodeLabel(node.name)}`} title="删除本地节点" disabled={localNodes.busy} onClick={e => { e.stopPropagation(); localNodes.remove(localByAlias.get(node.name)!); }} className="p-1 text-slate-400 hover:text-rose-500"><Trash2 size={13} /></button>
+                            </div>}
                             {isActive && (
                               <span className="flex items-center space-x-0.5 px-1.5 py-0.5 rounded-md bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 text-[10px] font-bold shrink-0">
                                 <Check className="w-3 h-3" />
@@ -1241,6 +1261,7 @@ export const LinesManagementView: React.FC = React.memo(() => {
                               <span className="text-[10px] px-1.5 py-0.2 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-500 font-mono">
                                 {node.type}
                               </span>
+                              {localByAlias.has(node.name) && <span className="text-[10px] px-1.5 rounded-md bg-indigo-50 dark:bg-indigo-950 text-indigo-600 dark:text-indigo-300">本地</span>}
                               {mult !== null && (
                                 <span className="text-[10px] px-1.5 py-0.2 rounded-md bg-amber-50 dark:bg-amber-500/15 text-amber-600 dark:text-amber-400 font-mono font-bold">
                                   {formatMultiplier(mult)}
@@ -1655,6 +1676,7 @@ export const LinesManagementView: React.FC = React.memo(() => {
         onClose={() => { setSmartModalOpen(false); smartTrigger.current?.focus(); }}
         editingRule={editingRule}
         allProxyNames={realNodeNames}
+        proxyLabels={Object.fromEntries([...localByAlias].map(([alias, node]) => [alias, `${node.name} · 本地`]))}
         fallbackOptions={smartFallbackOptions}
         otherSmartGroupNames={smartRules.filter(rule => rule.id !== editingRule?.id).map(rule => rule.name)}
         onSave={async (savedRule) => {
@@ -1668,6 +1690,9 @@ export const LinesManagementView: React.FC = React.memo(() => {
         }}
       />
       <ProfileSwitchDialog state={profileSwitch.state} actions={profileSwitch.actions} />
+      <LocalNodeDialog dialog={localNodes.dialog} busy={localNodes.busy} error={localNodes.error} preview={localNodes.preview}
+        onClose={localNodes.close} onSave={localNodes.save} onDelete={localNodes.confirmDelete} onPreview={localNodes.previewText} onImport={localNodes.importPreview} onClearPreview={localNodes.clearPreview} />
+      {!localNodes.dialog && (localNodes.error || localNodes.notice) && <div role="status" className="absolute bottom-4 left-4 right-4 rounded-xl border border-slate-200 dark:border-slate-700 p-3 bg-white dark:bg-slate-900 text-xs text-slate-700 dark:text-slate-300 shadow-md flex items-center justify-between gap-2"><span>{localNodes.error || localNodes.notice}</span>{localNodes.error ? <button type="button" className="text-indigo-600 shrink-0" onClick={() => void localNodes.refresh()}>重新读取</button> : <button type="button" aria-label="关闭节点提示" onClick={localNodes.dismissNotice} className="shrink-0 p-1"><X size={14} /></button>}</div>}
     </div>
   );
 });

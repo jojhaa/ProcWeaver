@@ -4,8 +4,10 @@ import {
   ExportableBundlePackage,
   BundleSlot,
 } from "../types/businessBundle";
+import type { BundleRepositoryOrigin } from "../types/bundleRepository";
 
 const STORAGE_KEY = "netbox_business_bundles_instances_v1";
+let installSerial = 0;
 
 // 标准默认语义插槽
 const DEFAULT_SLOTS: BundleSlot[] = [
@@ -146,10 +148,12 @@ export function saveBundleInstances(instances: BundleLocalInstance[]): void {
 export function installPresetBundle(
   definition: BusinessBundleDefinition,
   autoEnable = false,
-  boundNode: string | null = null
+  boundNode: string | null = null,
+  repositoryOrigin?: BundleRepositoryOrigin
 ): BundleLocalInstance {
   const instances = getBundleInstances();
-  const instanceId = `inst-${definition.packageId}-${Date.now().toString(36)}`;
+  let instanceId: string;
+  do { instanceId = `inst-${definition.packageId}-${Date.now().toString(36)}-${(++installSerial).toString(36)}`; } while (instances.some(i => i.instanceId === instanceId));
 
   const newInstance: BundleLocalInstance = {
     instanceId,
@@ -163,6 +167,7 @@ export function installPresetBundle(
     isModified: false,
     createdAt: Date.now(),
     updatedAt: Date.now(),
+    ...(repositoryOrigin ? { repositoryOrigin: { ...repositoryOrigin } } : {}),
   };
 
   instances.push(newInstance);
@@ -368,52 +373,4 @@ export function validateAndParseBundlePackage(jsonString: string): {
   } catch (err: any) {
     return { valid: false, error: `解析 JSON 失败: ${err.message || err}` };
   }
-}
-
-/**
- * 从 ProcWeaver-Rules 规则仓库的 Business-Rules 目录真实拉取在线业务规则包
- * 严格真实请求，绝不返回虚假 mock 数据！
- */
-export async function fetchRemoteBusinessRules(): Promise<BusinessBundleDefinition[]> {
-  const candidateUrls = [
-    "https://api.github.com/repos/jojhaa/ProcWeaver-Rules/contents/Business-Rules",
-    "https://api.github.com/repos/jojhaa/ProcWeaver-Rules/contents/Business-Rule",
-  ];
-
-  for (const url of candidateUrls) {
-    try {
-      const res = await fetch(url, { headers: { Accept: "application/vnd.github.v3+json" } });
-      if (res.ok) {
-        const items = await res.json();
-        if (Array.isArray(items)) {
-          const jsonFiles = items.filter((f: any) => f.name && f.name.endsWith(".pwpack.json"));
-          const list: BusinessBundleDefinition[] = [];
-          for (const file of jsonFiles) {
-            if (file.download_url) {
-              try {
-                const fileRes = await fetch(file.download_url);
-                if (fileRes.ok) {
-                  const content = await fileRes.text();
-                  const check = validateAndParseBundlePackage(content);
-                  if (check.valid && check.bundle) {
-                    list.push(check.bundle);
-                  }
-                }
-              } catch {
-                // 忽略个别损坏文件
-              }
-            }
-          }
-          if (list.length > 0) {
-            return list;
-          }
-        }
-      }
-    } catch (err) {
-      console.warn(`从规则仓库在线拉取 ${url} 失败:`, err);
-    }
-  }
-
-  // 严格返回真实结果：若仓库暂无额外套件，绝不使用虚假 mock 冒充
-  return [];
 }

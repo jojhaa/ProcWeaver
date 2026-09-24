@@ -1,5 +1,7 @@
 pub mod commands;
 pub mod storage;
+pub mod local_nodes;
+mod bundle_repository;
 mod app_lifecycle;
 #[cfg(windows)]
 mod windows_identity;
@@ -87,6 +89,12 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            local_nodes::get_local_nodes,
+            local_nodes::get_local_node,
+            local_nodes::save_local_nodes,
+            local_nodes::preview_local_nodes,
+            bundle_repository::read_bundle_repository_file,
+            bundle_repository::cancel_bundle_repository_request,
             commands::bundle_launch::launch_bundle_app,
             commands::bundle_launch::get_bundle_entry_states,
             commands::bundle_launch::take_bundle_launch_requests,

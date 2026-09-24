@@ -22,6 +22,7 @@ interface Props {
   onLaunch: () => void;
   onShortcuts: () => void;
   availableProxies: string[];
+  proxyLabels?: Record<string, string>;
   preservedBinding?: boolean;
   isExpanded: boolean;
   onToggleExpand: () => void;
@@ -45,6 +46,7 @@ export const BundleRow: React.FC<Props> = ({
   onLaunch,
   onShortcuts,
   availableProxies,
+  proxyLabels = {},
   preservedBinding = false,
   isExpanded,
   onToggleExpand,
@@ -71,7 +73,7 @@ export const BundleRow: React.FC<Props> = ({
   const boundNode = instance.slotBindings.main;
   const isRequested = instance.enabled && Boolean(boundNode);
   const isEnabled = isRequested && status.phase === "applied";
-  const canLaunch = !instance.enabled || isEnabled || status.phase === "saved";
+  const canLaunch = !instance.enabled || isEnabled || status.phase === "saved" || status.phase === "paused";
 
   // 点击主开关事件
   const handleSwitchClick = (e: React.MouseEvent) => {
@@ -171,7 +173,7 @@ export const BundleRow: React.FC<Props> = ({
               {!preservedBinding && boundNode && !availableProxies.includes(boundNode) && <option value={boundNode}>不可用：{boundNode}</option>}
               {availableProxies.map((node) => (
                 <option key={node} value={node}>
-                  {node}
+                  {proxyLabels[node] || node}
                 </option>
               ))}
             </select>
@@ -282,12 +284,12 @@ export const BundleRow: React.FC<Props> = ({
                 isEnabled ? "text-emerald-600 dark:text-emerald-400" : "text-slate-400 dark:text-slate-500"
               }`}
             >
-              {isEnabled ? "已应用" : status.phase === "pending" ? "待核心确认" : status.phase === "error" ? "应用未确认" : status.phase === "saved" ? "已保存，待启动" : status.phase === "unbound" ? "待绑定" : "已停用"}
+              {isEnabled ? "已应用" : status.phase === "paused" ? "总开关已暂停" : status.phase === "pending" ? "待核心确认" : status.phase === "error" ? "应用未确认" : status.phase === "saved" ? "已保存，待启动" : status.phase === "unbound" ? "待绑定" : "已停用"}
             </span>
             <div className="relative inline-block w-11 h-6 align-middle select-none">
               <div
                 className={`block w-11 h-6 rounded-full transition-colors duration-200 ${
-                  isEnabled ? "bg-emerald-500" : isRequested ? "bg-amber-500" : "bg-slate-300 dark:bg-slate-700"
+                  isEnabled ? "bg-emerald-500" : isRequested && status.phase !== "paused" ? "bg-amber-500" : "bg-slate-300 dark:bg-slate-700"
                 }`}
               >
                 <div
@@ -303,10 +305,10 @@ export const BundleRow: React.FC<Props> = ({
 
       <div role="status" className={`px-4 pb-3 text-xs break-words ${status.phase === "applied" ? "text-emerald-700 dark:text-emerald-400" : "text-amber-700 dark:text-amber-300"}`}>
         {status.message}
-        {status.phase !== "applied" && status.previousTargets.length > 0 && <span>；核心上次保存出口：{status.previousTargets.join("、")}（当前连接出口未核实）</span>}
+        {status.phase !== "applied" && status.phase !== "paused" && status.previousTargets.length > 0 && <span>；核心上次保存出口：{status.previousTargets.map(n => proxyLabels[n] || n).join("、")}（当前连接出口未核实）</span>}
         {status.phase === "error" && boundNode && /重新绑定|重绑定|出口.*失效/.test(status.message) && <button type="button" onClick={() => onSelectNodeChange(instance.instanceId, boundNode)} className="ml-2 underline">重新绑定所选出口</button>}
       </div>
-      {entry && <div className="px-4 pb-3 text-xs text-slate-600 dark:text-slate-300 break-words">
+      {entry && status.phase !== "paused" && <div className="px-4 pb-3 text-xs text-slate-600 dark:text-slate-300 break-words">
         <p>应用接入：{entry.message}</p>
         <p className={entry.connectionState === "error" ? "text-amber-700 dark:text-amber-300" : ""}>连接核验：{entry.connectionMessage}</p>
         {entry.chains.map(chain => <p key={chain}>{chain}</p>)}
@@ -331,7 +333,7 @@ export const BundleRow: React.FC<Props> = ({
               <span className="text-slate-800 dark:text-slate-300 font-bold">主业务出口插槽 [main]:</span>
               <p className="text-[11px] text-slate-500 dark:text-slate-400">
                 {boundNode ? (
-                  <span className="font-medium">已选择「{boundNode}」；{isEnabled ? "核心已应用" : "以核心确认状态为准"}。</span>
+                  <span className="font-medium">已选择「{proxyLabels[boundNode] || boundNode}」；{isEnabled ? "核心已应用" : status.phase === "paused" ? "已暂停" : "以核心确认状态为准"}。</span>
                 ) : (
                   <span className="text-slate-400 dark:text-slate-500">未绑定出站节点，当前跟随系统默认网络。</span>
                 )}

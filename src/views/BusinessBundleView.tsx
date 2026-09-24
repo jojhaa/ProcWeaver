@@ -10,7 +10,6 @@ import {
   updateBundleInstance,
   deleteBundleInstance,
   createCustomBundle,
-  fetchRemoteBusinessRules,
 } from "../services/bundleStorage";
 import { bundleController, useBusinessBundles } from "../hooks/useBusinessBundles";
 import { getBundleStatus } from "../utils/bundleController";
@@ -21,6 +20,10 @@ import { QuickBindModal } from "../components/business-bundle/QuickBindModal";
 import { ImportBundleModal } from "../components/business-bundle/ImportBundleModal";
 import { ExportBundleModal } from "../components/business-bundle/ExportBundleModal";
 import { EditBundleModal } from "../components/business-bundle/EditBundleModal";
+import { RepositoryCenter } from "../components/business-bundle/RepositoryCenter";
+import { useBundleRepositories } from "../hooks/useBundleRepositories";
+import { DEFAULT_REPOSITORY, repositoryPage } from "../services/bundleRepositories";
+import type { RepositoryPackage } from "../types/bundleRepository";
 import { toggleDnsGuard, getDnsGuardStatus, isTauri } from "../api";
 import {
   Package,
@@ -28,8 +31,6 @@ import {
   Download,
   Plus,
   Sparkles,
-  RefreshCw,
-  ExternalLink,
 } from "lucide-react";
 
 interface Props {
@@ -42,29 +43,9 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
   const { instances } = bundleState;
   const availableProxies = (bundleState.view?.targets || []).map(target => target.name);
   const [activeTab, setActiveTab] = useState<"installed" | "presets" | "studio">("installed");
-  const [repoBundles, setRepoBundles] = useState<BusinessBundleDefinition[]>([]);
-  const [loadingRepo, setLoadingRepo] = useState<boolean>(false);
-  const [repoFetched, setRepoFetched] = useState<boolean>(false);
-
-  const loadRepoBundles = async () => {
-    setLoadingRepo(true);
-    try {
-      const list = await fetchRemoteBusinessRules();
-      setRepoBundles(list);
-      setRepoFetched(true);
-      if (list.length > 0) {
-        showToast(`已从规则仓库同步 ${list.length} 个在线业务规则包`);
-      } else {
-        showToast("已连接规则仓库，当前暂无额外可装载套件");
-      }
-    } catch {
-      setRepoBundles([]);
-      setRepoFetched(true);
-      showToast("连接规则仓库失败，请检查网络连接");
-    } finally {
-      setLoadingRepo(false);
-    }
-  };
+  const repositories = useBundleRepositories(activeTab === "presets");
+  const repoCount = repositories.state.repositories.filter(r => r.enabled).reduce((sum, r) => sum + (repositories.state.statuses[r.id]?.packages.length || 0), 0);
+  const loadingRepo = repositories.state.repositories.some(r => r.enabled && repositories.state.statuses[r.id]?.loading);
 
   // 折叠状态追踪 (默认第一项展开，其余折叠)
   const [expandedMap, setExpandedMap] = useState<Record<string, boolean>>(() => ({
@@ -105,7 +86,6 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
     if (isTauri()) void import("@tauri-apps/api/event").then(({ listen }) => listen("procweaver-dns-guard-changed", refreshDns))
       .then(remove => { if (disposed) remove(); else unlisten = remove; }).catch(() => {});
 
-    loadRepoBundles();
     return () => { disposed = true; unlisten?.(); window.removeEventListener("focus", refreshDns); };
   }, []);
 
@@ -225,8 +205,11 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
   };
 
   // 预设中心装载
-  const handleInstallFromPreset = (def: BusinessBundleDefinition) => {
-    const newInst = installPresetBundle(def, false, null);
+  const handleInstallFromPreset = (item: RepositoryPackage) => {
+    const def = item.definition;
+    let newInst: BundleLocalInstance;
+    try { newInst = installPresetBundle(def, false, null, item.origin); }
+    catch (e) { showToast(e instanceof Error ? e.message : "装载失败，请重试"); return; }
     const next = getBundleInstances();
     persistAndSync(next);
     setExpandedMap((prev) => ({ ...prev, [newInst.instanceId]: true }));
@@ -380,7 +363,17 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
           </div>
 
           {/* 全局健康状态 */}
-          <div className="flex items-center space-x-3 text-xs">
+          <div className="flex flex-wrap items-center gap-3 text-xs">
+            <button type="button" role="switch" aria-label="业务包分流总开关"
+              aria-checked={bundleState.view?.config.bundlesEnabled !== false}
+              disabled={!bundleState.view || bundleState.pending || Boolean(bundleState.readError)}
+              onClick={() => void bundleController.setMasterEnabled(bundleState.view?.config.bundlesEnabled === false)}
+              className="flex items-center gap-2 px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 disabled:opacity-50 cursor-pointer">
+              <span>业务包分流 · {bundleState.masterPending ? "切换中" : bundleState.view?.config.bundlesEnabled === false ? "已暂停" : "已开启"}</span>
+              <span className={`relative w-9 h-5 rounded-full ${bundleState.view?.config.bundlesEnabled === false ? "bg-slate-300 dark:bg-slate-600" : "bg-emerald-500"}`}>
+                <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${bundleState.view?.config.bundlesEnabled === false ? "left-0.5" : "left-0.5 translate-x-4"}`} />
+              </span>
+            </button>
             <div className="flex items-center space-x-2 px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
               <span className={`w-2 h-2 rounded-full ${bundleState.view?.running && !bundleState.readError ? "bg-emerald-500" : "bg-slate-400"}`} />
               <span className="text-slate-700 dark:text-slate-300 font-medium">{bundleState.readError ? "核心状态读取失败" : bundleState.view?.running ? "Mihomo 核心运行中" : "核心尚未运行或未确认"}</span>
@@ -412,6 +405,7 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
             </button>
           </div>
         </header>
+        {bundleState.view?.config.bundlesEnabled === false && <p className="text-xs text-slate-500 dark:text-slate-400">业务包已暂停，单包设置与快捷方式保留，新连接沿用原有规则。已有连接可能继续使用原出口。</p>}
 
         {/* 主导航切换器与动作区 */}
         <nav className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
@@ -436,9 +430,6 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
               type="button"
               onClick={() => {
                 setActiveTab("presets");
-                if (!repoFetched && !loadingRepo) {
-                  loadRepoBundles();
-                }
               }}
               className={`px-4 py-2 rounded-xl text-xs font-medium transition flex items-center space-x-2 cursor-pointer ${
                 activeTab === "presets"
@@ -450,7 +441,7 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
               <span className={`px-1.5 py-0.2 rounded-full text-[10px] ${
                 activeTab === "presets" ? "bg-white/20 text-white font-bold" : "bg-slate-200 dark:bg-slate-800 text-slate-600 dark:text-slate-400"
               }`}>
-                {loadingRepo ? "..." : (repoFetched ? repoBundles.length : "·")}
+                {loadingRepo ? "..." : repoCount}
               </span>
             </button>
             <button
@@ -517,6 +508,7 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
                   onLaunch={() => void bundleTools.launch({ instanceId: instance.instanceId })}
                   onShortcuts={() => void bundleTools.shortcuts(instance.instanceId)}
                   availableProxies={availableProxies}
+                  proxyLabels={bundleState.view?.targetLabels}
                   preservedBinding={bundleState.view?.preservedTargets?.some(target => {
                     const stored = instance.slotTargets?.main;
                     return stored && target.profileId === stored.profileId && target.kind === stored.kind && target.name === stored.name;
@@ -540,140 +532,11 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
           </main>
         )}
 
-        {/* ================= 视图 2：仓库中心 (Business-Rules) ================= */}
-        {activeTab === "presets" && (
-          <section className="space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-2 border-b border-slate-100 dark:border-slate-800/60">
-              <div>
-                <h2 className="text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
-                  <span>规则仓库业务套件</span>
-                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-purple-100 text-purple-700 dark:bg-purple-500/20 dark:text-purple-300 font-mono">
-                    ProcWeaver-Rules/Business-Rules
-                  </span>
-                </h2>
-                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                  便携版仅默认携带核心套件，其它业务包可在此一键装载到本机，或在右上角手动导入
-                </p>
-              </div>
-
-              <div className="flex items-center space-x-2">
-                <button
-                  type="button"
-                  onClick={loadRepoBundles}
-                  disabled={loadingRepo}
-                  className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-700 text-xs font-medium transition flex items-center gap-1.5 cursor-pointer shadow-xs"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${loadingRepo ? "animate-spin text-indigo-500" : ""}`} />
-                  <span>{loadingRepo ? "拉取仓库中..." : "刷新仓库"}</span>
-                </button>
-                <a
-                  href="https://github.com/jojhaa/ProcWeaver-Rules/tree/main/Business-Rules"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-700 text-xs font-medium transition flex items-center gap-1.5"
-                >
-                  <span>访问远程目录</span>
-                  <ExternalLink className="w-3.5 h-3.5" />
-                </a>
-              </div>
-            </div>
-
-            {loadingRepo ? (
-              <div className="p-12 text-center rounded-2xl bg-white dark:bg-slate-900/60 border border-slate-200/80 dark:border-slate-800 space-y-3 shadow-xs">
-                <RefreshCw className="w-8 h-8 text-indigo-500 animate-spin mx-auto" />
-                <div className="text-sm font-bold text-slate-900 dark:text-white">正在同步远程规则仓库...</div>
-                <p className="text-xs text-slate-500 dark:text-slate-400 font-mono">
-                  连接 jojhaa/ProcWeaver-Rules/Business-Rules 获取最新 .pwpack.json
-                </p>
-              </div>
-            ) : repoBundles.length === 0 ? (
-              <div className="p-10 text-center rounded-2xl bg-white dark:bg-slate-900/60 border border-slate-200/80 dark:border-slate-800 space-y-3 shadow-xs">
-                <div className="text-4xl">🌐</div>
-                <div className="text-sm font-bold text-slate-900 dark:text-white">
-                  规则仓库暂无可在线装载的业务规则包
-                </div>
-                <p className="text-xs text-slate-500 dark:text-slate-400 max-w-lg mx-auto leading-relaxed">
-                  当前官方规则仓库（<code className="px-1 py-0.5 rounded bg-purple-50 text-purple-600 dark:bg-purple-950/40 dark:text-purple-300 font-mono">ProcWeaver-Rules/Business-Rules</code>）暂未发布额外的 <code className="px-1 py-0.5 rounded bg-indigo-50 text-indigo-600 dark:bg-indigo-950/40 dark:text-indigo-300 font-mono">.pwpack.json</code> 规则包。已装载套件中的 OpenAI 和 Google 反重力已在本地开箱就绪。
-                </p>
-                <div className="flex flex-wrap items-center justify-center gap-2 pt-2">
-                  <button
-                    type="button"
-                    onClick={loadRepoBundles}
-                    className="px-3.5 py-1.5 rounded-xl text-xs font-medium bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 cursor-pointer transition flex items-center gap-1.5 shadow-2xs"
-                  >
-                    <RefreshCw className="w-3.5 h-3.5" />
-                    <span>刷新重试</span>
-                  </button>
-                  <a
-                    href="https://github.com/jojhaa/ProcWeaver-Rules"
-                    target="_blank"
-                    rel="noreferrer"
-                    className="px-3.5 py-1.5 rounded-xl text-xs font-medium bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 transition flex items-center gap-1.5 shadow-2xs"
-                  >
-                    <span>访问规则仓库主页</span>
-                    <ExternalLink className="w-3.5 h-3.5" />
-                  </a>
-                  <button
-                    type="button"
-                    onClick={() => setIsImportOpen(true)}
-                    className="px-3.5 py-1.5 rounded-xl text-xs font-bold bg-indigo-600 hover:bg-indigo-500 text-white cursor-pointer transition flex items-center gap-1.5 shadow-sm"
-                  >
-                    <Download className="w-3.5 h-3.5" />
-                    <span>导入本地规则包 (.pwpack.json)</span>
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                {repoBundles.map((bundle) => {
-                  const isAlreadyInstalled = instances.some(
-                    (i) => i.definition.packageId === bundle.packageId
-                  );
-
-                  return (
-                    <div
-                      key={bundle.packageId}
-                      className="p-4 rounded-2xl bg-white dark:bg-slate-900/90 border border-slate-200/80 dark:border-slate-800 flex items-start justify-between gap-3 hover:border-indigo-300 dark:hover:border-slate-700 shadow-xs dark:shadow-md transition"
-                    >
-                      <div className="flex items-start space-x-3">
-                        <span className="text-2xl mt-0.5">{bundle.icon}</span>
-                        <div className="space-y-1">
-                          <div className="flex items-center space-x-2">
-                            <h4 className="text-sm font-bold text-slate-900 dark:text-white">{bundle.packageName}</h4>
-                            <span className="px-1.5 py-0.2 rounded text-[10px] font-mono bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
-                              {bundle.packageVersion}
-                            </span>
-                          </div>
-                          <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
-                            {bundle.description}
-                          </p>
-                          <div className="flex flex-wrap items-center gap-1 pt-1">
-                            {bundle.processes.map((p) => (
-                              <span
-                                key={p.exe}
-                                className="px-1.5 py-0.2 rounded text-[10px] font-mono bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border border-slate-200/60 dark:border-transparent"
-                              >
-                                {p.exe}
-                              </span>
-                            ))}
-                          </div>
-                        </div>
-                      </div>
-
-                      <button
-                        type="button"
-                        onClick={() => handleInstallFromPreset(bundle)}
-                        className="px-3 py-1.5 rounded-xl text-xs font-bold bg-indigo-600 text-white hover:bg-indigo-500 cursor-pointer shrink-0 transition shadow-xs"
-                      >
-                        {isAlreadyInstalled ? "+ 再次装载" : "+ 装载到本机"}
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </section>
-        )}
+        {/* 仓库管理独立于已装载规则与运行配置。 */}
+        {activeTab === "presets" && <RepositoryCenter state={repositories.state} defaultId={DEFAULT_REPOSITORY.id} instances={instances}
+          onRefresh={id => { void repositories.actions.refresh(id); }} onReload={() => { repositories.actions.reload(); }}
+          onSave={repositories.actions.upsert} onToggle={repositories.actions.toggle} onRemove={repositories.actions.remove}
+          onInstall={handleInstallFromPreset} repositoryLink={repositoryPage} />}
 
         {/* ================= 视图 3：自定义工坊 ================= */}
         {activeTab === "studio" && (
@@ -750,6 +613,7 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
         isOpen={Boolean(quickBindTarget)}
         bundleInstance={quickBindTarget}
         availableProxies={availableProxies}
+        proxyLabels={bundleState.view?.targetLabels}
         onConfirm={handleConfirmQuickBind}
         onCancel={() => setQuickBindTarget(null)}
       />
@@ -758,6 +622,7 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
       <ImportBundleModal
         isOpen={isImportOpen}
         availableProxies={availableProxies}
+        proxyLabels={bundleState.view?.targetLabels}
         onConfirm={handleImportConfirm}
         onCancel={() => setIsImportOpen(false)}
       />

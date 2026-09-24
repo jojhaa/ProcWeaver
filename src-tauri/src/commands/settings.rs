@@ -257,7 +257,7 @@ pub fn prepare_with(raw: &str, settings: &GeneralSettings) -> Result<String, Str
         "always" => "always",
         "off" => "off",
         _ => {
-            if crate::routing_overrides::read().map(|r| r.process_enabled).unwrap_or(false) {
+            if crate::routing_overrides::read().map(|r| r.effective().process_enabled).unwrap_or(false) {
                 "always"
             } else {
                 "off"

@@ -21,9 +21,10 @@ interface Props {
   proxyPort?: number;
   corePid?: number;
   activeNodeName?: string;
+  activeNodeLabel?: string;
 }
 
-export const ActiveExitCard: React.FC<Props> = ({ proxyPort, corePid, activeNodeName }) => {
+export const ActiveExitCard: React.FC<Props> = ({ proxyPort, corePid, activeNodeName, activeNodeLabel }) => {
   const { data, loading, phase, loadData } = useExitIpHealth(proxyPort, corePid);
   const [copied, setCopied] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
@@ -93,7 +94,7 @@ export const ActiveExitCard: React.FC<Props> = ({ proxyPort, corePid, activeNode
             <div>
               <div className="flex items-center space-x-2 flex-wrap gap-y-1">
                 <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">
-                  当前物理出口画像 · 活动节点: <strong className="text-indigo-600 dark:text-indigo-400 font-bold">{activeNodeName || "默认主组 (PROXY)"}</strong>
+                  当前物理出口画像 · 活动节点: <strong className="text-indigo-600 dark:text-indigo-400 font-bold">{activeNodeLabel || activeNodeName || "默认主组 (PROXY)"}</strong>
                 </span>
                 {data?.country && (
                   <span className="text-[11px] px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-medium break-words">

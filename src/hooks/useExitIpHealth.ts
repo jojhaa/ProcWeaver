@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import { fetchIpHealth, waitForExitConnection, getProfiles } from "../api";
+import { localNodesApi } from "../api/localNodes";
 import { IpHealthInfo } from "../types";
 import { delayedExitCheck } from "../utils/delayedExitCheck";
 import { logInfo, logError } from "../api/logs";
@@ -50,10 +51,10 @@ async function runDetection(proxyPort?: number, corePid?: number, force = false)
 
   // 检查是否有可用节点订阅，无订阅时直接进入待机状态，绝不发起网络请求
   try {
-    const profiles = await getProfiles();
+    const [profiles, local] = await Promise.all([getProfiles(), localNodesApi.read()]);
     const hasAnyProfile = Array.isArray(profiles) && profiles.length > 0;
     const hasActiveProfile = hasAnyProfile && profiles.some((p) => p.isSelected && (p.nodeCount ?? 0) > 0);
-    if (!hasAnyProfile || !hasActiveProfile) {
+    if ((!hasAnyProfile || !hasActiveProfile) && local.nodes.length === 0) {
       globalState = {
         ...globalState,
         loading: false,

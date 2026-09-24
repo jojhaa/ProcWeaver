@@ -36,6 +36,7 @@ fn default_bundle_fallback() -> String { "rules".into() }
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Overrides {
     pub schema_version: u32, pub revision: u64,
+    #[serde(default = "default_bundles_enabled")] pub bundles_enabled: bool,
     pub process_enabled: bool, pub dns_enabled: bool,
     pub process_rules: Vec<ProcessRule>, pub dns_rules: Vec<DnsRule>,
     #[serde(default)] pub bundles: Vec<BundleRoute>,
@@ -43,8 +44,28 @@ pub struct Overrides {
     #[serde(default)] pub retain_foreign_targets: bool,
 }
 fn first_bundle_port() -> u16 { 34000 }
+fn default_bundles_enabled() -> bool { true }
+impl Overrides {
+    /// 暂停仅影响运行计划，保存的单包状态、规则与绑定保持不变。
+    pub fn effective(&self) -> Self {
+        let mut config = self.clone();
+        let owned = |id: &str| super::bundles::owner(id, &self.bundles).is_some();
+        let dns_owned = |id: &str| self.bundles.iter().any(|b| id.starts_with(&format!("bundle-dns-{}-", b.id)));
+        // Manual feature switches and the bundle master are independent gates.
+        if !self.process_enabled { config.process_rules.retain(|r| owned(&r.id)); }
+        if !self.dns_enabled { config.dns_rules.retain(|r| dns_owned(&r.id)); }
+        if !config.bundles_enabled {
+            config.process_rules.retain(|r| !owned(&r.id));
+            config.dns_rules.retain(|r| !dns_owned(&r.id));
+            for bundle in &mut config.bundles { bundle.enabled = false; }
+        }
+        config.process_enabled |= config.bundles.iter().any(|b| b.enabled);
+        config.dns_enabled |= config.bundles_enabled && config.dns_rules.iter().any(|r| dns_owned(&r.id) && r.enabled);
+        config
+    }
+}
 impl Default for Overrides {
-    fn default() -> Self { Self { retain_foreign_targets: false, schema_version: 1, revision: 0, process_enabled: false,
+    fn default() -> Self { Self { bundles_enabled: true, retain_foreign_targets: false, schema_version: 1, revision: 0, process_enabled: false,
         dns_enabled: false, process_rules: vec![], dns_rules: vec![], bundles: vec![], next_bundle_port: first_bundle_port() } }
 }
 
