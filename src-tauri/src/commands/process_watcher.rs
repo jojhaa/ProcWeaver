@@ -315,8 +315,10 @@ fn scan_and_handle_bare_processes() {
             }
 
             // 执行策略动作
-            // 普通浏览器（Chrome, Edge, Brave）：由于用户可能正在浏览日常网页，绝不自动强杀！直接走温和提示
-            if app_def.is_browser || mode == WatcherMode::NotifyOnly {
+            // 商店应用与无法核实入口的实例只提示，重启必须进入业务包确认流程。
+            let needs_activation=item.executable_path.as_deref().is_none_or(|path|
+                !matches!(super::packaged_app::resolve(std::path::Path::new(path)),Ok(None)));
+            if app_def.is_browser || needs_activation || mode == WatcherMode::NotifyOnly {
                 // 模式 B（温和气泡提示）
                 if let Ok(guard) = APP_HANDLE.lock() {
                     if let Some(app) = guard.as_ref() {
@@ -326,10 +328,12 @@ fn scan_and_handle_bare_processes() {
                             display_name: app_def.display_name.to_string(),
                             pid,
                             is_browser: app_def.is_browser,
-                            message: format!(
-                                "检测到「{}」正在直连裸跑（PID: {}），建议通过专属加速通道启动以防网络受阻",
+                            message: if needs_activation {
+                                format!("检测到「{}」未携带代理参数；商店应用或入口待核实的实例不会自动结束，请在业务包中检测并确认重启",app_def.display_name)
+                            } else { format!(
+                                "检测到「{}」未携带代理启动参数（PID: {}），实际出口仍需核验，可通过专属通道启动",
                                 app_def.display_name, pid
-                            ),
+                            ) },
                         };
                         let _ = app.emit("watcher-bare-process-detected", payload);
                     }
@@ -384,6 +388,7 @@ fn scan_and_handle_bare_processes() {
 
 /// 启动后台守护任务循环
 pub fn start_watcher_loop() {
+    if !cfg!(windows) { return; }
     if WATCHER_ACTIVE.swap(true, Ordering::SeqCst) {
         return; // 已经运行中
     }
@@ -407,6 +412,7 @@ pub fn stop_watcher_loop() {
 
 /// 初始化开机/启动自愈状态
 pub fn init_watcher_on_startup() {
+    if !cfg!(windows) { return; }
     let cfg = load_watcher_config();
     if let Ok(mut g) = CURRENT_MODE.lock() {
         *g = cfg.mode;
@@ -418,12 +424,14 @@ pub fn init_watcher_on_startup() {
 
 #[tauri::command]
 pub fn get_watcher_mode() -> Result<WatcherMode, String> {
+    if !cfg!(windows) { return Ok(WatcherMode::Disabled); }
     let guard = CURRENT_MODE.lock().map_err(|e| e.to_string())?;
     Ok(*guard)
 }
 
 #[tauri::command]
 pub fn set_watcher_mode(mode: WatcherMode) -> Result<WatcherMode, String> {
+    if !cfg!(windows) && mode != WatcherMode::Disabled { return Err("macOS 请从业务包启动应用，暂不支持自动重启接管".into()); }
     if let Ok(mut g) = CURRENT_MODE.lock() {
         *g = mode;
     }

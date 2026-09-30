@@ -5,22 +5,29 @@ import { Play, Square, Globe, RefreshCw, Cpu, Zap } from "lucide-react";
 
 import { useCoreStatus } from "../hooks/useCoreStatus";
 import { proxyStateLabel } from "../utils/coreStatusStore";
+import { usePlatform } from "../context/PlatformContext";
+import type { CoreVariant } from "../types/platform";
+import { useMonitorVisible } from "../hooks/useMonitorVisible";
 
 interface Props {
   extraAction?: React.ReactNode;
 }
 
 export const CoreControlBar: React.FC<Props> = ({ extraAction }) => {
-  const { status, pending: loading, run, refresh } = useCoreStatus();
+  const platform = usePlatform();
+  const mobile = platform.os === "android";
+  const visible = useMonitorVisible();
+  const { status, known, readError, pending: loading, run, refresh } = useCoreStatus();
+  const unknown = !known;
   const proxy = status.systemProxy!;
   const [cpuInfo, setCpuInfo] = useState<CpuInfo | null>(null);
-  const [coreMode, setCoreMode] = useState<"auto" | "v3" | "compatible">("auto");
+  const [coreMode, setCoreMode] = useState<CoreVariant>("auto");
   const [error, setError] = useState("");
   const [uptimeSeconds, setUptimeSeconds] = useState(0);
   const [localStartTime, setLocalStartTime] = useState<number | null>(null);
 
   useEffect(() => {
-    getCpuInfo().then(setCpuInfo).catch(console.error);
+    if (!mobile) getCpuInfo().then(setCpuInfo).catch(console.error);
   }, []);
 
   // 运行耗时秒级自增计时器 (几时几分几秒)
@@ -42,10 +49,11 @@ export const CoreControlBar: React.FC<Props> = ({ extraAction }) => {
       setUptimeSeconds(Math.max(0, now - effectiveStart));
     };
 
+    if (mobile && !visible) return;
     updateUptime();
     const timer = setInterval(updateUptime, 1000);
     return () => clearInterval(timer);
-  }, [status.running, status.startedAt]);
+  }, [status.running, status.startedAt, mobile, visible]);
 
   const formatUptime = (totalSecs: number) => {
     const h = Math.floor(totalSecs / 3600);
@@ -56,6 +64,7 @@ export const CoreControlBar: React.FC<Props> = ({ extraAction }) => {
   };
 
   const handleToggleCore = async () => {
+    if (unknown) return;
     setError("");
     try {
       await run(() => toggleCore(!status.running, coreMode));
@@ -67,9 +76,9 @@ export const CoreControlBar: React.FC<Props> = ({ extraAction }) => {
 
   const handleToggleSystemProxy = async () => {
     setError("");
-    if (proxy.state === "unknown") { await refresh(); return; }
+    if (proxy.state === "unknown" && platform.os !== "macos") { await refresh(); return; }
     try {
-      await run(() => toggleSystemProxy(proxy.state !== "enabled", status.mixedPort));
+      await run(() => toggleSystemProxy(proxy.state !== "enabled" && proxy.state !== "unknown", status.mixedPort));
     } catch (e) {
       setError(String(e));
     }
@@ -77,7 +86,8 @@ export const CoreControlBar: React.FC<Props> = ({ extraAction }) => {
 
   return (
     <div className="bg-white/90 dark:bg-slate-900/80 border border-slate-200/90 dark:border-slate-800/80 backdrop-blur-md rounded-2xl p-5 shadow-sm dark:shadow-xl space-y-4 transition-colors">
-      {error && <p role="alert" className="text-sm text-rose-500 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/30 p-2.5 rounded-xl border border-rose-200 dark:border-rose-900/50">{error}</p>}
+      {(error || (!status.running && status.lastStartError)) && <p role="alert" className="text-sm text-rose-500 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/30 p-2.5 rounded-xl border border-rose-200 dark:border-rose-900/50">{error || status.lastStartError}</p>}
+      {!mobile && known && !status.running && <p className="text-xs text-slate-500 dark:text-slate-400">核心未启动，可继续管理订阅、节点和规则；保存的配置将在核心启动后应用。</p>}
       
       {/* 顶部主控制行 */}
       <div className="flex flex-wrap items-center justify-between gap-4">
@@ -86,10 +96,10 @@ export const CoreControlBar: React.FC<Props> = ({ extraAction }) => {
           <div className="relative flex items-center justify-center">
             <div
               className={`w-3.5 h-3.5 rounded-full ${
-                status.running ? "bg-emerald-500 shadow-sm shadow-emerald-500/50" : "bg-slate-400 dark:bg-slate-600"
+                !unknown && status.running ? "bg-emerald-500 shadow-sm shadow-emerald-500/50" : "bg-slate-400 dark:bg-slate-600"
               }`}
             />
-            {status.running && (
+            {!unknown && status.running && (
               <div className="absolute -inset-1 bg-emerald-500/30 rounded-full animate-ping pointer-events-none" />
             )}
           </div>
@@ -97,26 +107,26 @@ export const CoreControlBar: React.FC<Props> = ({ extraAction }) => {
           <div>
             <div className="flex items-center space-x-2.5">
               <span className="font-bold text-slate-900 dark:text-white text-base tracking-tight">
-                Mihomo 核心
+                {mobile ? "VPN 连接" : "Mihomo 核心"}
               </span>
               <span
                 className={`px-2.5 py-0.5 rounded-md text-[11px] font-medium transition-all ${
-                  status.running
+                  !unknown && status.running
                     ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30 font-mono shadow-xs"
                     : "bg-slate-100 text-slate-600 border border-slate-200 dark:bg-slate-800 dark:text-slate-400 dark:border-slate-700 font-sans"
                 }`}
               >
-                {status.running ? formatUptime(uptimeSeconds) : "已停止"}
+                {unknown ? "状态未知" : status.running ? formatUptime(uptimeSeconds) : "已停止"}
               </span>
             </div>
-            <div className="flex items-center space-x-2 text-xs text-slate-500 dark:text-slate-400 mt-1.5">
+            {!mobile && <div className="flex items-center space-x-2 text-xs text-slate-500 dark:text-slate-400 mt-1.5">
               <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800/70 border border-slate-200/80 dark:border-slate-700/60 font-mono text-[11px]">
                 Mixed: <strong className="text-slate-800 dark:text-slate-200 ml-1">{status.mixedPort}</strong>
               </span>
               <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800/70 border border-slate-200/80 dark:border-slate-700/60 font-mono text-[11px]">
                 API: <strong className="text-slate-800 dark:text-slate-200 ml-1">{status.controllerPort}</strong>
               </span>
-            </div>
+            </div>}
           </div>
         </div>
 
@@ -126,10 +136,10 @@ export const CoreControlBar: React.FC<Props> = ({ extraAction }) => {
           {extraAction}
 
           {/* 系统代理开关 */}
-          <button
+          {platform.systemProxy && <button
             onClick={handleToggleSystemProxy}
             title={proxy.state === "external" ? "点击将系统代理接入本核心" : proxy.message}
-            disabled={loading || (!status.running && proxy.state !== "enabled" && proxy.state !== "unknown")}
+            disabled={!platform.systemProxy || loading || (!status.running && proxy.state !== "enabled" && proxy.state !== "unknown")}
             className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl text-xs font-semibold border transition shadow-sm ${
               status.systemProxyEnabled
                 ? "bg-indigo-600 hover:bg-indigo-500 text-white border-indigo-500 shadow-indigo-600/30"
@@ -138,12 +148,12 @@ export const CoreControlBar: React.FC<Props> = ({ extraAction }) => {
           >
             <Globe className="w-3.5 h-3.5" />
             <span>系统代理: {loading ? "切换中…" : proxyStateLabel(proxy.state)}</span>
-          </button>
+          </button>}
 
           {/* 内核启动/关闭 */}
           <button
             onClick={handleToggleCore}
-            disabled={loading}
+            disabled={loading || unknown}
             className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-semibold border transition shadow-sm ${
               status.running
                 ? "bg-rose-500/10 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400 border-rose-500/30"
@@ -157,12 +167,16 @@ export const CoreControlBar: React.FC<Props> = ({ extraAction }) => {
             ) : (
               <Play className="w-3.5 h-3.5 fill-current" />
             )}
-            <span>{status.running ? "停止核心" : "启动核心"}</span>
+            <span className="whitespace-nowrap">{unknown ? (mobile ? "等待 VPN 状态" : "等待核心状态") : mobile ? (status.running ? "断开 VPN" : "连接 VPN") : (status.running ? "停止核心" : "启动核心")}</span>
           </button>
         </div>
       </div>
 
-      {(proxy.bypassChanged || proxy.state === "unknown" || proxy.state === "external") && (
+      {unknown && <div role="status" className="text-xs text-amber-700 dark:text-amber-400 flex items-center gap-3">
+        <span>{readError || (mobile ? "正在读取 VPN 状态…" : "正在读取核心状态…")}</span>
+        <button className="shrink-0 rounded-lg border px-3 py-2" disabled={loading} onClick={() => void refresh()}>重试</button>
+      </div>}
+      {!mobile && (proxy.bypassChanged || proxy.state === "unknown" || proxy.state === "external") && (
         <p role="status" className="text-xs text-amber-700 dark:text-amber-400">{proxy.message}{proxy.state === "unknown" ? "；点击系统代理按钮重试" : ""}</p>
       )}
       {proxy.lastChange && (
@@ -170,12 +184,13 @@ export const CoreControlBar: React.FC<Props> = ({ extraAction }) => {
           最近变更 {new Date(proxy.lastChange.timestamp).toLocaleTimeString()}：{proxy.lastChange.reason}
         </p>
       )}
+      {platform.os === "macos" && <p className="text-xs text-slate-500">当前为应用代理模式，TUN 尚未启用。应用需遵循代理设置，实际接入请核对连接记录与出口。</p>}
       {/* 内核版本与 CPU 架构选择器 */}
-      <div className="pt-3 border-t border-slate-200 dark:border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs">
+      {!mobile && <div className="pt-3 border-t border-slate-200 dark:border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs">
         <div className="flex items-center space-x-2 text-slate-500 dark:text-slate-400">
           <Cpu className="w-4 h-4 text-indigo-500 dark:text-indigo-400" />
-          <span>硬件架构: <strong className="text-slate-800 dark:text-slate-300 font-mono">{cpuInfo?.arch || "x86_64"}</strong></span>
-          {cpuInfo?.avx2Supported ? (
+          <span>{mobile ? "Android" : platform.label} · <strong className="text-slate-800 dark:text-slate-300 font-mono">{mobile && platform.arch === "aarch64" ? "ARM64" : platform.arch}</strong></span>
+          {platform.os === "windows" && (cpuInfo?.avx2Supported ? (
             <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
               <Zap className="w-3 h-3 fill-current" />
               <span>支持 AVX2 指令集</span>
@@ -184,19 +199,20 @@ export const CoreControlBar: React.FC<Props> = ({ extraAction }) => {
             <span className="inline-flex items-center px-2 py-0.5 rounded bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400">
               常规指令集
             </span>
-          )}
+          ))}
         </div>
 
         {/* 双内核切换选择器 */}
-        <div className="flex items-center space-x-1 bg-slate-100 dark:bg-slate-950 p-1 rounded-xl border border-slate-200 dark:border-slate-800">
+        {!mobile && <div className="flex items-center space-x-1 bg-slate-100 dark:bg-slate-950 p-1 rounded-xl border border-slate-200 dark:border-slate-800">
           <span className="text-slate-500 px-2 font-medium">内核版本:</span>
           {(
             [
               { id: "auto", label: "自动优选" },
               { id: "v3", label: "amd64-v3 (AVX2 高性能)" },
               { id: "compatible", label: "amd64-compatible (通用兼容)" },
+              { id: "standard", label: "原生标准版" },
             ] as const
-          ).map((item) => (
+          ).filter(item => platform.coreModes.includes(item.id) && (platform.os !== "windows" || item.id !== "standard")).map((item) => (
             <button
               key={item.id}
               onClick={() => setCoreMode(item.id)}
@@ -210,8 +226,8 @@ export const CoreControlBar: React.FC<Props> = ({ extraAction }) => {
               {item.label}
             </button>
           ))}
-        </div>
-      </div>
+        </div>}
+      </div>}
     </div>
   );
 };

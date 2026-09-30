@@ -102,7 +102,7 @@ pub fn add_listeners(yaml: &mut Value, config: &Overrides, prefix: &Value, fallb
 }
 pub fn structural(raw: &str) -> Result<Value, String> {
     let mut yaml: Value = serde_yaml::from_str(raw).map_err(|_| "配置 YAML 无效")?;
-    if let Some(map) = yaml.as_mapping_mut() { map.remove(Value::from(SELECTIONS)); map.remove(Value::from("netbox-capture")); }
+    if let Some(map) = yaml.as_mapping_mut() { map.remove(Value::from(SELECTIONS)); map.remove(Value::from("netbox-capture")); map.remove(Value::from("procweaver-windivert-v1")); }
     Ok(yaml)
 }
 pub async fn select(raw: &str) -> Result<(), String> {

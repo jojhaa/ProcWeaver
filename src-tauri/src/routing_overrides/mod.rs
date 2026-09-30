@@ -1,12 +1,14 @@
 pub mod model;
 pub mod composer;
 pub mod tracker;
+pub mod ownership;
 pub mod native;
 pub mod bundles;
 pub mod foreign_targets;
 mod target_cache;
 #[cfg(test)] mod tests;
 #[cfg(test)] mod bundle_runtime_tests;
+#[cfg(all(test, windows))] mod instance_runtime_tests;
 use model::*;
 use crate::commands::{profile, settings, local_rules, exclusions, process};
 use serde::{Deserialize, Serialize};
@@ -21,7 +23,12 @@ pub fn set_applied(revision: u64, generation: u64) { *APPLIED.lock().unwrap_or_e
 fn path() -> std::path::PathBuf { crate::storage::data_dir().join("config/routing-overrides.json") }
 pub fn read() -> Result<Overrides, String> {
     match std::fs::read(path()) {
-        Ok(bytes) => normalize(serde_json::from_slice(&bytes).map_err(|_| "进程 / DNS 规则损坏，请恢复备份，未覆盖原文件")?),
+        Ok(bytes) => {
+            let config: Overrides = serde_json::from_slice(&bytes).map_err(|_| "进程 / DNS 规则损坏，请恢复备份，未覆盖原文件")?;
+            #[cfg(target_os = "android")]
+            let config = config.without_bundles();
+            normalize(config)
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Overrides::default()),
         Err(_) => Err("无法读取进程 / DNS 规则".into()),
     }
@@ -35,7 +42,7 @@ pub fn prepare(raw: &str, config: &Overrides, profile_id: &str) -> Result<String
     prepare_with_nodes(raw, config, profile_id, &crate::local_nodes::read()?)
 }
 pub fn prepare_with_nodes(raw: &str, config: &Overrides, profile_id: &str, nodes: &crate::local_nodes::Store) -> Result<String, String> {
-    let follows_system = config.bundles_enabled && config.bundles.iter().any(|b| b.enabled && b.mode == "sandbox" && b.fallback == "system");
+    let follows_system = !cfg!(target_os = "android") && config.bundles_enabled && config.bundles.iter().any(|b| b.enabled && b.mode == "sandbox" && b.fallback == "system");
     let enabled = if follows_system { crate::commands::sysproxy::get_system_proxy_status()? } else { false };
     prepare_plan(raw, config, profile_id, enabled, nodes)
 }
@@ -79,6 +86,9 @@ fn prepare_plan(raw: &str, config: &Overrides, profile_id: &str, system_proxy: b
     }
     let channels = profile::get_business_channels().unwrap_or_default();
     let mut state = tracker::status(config);
+    let instance_routing = cfg!(windows) && general.traffic_mode == "windivert_v1";
+    // Instance-aware capture must never publish inherited global path rules.
+    if instance_routing { state.derived.clear(); }
     for rule in &mut state.derived {
         if let Some(target) = &mut rule.target { crate::local_nodes::remap(target, profile_id); foreign_targets::remap(target, config, profile_id); }
         bundles::map_process(rule, &config.bundles, profile_id);
@@ -90,24 +100,30 @@ fn prepare_plan(raw: &str, config: &Overrides, profile_id: &str, system_proxy: b
     let manual_derived: Vec<_> = state.derived.iter().filter(|r| bundles::owner(&r.id, &config.bundles).is_none()).cloned().collect();
 
     // 严密控制规则入栈顺序：后插入 0..0 者位于 rules 最终序列更顶层
-    let base = match general.routing_priority.as_str() {
+    let manual_base = base.clone();
+    let compose_base = |manual: &Overrides, owned: bool| -> Result<String, String> {
+      let compose = |raw: &str| if owned { composer::compose_owned(raw, manual, profile_id) }
+        else { composer::compose(raw, manual, profile_id, &manual_derived) };
+      match general.routing_priority.as_str() {
         "process_first" => {
             // 进程强锁防关联：先注入域名，再将进程插入第 0 位
-            let base = profile::compose_business_channels(&base, &channels)?;
-            composer::compose(&base, &manual, profile_id, &manual_derived)?
+            let base = profile::compose_business_channels(&manual_base, &channels)?;
+            compose(&base)
         }
         "direct_first" => {
             // 白名单直连绝对最高：先注入进程再注入域名，最后将全部 DIRECT 规则置于所有 PROXY 出站前列
-            let base = composer::compose(&base, &manual, profile_id, &manual_derived)?;
+            let base = compose(&manual_base)?;
             let base = profile::compose_business_channels(&base, &channels)?;
-            composer::prioritize_direct_rules(&base)?
+            composer::prioritize_direct_rules(&base)
         }
         _ => {
             // 默认业务专线优先（domain_first）：先注入进程规则，再将业务域名规则插入第 0 位
-            let base = composer::compose(&base, &manual, profile_id, &manual_derived)?;
-            profile::compose_business_channels(&base, &channels)?
+            let base = compose(&manual_base)?;
+            profile::compose_business_channels(&base, &channels)
         }
+      }
     };
+    let base = compose_base(&manual, false)?;
 
     let exclusions = exclusions::get_exclusions()?;
     let finish = |raw:&str| -> Result<String,String> {
@@ -115,19 +131,49 @@ fn prepare_plan(raw: &str, config: &Overrides, profile_id: &str, system_proxy: b
         let raw=if config.process_enabled {composer::safety(&raw)?}else{raw};
         composer::ensure_bt_pt_and_proxy_group(&raw)
     };
+    #[cfg(windows)]
+    let mut owner_policies = std::collections::BTreeMap::new();
+    #[cfg(windows)]
+    if instance_routing && config.process_enabled {
+        for rule in config.process_rules.iter().filter(|r| ownership::standalone(r, config)) {
+            let key = ownership::key(rule, config);
+            if owner_policies.contains_key(&key) { continue; }
+            let mut selected = config.clone();
+            selected.process_rules = vec![rule.clone()];
+            let policy = if bundles::owner(&rule.id, &config.bundles).is_some() {
+                selected.dns_enabled = false;
+                composer::compose_owned(&base, &selected, profile_id)?
+            } else { compose_base(&selected, true)? };
+            owner_policies.insert(key, serde_yaml::from_str(&finish(&policy)?).map_err(|_| "实例分流策略无效")?);
+        }
+    }
     // Capture the existing routing plan before adding any bundle-owned process rules.
     let fallback:serde_yaml::Value=serde_yaml::from_str(&finish(&base)?).map_err(|_|"原有分流规则无效")?;
     let fallback=fallback["rules"].as_sequence().cloned().unwrap_or_default();
     let bundles = Overrides {
         process_enabled: config.process_enabled,
-        process_rules: config.process_rules.iter().filter(|r| bundles::owner(&r.id, &config.bundles).is_some()).cloned().collect(),
+        process_rules: config.process_rules.iter().filter(|r| bundles::owner(&r.id, &config.bundles).is_some()
+            && (!instance_routing || ownership::standalone(r, config))).cloned().collect(),
         bundles: config.bundles.clone(),
         ..Overrides::default()
     };
     let bundle_derived: Vec<_> = state.derived.iter().filter(|r| bundles::owner(&r.id, &config.bundles).is_some()).cloned().collect();
     let base = composer::compose(&base, &bundles, profile_id, &bundle_derived)?;
     let base = finish(&base)?;
-    crate::capture::compose(&base, config, profile_id, &fallback)
+    #[cfg(windows)]
+    let base = crate::commands::dns_listener::compose(&base, config)?;
+    let base = crate::capture::compose(&base, config, profile_id, &fallback)?;
+    #[cfg(windows)]
+    let base = if general.traffic_mode == crate::capture::windivert::plan::MODE {
+        crate::capture::windivert::plan::compose_with_policies(&base, config, &owner_policies)?
+    } else { base };
+    #[cfg(target_os = "android")]
+    if general.allow_lan {
+        let mut yaml: serde_yaml::Value = serde_yaml::from_str(&base).map_err(|_| "运行配置无效")?;
+        crate::commands::mobile_settings::add_lan_listener(yaml.as_mapping_mut().ok_or("运行配置必须为对象")?, &general.lan_sharing)?;
+        return serde_yaml::to_string(&yaml).map_err(|_| "生成共享运行配置失败".into());
+    }
+    Ok(base)
 }
 pub async fn reapply(config: &Overrides) -> Result<(), String> {
     let (id, source) = current_source();
@@ -172,9 +218,16 @@ pub(crate) async fn change_system_proxy(enable: bool, change: impl FnOnce() -> R
 /// 所有调用方已持有 LIFECYCLE。超时也可能已应用，因此错误时必须重新加载旧配置。
 pub async fn apply_runtime(prepared: &str) -> Result<(), String> {
     if !process::ACTIVE.load(Ordering::SeqCst) { return Ok(()); }
+    #[cfg(windows)]
+    let resolved = crate::commands::dns_listener::resolve_for_apply(prepared, process::PID.load(Ordering::SeqCst)).await?;
+    #[cfg(windows)]
+    let resolved = crate::capture::windivert::ports::resolve_for_apply(&resolved, process::PID.load(Ordering::SeqCst)).await?;
+    #[cfg(windows)]
+    let prepared = resolved.as_str();
     let target = crate::storage::data_dir().join("core_data/config.yaml");
     let old = std::fs::read_to_string(&target).map_err(|_| "读取旧运行配置失败")?;
-    let reload_needed = bundles::structural(&old)? != bundles::structural(prepared)?;
+    // Android also reconciles package-owned connections and selections in its host.
+    let reload_needed = cfg!(target_os = "android") || bundles::structural(&old)? != bundles::structural(prepared)?;
     let pid = process::PID.load(Ordering::SeqCst);
     crate::commands::dns_runtime::preflight(prepared, pid).await?;
     let applied = async {
@@ -196,9 +249,20 @@ pub async fn apply_runtime(prepared: &str) -> Result<(), String> {
         if let Err(restore) = restored { crate::capture::failed(&restore); return Err(format!("{error}；旧文件已恢复，但核心恢复未确认：{restore}")); }
         return Err(format!("{error}；已恢复旧运行配置"));
     }
+    #[cfg(windows)]
+    crate::commands::dns_listener::remember_success(prepared);
     Ok(())
 }
 async fn reload(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let config = std::fs::read_to_string(path).map_err(|_| "运行配置读取失败")?;
+        let _: serde_json::Value = crate::platform::android::call_async("reload", serde_json::json!({"config": config})).await?;
+        crate::commands::mihomo_api::invalidate_monitor_types();
+        return Ok(());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
     let canonical = std::fs::canonicalize(path).map_err(|_| "运行路径无效")?;
     let text = canonical.to_string_lossy(); let path = text.strip_prefix(r"\\?\").unwrap_or(&text);
     let port = settings::get_general_settings()?.controller_port;
@@ -209,6 +273,7 @@ async fn reload(path: &std::path::Path) -> Result<(), String> {
     let result = client.get(format!("http://127.0.0.1:{port}/configs")).send().await.map_err(|_| "核心应用后核对失败")?;
     if !result.status().is_success() { return Err("核心应用后核对失败".into()); }
     Ok(())
+    }
 }
 
 #[derive(Serialize)]
@@ -235,7 +300,12 @@ pub fn view() -> Result<View, String> {
     let mut unavailable_rules: Vec<_> = effective.process_rules.iter().filter(|r| r.enabled && r.action == "proxy" && r.target.as_ref().is_none_or(|t| !available.contains(t))).map(|r| r.id.clone()).collect();
     unavailable_rules.extend(effective.dns_rules.iter().filter(|r| r.enabled && !available.contains(&r.target)).map(|r| r.id.clone()));
     unavailable_rules.extend(effective.bundles.iter().filter(|b| b.enabled && [&b.main_target, &b.dns_target].into_iter().flatten().any(|t| !available.contains(t))).map(|b| format!("bundle:{}",b.id)));
-    let tracking = tracker::status(&config);
+    let mut tracking = tracker::status(&config);
+    #[cfg(windows)]
+    if settings::get_general_settings()?.traffic_mode == "windivert_v1" {
+        tracking.derived.clear();
+        tracking.conflicts.clear();
+    }
     let running = process::ACTIVE.load(Ordering::SeqCst);
     let applied = if running { *APPLIED.lock().unwrap_or_else(|p| p.into_inner()) } else { None };
     Ok(View { target_labels, traffic_driver: crate::capture::smart_arbiter::get_active_driver_name(), capture: crate::capture::status(), config, targets, preserved_targets, tracking, running, applied_revision: applied.map(|p| p.0), applied_generation: applied.map(|p| p.1), unavailable_rules })
@@ -244,6 +314,8 @@ pub fn view() -> Result<View, String> {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Selection { pub identity: String, pub executable_path: String }
 pub async fn save(config: Overrides, selections: Vec<Selection>) -> Result<View, String> {
+    #[cfg(target_os = "android")]
+    let config = config.without_bundles();
     let _lock = process::LIFECYCLE.lock().await;
     let old = read()?;
     if config.revision != old.revision { return Err("规则已被其他页面修改，请重新加载后再保存".into()); }
@@ -262,7 +334,9 @@ pub async fn save(config: Overrides, selections: Vec<Selection>) -> Result<View,
         } }
         tracker::reconcile(processes, false);
     }
-    if let Some(error) = tracker::conflict_message(&tracker::status(&config).conflicts) { return Err(error); }
+    if !(cfg!(windows) && settings::get_general_settings()?.traffic_mode == "windivert_v1") {
+        if let Some(error) = tracker::conflict_message(&tracker::status(&config).conflicts) { return Err(error); }
+    }
     config.revision = old.revision.checked_add(1).ok_or("规则修订号已耗尽")?;
     let old_runtime = if process::ACTIVE.load(Ordering::SeqCst) { Some(std::fs::read_to_string(crate::storage::data_dir().join("core_data/config.yaml")).map_err(|_| "读取恢复配置失败")?) } else { None };
     reapply(&config).await?;

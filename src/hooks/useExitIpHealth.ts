@@ -35,10 +35,20 @@ function notifyListeners() {
   }
 }
 
+export function resetExitIpHealth() {
+  ++currentGeneration;
+  lastCheckedKey = null;
+  routeChanged = false;
+  globalState = { data: null, loading: false, error: null, phase: "等待核心启动" };
+  notifyListeners();
+}
+
 async function runDetection(proxyPort?: number, corePid?: number, force = false) {
   if (!proxyPort) {
+    ++currentGeneration;
     globalState = {
       ...globalState,
+      data: null,
       loading: false,
       error: null,
       phase: "等待核心启动",
@@ -49,9 +59,14 @@ async function runDetection(proxyPort?: number, corePid?: number, force = false)
     return;
   }
 
+  const currentKey = `${corePid ?? 0}:${proxyPort}`;
+  if (!force && !routeChanged && ((globalState.loading && globalState.corePid === corePid && globalState.proxyPort === proxyPort) || (globalState.data && lastCheckedKey === currentKey))) return;
+  const thisGen = ++currentGeneration;
+
   // 检查是否有可用节点订阅，无订阅时直接进入待机状态，绝不发起网络请求
   try {
     const [profiles, local] = await Promise.all([getProfiles(), localNodesApi.read()]);
+    if (thisGen !== currentGeneration) return;
     const hasAnyProfile = Array.isArray(profiles) && profiles.length > 0;
     const hasActiveProfile = hasAnyProfile && profiles.some((p) => p.isSelected && (p.nodeCount ?? 0) > 0);
     if ((!hasAnyProfile || !hasActiveProfile) && local.nodes.length === 0) {
@@ -69,25 +84,13 @@ async function runDetection(proxyPort?: number, corePid?: number, force = false)
       return;
     }
   } catch {}
-
-  const currentKey = `${corePid ?? 0}:${proxyPort}`;
-
-  // 非强制刷新时：若节点未变更且已有缓存数据且核心未变化，直接复用，绝不重复探测
-  if (!force && !routeChanged && globalState.data && lastCheckedKey === currentKey) {
-    return;
-  }
-
-  // 避免并发重复发起探测
-  if (globalState.loading && !force && !routeChanged) {
-    return;
-  }
-
-  const thisGen = ++currentGeneration;
+  if (thisGen !== currentGeneration) return;
   const isRouteChange = routeChanged;
   routeChanged = false;
 
   globalState = {
     ...globalState,
+    data: isRouteChange || lastCheckedKey !== currentKey ? null : globalState.data,
     loading: true,
     error: null,
     phase: "等待节点连接",
@@ -145,7 +148,7 @@ async function runDetection(proxyPort?: number, corePid?: number, force = false)
 
       const costMs = Math.round(performance.now() - probeStartTime);
       const riskScoreStr =
-        result.fraudScore !== undefined
+        result.fraudScore != null
           ? `${result.fraudScore}分 (${
               result.fraudScore <= 25
                 ? "极佳 · 低风险"
@@ -210,9 +213,6 @@ export function useExitIpHealth(proxyPort?: number, corePid?: number) {
   }));
 
   useEffect(() => {
-    globalState.proxyPort = proxyPort;
-    globalState.corePid = corePid;
-
     const listener = (newState: GlobalExitIpState) => {
       setState(newState);
     };
@@ -223,7 +223,7 @@ export function useExitIpHealth(proxyPort?: number, corePid?: number) {
       Boolean(proxyPort) &&
       (routeChanged || !globalState.data || lastCheckedKey !== currentKey);
 
-    if (needInit && !globalState.loading) {
+    if (needInit && (!globalState.loading || globalState.corePid !== corePid || globalState.proxyPort !== proxyPort)) {
       void runDetection(proxyPort, corePid, false);
     } else {
       // 保持与当前全局缓存一致（切换 Tab 返回时瞬间恢复渲染，绝不重新探测）

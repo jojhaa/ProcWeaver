@@ -17,17 +17,25 @@ import {
 import {
   DnsSettings,
   DnsEnhancedMode,
-  DEFAULT_DNS_SETTINGS,
+  defaultDnsSettingsFor,
   getDnsSettings,
   saveDnsSettings,
 } from "../api/dns";
 import { DnsModeModal } from "../components/DnsModeModal";
+import { usePlatform } from "../context/PlatformContext";
+import { useCoreStatus } from "../hooks/useCoreStatus";
+import { useDnsListenerStatus } from "../hooks/useDnsListenerStatus";
+import { DnsListenerSettings } from "../components/DnsListenerSettings";
 
 export const DnsSettingsView: React.FC = () => {
-  const [settings, setSettings] = useState<DnsSettings>(DEFAULT_DNS_SETTINGS);
+  const { os } = usePlatform();
+  const core = useCoreStatus();
+  const listener = useDnsListenerStatus(os === "windows", core.status.running, core.status.pid, core.pending);
+  const [settings, setSettings] = useState<DnsSettings>(() => defaultDnsSettingsFor(os));
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [savedMessage, setSavedMessage] = useState("");
   const [error, setError] = useState("");
   const [isModeModalOpen, setIsModeModalOpen] = useState(false);
   const [newPolicyPattern, setNewPolicyPattern] = useState("");
@@ -51,7 +59,8 @@ export const DnsSettingsView: React.FC = () => {
     setSaved(false);
     setError("");
     try {
-      await saveDnsSettings(settings);
+      const actual = await core.run(async () => { setSettings(await saveDnsSettings(settings)); });
+      setSavedMessage(actual.running ? "DNS 设置已保存，核心已确认应用" : "DNS 设置已保存，等待核心启动");
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
     } catch (err: any) {
@@ -64,7 +73,7 @@ export const DnsSettingsView: React.FC = () => {
   const handleResetToDefault = () => {
     if (window.confirm("确定要将 DNS 设置恢复为官方推荐的防污染预设吗？")) {
       setSettings({
-        ...DEFAULT_DNS_SETTINGS,
+        ...defaultDnsSettingsFor(os),
         enableOverride: settings.enableOverride,
       });
       setSaved(false);
@@ -115,7 +124,7 @@ export const DnsSettingsView: React.FC = () => {
                       : "bg-slate-200 dark:bg-slate-800 text-slate-500 dark:text-slate-400"
                   }`}
                 >
-                  {settings.enableOverride ? "接管运行中" : "未覆写 (使用订阅原样)"}
+                  {settings.enableOverride ? "已选择覆写" : "解析选项沿用订阅"}
                 </span>
               </div>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
@@ -144,6 +153,8 @@ export const DnsSettingsView: React.FC = () => {
       </div>
 
       {/* 基础控制与模式卡片 */}
+      {os === "windows" && <DnsListenerSettings mode={settings.listenerMode} status={listener.status} error={listener.error}
+        onChange={listenerMode => { setSettings({ ...settings, listenerMode }); setSaved(false); }} />}
       <div className="bg-white/80 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 space-y-4 shadow-sm transition-colors">
         <div className="flex items-center space-x-2 text-sm font-semibold text-slate-900 dark:text-white">
           <Sliders className="w-4 h-4 text-indigo-500" />
@@ -169,14 +180,16 @@ export const DnsSettingsView: React.FC = () => {
 
           {/* 监听端口 */}
           <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/40">
-            <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">
+            <label htmlFor="dns-listen" className="block font-medium text-slate-600 dark:text-slate-400 mb-1">
               本地监听端点 (Listen)
             </label>
             <input
+              id="dns-listen"
               type="text"
+              disabled={os === "windows" && (settings.listenerMode === "auto" || settings.listenerMode === "off")}
               value={settings.listen}
               onChange={(e) => {
-                setSettings({ ...settings, listen: e.target.value });
+                setSettings({ ...settings, listen: e.target.value, ...(os === "windows" ? { listenerMode: "fixed" as const } : {}) });
                 setSaved(false);
               }}
               className="w-full px-3 py-1.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-300/80 dark:border-slate-800 text-slate-900 dark:text-white font-mono text-xs focus:outline-none focus:border-indigo-500"
@@ -189,7 +202,7 @@ export const DnsSettingsView: React.FC = () => {
           {[
             {
               label: "DNS 服务状态",
-              desc: "关闭后将直接使用 Windows 操作系统本地 DNS",
+              desc: "关闭后将直接使用操作系统本地 DNS",
               val: settings.status,
               toggle: () => setSettings({ ...settings, status: !settings.status }),
             },
@@ -225,7 +238,7 @@ export const DnsSettingsView: React.FC = () => {
             },
             {
               label: "追加系统 DNS",
-              desc: "自动追加宿主机 Windows 网卡或 DHCP 下发的本地 DNS",
+              desc: "自动追加宿主机网络连接或 DHCP 下发的本地 DNS",
               val: settings.appendSystemDns ?? false,
               toggle: () => setSettings({ ...settings, appendSystemDns: !settings.appendSystemDns }),
             },
@@ -305,7 +318,7 @@ export const DnsSettingsView: React.FC = () => {
               className="w-full px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-300/80 dark:border-slate-800 text-slate-900 dark:text-white font-mono text-xs focus:outline-none focus:border-indigo-500"
             />
             <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
-              白名单内的域名将直接获得真实 IP 解析，防止局域网设备或特定 Windows 网络探测报错
+              白名单内的域名将直接获得真实 IP 解析，防止局域网设备或特定系统网络探测报错
             </p>
           </div>
         </div>
@@ -673,16 +686,16 @@ export const DnsSettingsView: React.FC = () => {
           {saved && (
             <span className="text-xs text-emerald-600 dark:text-emerald-400 flex items-center gap-1">
               <Check className="w-3.5 h-3.5" />
-              <span>DNS 覆写配置已保存并生效</span>
+              <span>{savedMessage}</span>
             </span>
           )}
           <button
             type="submit"
-            disabled={saving}
+            disabled={saving || core.pending}
             className="flex items-center space-x-2 px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white font-semibold text-xs transition shadow-sm disabled:opacity-50 cursor-pointer"
           >
             <Save className="w-4 h-4" />
-            <span>{saving ? "应用重启中..." : "保存 DNS 覆写"}</span>
+            <span>{saving ? (core.status.running ? "保存并应用中..." : "保存中...") : "保存 DNS 设置"}</span>
           </button>
         </div>
       </div>

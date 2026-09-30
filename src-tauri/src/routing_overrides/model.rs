@@ -46,8 +46,20 @@ pub struct Overrides {
 fn first_bundle_port() -> u16 { 34000 }
 fn default_bundles_enabled() -> bool { true }
 impl Overrides {
+    /// Filter only the effective Android plan; stored desktop definitions survive.
+    pub fn without_bundles(&self) -> Self {
+        let mut config = self.clone();
+        config.process_rules.retain(|r| !r.id.strip_prefix("derived:").unwrap_or(&r.id).starts_with("bundle-"));
+        config.dns_rules.retain(|r| !r.id.starts_with("bundle-dns-"));
+        config.bundles.clear();
+        config.bundles_enabled = false;
+        config
+    }
     /// 暂停仅影响运行计划，保存的单包状态、规则与绑定保持不变。
     pub fn effective(&self) -> Self {
+        #[cfg(target_os = "android")]
+        let mut config = self.without_bundles();
+        #[cfg(not(target_os = "android"))]
         let mut config = self.clone();
         let owned = |id: &str| super::bundles::owner(id, &self.bundles).is_some();
         let dns_owned = |id: &str| self.bundles.iter().any(|b| id.starts_with(&format!("bundle-dns-{}-", b.id)));
@@ -72,6 +84,17 @@ impl Default for Overrides {
 pub fn safe_atom(value: &str) -> bool {
     !value.is_empty() && value.len() <= 1024 && !value.chars().any(|c| c.is_control() || matches!(c, ',' | '(' | ')' | '#' | '&' | '='))
 }
+// Common install paths contain balanced parentheses, e.g. Program Files (x86).
+// Commas/control characters and unbalanced groups remain forbidden in rules.
+fn safe_process_atom(value: &str) -> bool {
+    if value.is_empty() || value.len() > 1024 || value.chars().any(|c| c.is_control() || matches!(c, ',' | '#' | '&' | '=')) { return false; }
+    let mut depth = 0i32;
+    for c in value.chars() {
+        if c == '(' { depth += 1; } else if c == ')' { depth -= 1; }
+        if !(0..=8).contains(&depth) { return false; }
+    }
+    depth == 0
+}
 pub fn domain(value: &str) -> bool {
     !value.is_empty() && value.len() <= 253 && value.contains('.') && value.parse::<std::net::IpAddr>().is_err()
         && value.split('.').all(|s| !s.is_empty() && s.len() <= 63 && !s.starts_with('-') && !s.ends_with('-')
@@ -85,7 +108,9 @@ pub fn normalize(mut config: Overrides) -> Result<Overrides, String> {
     for bundle in &mut config.bundles {
         if bundle.id.is_empty() || bundle.id.len() > 64 || !bundle.id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
             || !bundle_ids.insert(bundle.id.clone()) || bundle.name.is_empty() || bundle.name.len() > 200
-            || !safe_atom(&bundle.main_exe) || !bundle.main_exe.to_ascii_lowercase().ends_with(".exe")
+            || !(bundle.main_exe.is_empty() && !bundle.enabled || safe_process_atom(&bundle.main_exe)
+                && (!cfg!(windows) || bundle.main_exe.to_ascii_lowercase().ends_with(".exe"))
+                && (!cfg!(target_os = "macos") || !bundle.main_exe.to_ascii_lowercase().ends_with(".app")))
             || !matches!(bundle.mode.as_str(), "strict" | "sandbox")
             || !matches!(bundle.fallback.as_str(), "rules" | "system" | "direct") {
             return Err("业务包标识、主程序、模式或未命中策略无效".into());
@@ -103,16 +128,25 @@ pub fn normalize(mut config: Overrides) -> Result<Overrides, String> {
     let mut ids = std::collections::HashSet::new();
     let mut matches = std::collections::HashSet::new();
     for r in &mut config.process_rules {
-        if !safe_atom(&r.id) || r.id.len() > 100 || !ids.insert(r.id.clone()) || r.label.len() > 120 { return Err("进程规则 ID 重复或名称过长".into()); }
+        let (id_limit, label_limit) = if cfg!(target_os = "android") { (400, 600) } else { (100, 120) };
+        if !safe_atom(&r.id) || r.id.len() > id_limit || !ids.insert(r.id.clone()) || r.label.len() > label_limit { return Err("进程规则 ID 重复或名称过长".into()); }
         r.match_value = r.match_value.trim().to_string();
-        if !safe_atom(&r.match_value) || r.match_value.contains(['*', '?']) { return Err("程序匹配值无效，不支持通配符或规则分隔符".into()); }
+        #[cfg(target_os = "android")]
+        {
+            let valid = r.match_value.len() <= 255 && r.match_value.contains('.') && r.match_value.split('.').all(|segment| {
+                segment.bytes().next().is_some_and(|c| c.is_ascii_alphabetic())
+                    && segment.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            });
+            if r.match_kind != "name" || !valid || r.include_descendants { return Err("Android 规则须使用完整应用包名，不支持桌面进程路径或子进程跟踪".into()); }
+        }
+        if !safe_process_atom(&r.match_value) || r.match_value.contains(['*', '?']) { return Err("程序匹配值无效，不支持通配符或规则分隔符".into()); }
         match r.match_kind.as_str() {
             "path" if std::path::Path::new(&r.match_value).is_absolute() => {},
             "name" if !r.match_value.contains(['/', '\\', ':']) => {},
             _ => return Err("程序匹配值无效，路径必须为绝对路径，名称不能包含路径分隔符".into()),
         }
-        if r.match_kind == "path" { r.match_value = r.match_value.replace('/', "\\"); }
-        if !matches.insert((r.match_kind.clone(), r.match_value.to_lowercase())) { return Err("程序匹配条件重复，请编辑已有规则".into()); }
+        if cfg!(windows) && r.match_kind == "path" { r.match_value = r.match_value.replace('/', "\\"); }
+        if !matches.insert((r.match_kind.clone(), crate::platform::path_key(&r.match_value))) { return Err("程序匹配条件重复，请编辑已有规则".into()); }
         match r.action.as_str() {
             "proxy" => {
                 let target = r.target.as_mut().ok_or("请选择节点或策略组")?;
@@ -154,4 +188,26 @@ fn validate_target(t: &Target) -> Result<(), String> {
     if !safe_atom(&t.name) || !safe_atom(profile_id) || !matches!(t.kind.as_str(), "node" | "group")
         || matches!(t.name.as_str(), "DIRECT" | "REJECT" | "GLOBAL" | "RULES") { return Err("节点绑定无效或名称包含保留字符".into()); }
     Ok(())
+}
+
+#[cfg(test)]
+mod mobile_tests {
+    use super::*;
+    #[test]
+    fn mobile_plan_removes_bundle_rules_without_mutating_desktop_source() {
+        let mut config = Overrides::default();
+        config.process_enabled = true;
+        for id in ["android-app-example", "bundle-example-main", "derived:bundle-orphan-child"] {
+            config.process_rules.push(ProcessRule { id:id.into(), enabled:true, label:id.into(),
+                match_kind:"name".into(), match_value:"org.example.app".into(), action:"direct".into(),
+                target:None, include_descendants:false, rule_mode:None });
+        }
+        let mobile = config.without_bundles();
+        assert_eq!(mobile.process_rules.len(), 1);
+        assert_eq!(mobile.process_rules[0].id, "android-app-example");
+        assert!(!mobile.bundles_enabled);
+        assert!(mobile.process_enabled);
+        assert_eq!(config.process_rules.len(), 3);
+        assert!(config.bundles_enabled);
+    }
 }

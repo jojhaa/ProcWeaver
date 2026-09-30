@@ -13,12 +13,7 @@ pub async fn save_routing_overrides(config: Overrides, selections: Vec<Selection
 #[tauri::command]
 pub async fn get_process_tree() -> Result<Vec<ProcessEntry>, String> {
     tauri::async_runtime::spawn_blocking(|| {
-        let mut entries = service::native::snapshot()?;
-        let identities: Vec<_> = entries.iter().filter(|p| p.created_at > 0).map(|p| (p.pid, p.created_at, p.identity.clone())).collect();
-        for p in &mut entries {
-            p.parent_identity = identities.iter().find(|(pid, time, _)| *pid == p.parent_pid && *time < p.created_at).map(|(_, _, id)| id.clone());
-        }
-        Ok(entries)
+        Ok(service::tracker::enrich_snapshot(service::native::snapshot()?))
     }).await.map_err(|_| "进程树读取任务失败")?
 }
 
@@ -40,7 +35,8 @@ pub async fn choose_routing_executable() -> Result<Option<String>, String> {
             if CommDlgExtendedError() != 0 { return Err("打开程序选择器失败".into()); }
             Ok(None)
         }
-        #[cfg(not(windows))] { Err("仅支持 Windows".into()) }
+        #[cfg(target_os = "macos")] { crate::platform::macos::apps::choose() }
+        #[cfg(not(any(windows, target_os = "macos")))] { Err("当前系统不支持应用选择器".into()) }
     }).await.map_err(|_| "程序选择器任务失败")?
 }
 

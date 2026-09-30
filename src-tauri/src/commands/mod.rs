@@ -1,5 +1,9 @@
 pub mod ip_health;
 pub mod mihomo_api;
+#[cfg(not(target_os = "android"))]
+pub mod process;
+#[cfg(target_os = "android")]
+#[path = "../platform/android/process.rs"]
 pub mod process;
 pub mod profile;
 pub mod profile_switch;
@@ -7,19 +11,31 @@ pub mod sysproxy;
 pub mod geo;
 pub mod settings;
 pub mod health_probe;
+pub(crate) mod node_catalog;
 pub mod local_rules;
 pub mod exclusions;
+#[cfg(not(target_os = "android"))]
+pub mod window;
+#[cfg(target_os = "android")]
+#[path = "../platform/android/window.rs"]
 pub mod window;
 pub mod routing_overrides;
 pub mod unlock_probe;
 pub mod dns;
 pub(crate) mod dns_runtime;
+#[cfg(windows)]
+pub(crate) mod dns_listener;
 pub mod dns_adapter;
 pub mod system;
 pub mod app_launcher;
+#[cfg(windows)]
+pub(crate) mod packaged_app;
 pub mod shortcut_manager;
 pub mod process_watcher;
 pub mod maintenance;
 pub mod bundle_launch;
 pub mod bundle_shortcuts;
 pub mod windows_integration;
+pub mod mobile_settings;
+pub mod config_transfer;
+pub mod config_sync;

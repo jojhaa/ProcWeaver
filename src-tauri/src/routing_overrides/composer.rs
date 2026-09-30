@@ -25,6 +25,15 @@ pub fn destination<'a>(rule: &'a ProcessRule, available: &[Target]) -> &'a str {
 
 /// 顺序：安全例外由外层最后前置；本层进程规则优先于原有规则。
 pub fn compose(raw: &str, config: &Overrides, profile_id: &str, derived: &[ProcessRule]) -> Result<String, String> {
+    compose_scoped(raw, config, profile_id, derived, false)
+}
+
+/// Only called for an already selected runtime owner. Original subscription
+/// process predicates still refer to the actual executable during specialization.
+pub fn compose_owned(raw: &str, config: &Overrides, profile_id: &str) -> Result<String, String> {
+    compose_scoped(raw, config, profile_id, &[], true)
+}
+fn compose_scoped(raw: &str, config: &Overrides, profile_id: &str, derived: &[ProcessRule], owned: bool) -> Result<String, String> {
     let config = normalize(config.clone())?;
     if !config.process_enabled && !config.dns_enabled { return Ok(raw.into()); }
     let available = targets(raw, profile_id)?;
@@ -34,16 +43,17 @@ pub fn compose(raw: &str, config: &Overrides, profile_id: &str, derived: &[Proce
         let mut prefix = Vec::new();
         for rule in config.process_rules.iter().filter(|r| r.enabled).chain(derived.iter()) {
             let kind = if rule.match_kind == "path" { "PROCESS-PATH" } else { "PROCESS-NAME" };
+            let process = if owned { "OR,((NETWORK,TCP),(NETWORK,UDP))".into() } else { format!("{kind},{}", rule.match_value) };
             let dest = destination(rule, &available);
             if let Some(bundle)=super::bundles::owner(&rule.id,&config.bundles).filter(|b|b.mode=="sandbox") {
                 if !bundle.enabled {continue;}
                 for pattern in &bundle.domains {
-                    let condition=format!("AND,(({kind},{}),({}))",rule.match_value,super::bundles::domain_condition(pattern));
+                    let condition=format!("AND,(({process}),({}))",super::bundles::domain_condition(pattern));
                     prefix.push(format!("{condition},{dest}").into());
                     if dest!="REJECT" && dest!="DIRECT" {prefix.push(format!("{condition},REJECT").into());}
                 }
                 // 系统开关在 prepare 中解析；仅此包进程的未命中请求可直连，不影响其他进程。
-                if bundle.fallback == "direct" { prefix.push(format!("{kind},{},DIRECT",rule.match_value).into()); }
+                if bundle.fallback == "direct" { prefix.push(format!("{process},DIRECT").into()); }
                 continue;
             }
             if rule.rule_mode.as_deref() == Some("inherit") && dest != "DIRECT" && dest != "REJECT" {
@@ -59,11 +69,11 @@ pub fn compose(raw: &str, config: &Overrides, profile_id: &str, derived: &[Proce
                     Value::from("MATCH,REJECT"),
                 ];
                 subrules.insert(Value::from(sub_name.clone()), Value::Sequence(sub_rules_list));
-                prefix.push(Value::from(format!("SUB-RULE,({kind},{}),{sub_name}", rule.match_value)));
+                prefix.push(Value::from(format!("SUB-RULE,({process}),{sub_name}")));
             } else {
-                prefix.push(Value::from(format!("{kind},{},{dest}", rule.match_value)));
+                prefix.push(Value::from(format!("{process},{dest}")));
                 // 不支持 UDP 的代理可能被核心跳过：同一匹配项随后拒绝，禁止落入原有直连。
-                if dest != "DIRECT" && dest != "REJECT" { prefix.push(Value::from(format!("{kind},{},REJECT", rule.match_value))); }
+                if dest != "DIRECT" && dest != "REJECT" { prefix.push(Value::from(format!("{process},REJECT"))); }
             }
         }
         let rules = yaml.as_mapping_mut().ok_or("配置须为对象")?.entry(Value::from("rules"))
@@ -147,6 +157,8 @@ pub fn safety(raw: &str) -> Result<String, String> {
     let mut yaml: Value = serde_yaml::from_str(raw).map_err(|_| "配置 YAML 无效")?;
     let mut prefix: Vec<Value> = ["IP-CIDR,127.0.0.0/8,DIRECT,no-resolve", "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve", "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve", "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve", "IP-CIDR6,::1/128,DIRECT,no-resolve", "IP-CIDR6,fc00::/7,DIRECT,no-resolve", "IP-CIDR6,fe80::/10,DIRECT,no-resolve"].into_iter().map(Value::from).collect();
     for name in ["mihomo.exe", "mihomo-v3.exe", "mihomo-compatible.exe"] { prefix.push(format!("PROCESS-NAME,{name},DIRECT").into()); }
+    #[cfg(target_os = "macos")]
+    for name in ["mihomo-darwin-arm64", "mihomo-darwin-amd64"] { prefix.push(format!("PROCESS-NAME,{name},DIRECT").into()); }
     let rules = yaml.as_mapping_mut().ok_or("配置须为对象")?.entry(Value::from("rules")).or_insert(Value::Sequence(vec![])).as_sequence_mut().ok_or("rules 须为数组")?;
     rules.splice(0..0, prefix);
     serde_yaml::to_string(&yaml).map_err(|_| "合成安全例外失败".into())

@@ -49,7 +49,20 @@ playwright-report/
 /portable/
 /dist-packages/
 /src-tauri/target/
-/src-tauri/gen/
+/src-tauri/gen/schemas/
+/src-tauri/gen/android/.gradle/
+/src-tauri/gen/android/.idea/
+/src-tauri/gen/android/**/build/
+/src-tauri/gen/android/local.properties
+/src-tauri/gen/android/app/tauri.properties
+/src-tauri/gen/android/app/tauri.build.gradle.kts
+/src-tauri/gen/android/tauri.settings.gradle
+/src-tauri/gen/android/app/src/main/assets/
+/src-tauri/gen/android/app/src/main/jniLibs/
+/src-tauri/gen/android/app/src/main/java/com/procweaver/mobile/generated/
+# Gradle's Windows wrapper is a required build entry point, not a standalone tool.
+!/src-tauri/gen/android/gradlew.bat
+*.hprof
 /.playwright-cli/
 *.tsbuildinfo
 *.log
@@ -170,3 +183,6 @@ temp/
 .DS_Store
 Thumbs.db
 Desktop.ini
+# Android signing material is supplied outside source control.
+*.jks
+*.keystore

@@ -1,6 +1,7 @@
 import type { RoutingApi } from "../api/routingOverrides";
 import type { BundleLocalInstance } from "../types/businessBundle";
 import type { RoutingView } from "../types/routingOverrides";
+import { bundlePlatform } from "../services/platform";
 import { compileBundlesToProcessRules, compileBundlesToDnsRules, compileBundleRoutes, routeSignature, resolveBundleTargets, ruleSignature, syncBundlesToCore, networkSignature } from "../services/bundleCompiler";
 
 export interface BundleState {
@@ -31,13 +32,22 @@ function savedInstances(instances: BundleLocalInstance[], view?: RoutingView): B
     };
     const processes = view.config.processRules.filter(r => belongs(r.id, "bundle-"));
     const dns = view.config.dnsRules.filter(r => belongs(r.id, "bundle-dns-"));
+    const os = bundlePlatform();
+    const basename = (path: string) => path.split(/[\\/]/).pop() || path;
+    const mainName = basename(saved.mainExe);
+    const restored = [...new Map(processes.map(rule => {
+      const exe = rule.matchKind === "path" ? basename(rule.matchValue) : rule.matchValue;
+      return [exe.toLowerCase(), { exe, role: exe.toLowerCase() === mainName.toLowerCase() ? "main" as const : "helper" as const,
+        description: rule.label, includeDescendants: rule.includeDescendants }] as const;
+    })).values()].sort((a, b) => Number(b.role === "main") - Number(a.role === "main"));
     return [{ ...instance, enabled: saved.enabled,
+      ...(os !== "android" && processes.length ? { processBindings: { ...instance.processBindings, [os]: processes.filter(r => r.matchKind === "path").map(r => ({ exe: basename(r.matchValue), executablePath: r.matchValue, includeDescendants: r.includeDescendants })) } } : {}),
       slotBindings: { main: saved.mainTarget?.name || instance.slotBindings.main, dns: saved.dnsTarget?.name || "FOLLOW_MAIN" },
       slotTargets: { main: saved.mainTarget || undefined, dns: saved.dnsTarget || undefined },
       definition: { ...instance.definition, mode: saved.mode === "sandbox" ? "sandbox" as const : "strict" as const,
         fallback: saved.fallback ?? "rules",
-        processes: processes.length ? processes.map(rule => ({ exe: rule.matchValue, role: rule.matchValue.toLowerCase() === saved.mainExe.toLowerCase() ? "main" as const : "helper" as const, description: rule.label })) : [{ exe: saved.mainExe, role: "main" as const, description: "主程序" }],
-        additionalExes: [], domains: saved.domains ?? dns.map(rule => `${rule.domainKind === "suffix" ? "*." : ""}${rule.domain}`) },
+        [os === "macos" ? "macosProcesses" : "processes"]: restored.length ? restored : (os === "macos" ? instance.definition.macosProcesses : instance.definition.processes) ?? [],
+        ...(bundlePlatform() === "windows" ? { additionalExes: [] } : {}), domains: saved.domains ?? dns.map(rule => `${rule.domainKind === "suffix" ? "*." : ""}${rule.domain}`) },
     }];
   });
 }

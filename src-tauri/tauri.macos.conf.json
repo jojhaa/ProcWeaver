@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      { "label": "main", "title": "ProcWeaver", "visible": false, "width": 1200, "height": 800, "minWidth": 1200, "minHeight": 800, "center": true, "resizable": true, "decorations": false },
+      { "label": "tray-menu", "title": "ProcWeaver Menu", "url": "index.html?window=tray-menu", "visible": false, "width": 500, "height": 380, "resizable": false, "decorations": false, "transparent": false, "alwaysOnTop": true, "skipTaskbar": true, "shadow": false }
+    ]
+  },
+  "bundle": {
+    "targets": ["app", "dmg"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns"],
+    "resources": {
+      "binaries/mihomo-darwin-arm64": "binaries/mihomo-darwin-arm64",
+      "binaries/mihomo-darwin-amd64": "binaries/mihomo-darwin-amd64",
+      "../licenses/mihomo-GPL-3.0.txt": "licenses/mihomo-GPL-3.0.txt",
+      "../licenses/libc-LICENSE-MIT.txt": "licenses/libc-LICENSE-MIT.txt",
+      "../licenses/libc-LICENSE-APACHE.txt": "licenses/libc-LICENSE-APACHE.txt",
+      "../licenses/blackmatrix7-GPL-2.0.txt": "licenses/blackmatrix7-GPL-2.0.txt",
+      "../licenses/blackmatrix7-UPSTREAM-README.md": "licenses/blackmatrix7-UPSTREAM-README.md",
+      "../licenses/loyalsoldier-clash-rules-GPL-3.0.txt": "licenses/loyalsoldier-clash-rules-GPL-3.0.txt",
+      "../licenses/meta-rules-dat-GPL-3.0.txt": "licenses/meta-rules-dat-GPL-3.0.txt",
+      "../licenses/serde_yaml-LICENSE-MIT.txt": "licenses/serde_yaml-LICENSE-MIT.txt",
+      "../licenses/unsafe-libyaml-LICENSE-MIT.txt": "licenses/unsafe-libyaml-LICENSE-MIT.txt",
+      "../licenses/tray-icon-LICENSE-MIT.txt": "licenses/tray-icon-LICENSE-MIT.txt",
+      "../licenses/THIRD_PARTY_NOTICES.md": "licenses/THIRD_PARTY_NOTICES.md",
+      "../LICENSE": "licenses/ProcWeaver-AGPL-3.0-only.txt"
+    },
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "signingIdentity": "-"
+    }
+  }
+}

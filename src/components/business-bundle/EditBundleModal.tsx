@@ -1,12 +1,15 @@
 import React, { useState, useEffect } from "react";
-import { BundleLocalInstance, BusinessBundleDefinition, BundleFallback } from "../../types/businessBundle";
+import { BundleLocalInstance, BusinessBundleDefinition, BundleFallback, BundleProcessBinding, BundleProcessBindings } from "../../types/businessBundle";
 import { PRESET_BUNDLES_CATALOG } from "../../services/bundleStorage";
 import { Pencil, X, RotateCcw, Save } from "lucide-react";
+import { usePlatform } from "../../context/PlatformContext";
+import { bundleProcesses, validAndroidPackage, matchingBindings, processMembers, processNames, validateProcessBindings } from "../../utils/bundlePlatform";
+import { BundleDiscoveryTools } from "./BundleDiscoveryTools";
 
 interface Props {
   isOpen: boolean;
   bundleInstance: BundleLocalInstance | null;
-  onSave: (updatedDefinition: BusinessBundleDefinition) => void;
+  onSave: (updatedDefinition: BusinessBundleDefinition, bindings?: BundleProcessBindings) => void;
   onCancel: () => void;
 }
 
@@ -16,12 +19,15 @@ export const EditBundleModal: React.FC<Props> = ({
   onSave,
   onCancel,
 }) => {
+  const platform = usePlatform();
+  const os = platform.os === "android" ? "android" : platform.os === "macos" ? "macos" : "windows";
   const [name, setName] = useState<string>("");
   const [description, setDescription] = useState<string>("");
   const [mode, setMode] = useState<"strict" | "sandbox">("strict");
   const [fallback, setFallback] = useState<BundleFallback>("rules");
   const [exesText, setExesText] = useState<string>("");
   const [domainsText, setDomainsText] = useState<string>("");
+  const [bindings, setBindings] = useState<BundleProcessBinding[]>([]);
 
   useEffect(() => {
     if (bundleInstance) {
@@ -30,9 +36,10 @@ export const EditBundleModal: React.FC<Props> = ({
       setDescription(def.description);
       setMode(def.mode);
       setFallback(def.fallback ?? "rules");
-      const exes = def.processes.map((p) => p.exe);
+      const exes = bundleProcesses(def, os).map((p) => p.exe);
       setExesText(exes.join("\n"));
       setDomainsText((def.domains || []).join("\n"));
+      setBindings(os === "android" ? [] : bundleInstance.processBindings?.[os] ?? []);
     }
   }, [bundleInstance, isOpen]);
 
@@ -49,15 +56,13 @@ export const EditBundleModal: React.FC<Props> = ({
     setDescription(originalPreset.description);
     setMode(originalPreset.mode);
     setFallback(originalPreset.fallback ?? "rules");
-    setExesText(originalPreset.processes.map((p) => p.exe).join("\n"));
+    setExesText(bundleProcesses(originalPreset, os).map((p) => p.exe).join("\n"));
     setDomainsText((originalPreset.domains || []).join("\n"));
+    setBindings([]);
   };
 
   const handleSave = () => {
-    const rawExes = exesText
-      .split(/[\n,]+/)
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
+    const rawExes = processNames(exesText);
 
     const rawDomains = domainsText
       .split(/[\n,]+/)
@@ -73,13 +78,18 @@ export const EditBundleModal: React.FC<Props> = ({
       alert("规则包至少需要包含一个可执行文件进程！");
       return;
     }
+    if (os === "macos" && rawExes.some(exe => exe.toLowerCase().endsWith(".app"))) {
+      alert("请填写 .app 内实际可执行文件名，不要填写应用包名称。");
+      return;
+    }
 
     // 格式化进程定义列表
-    const processes = rawExes.map((exe, idx) => ({
-      exe,
-      role: (idx === 0 ? "main" : "worker") as "main" | "worker",
-      description: idx === 0 ? "主程序" : "协同伴生进程",
-    }));
+    if (os === "android" && rawExes.some(pkg => !validAndroidPackage(pkg))) {
+      alert("请填写完整 Android 应用包名，例如 com.example.app。"); return;
+    }
+    const nextBindings = matchingBindings(bindings, rawExes, os);
+    try { validateProcessBindings(nextBindings, os); } catch (e) { alert(e instanceof Error ? e.message : "进程绑定无效"); return; }
+    const processes = processMembers(rawExes, bundleProcesses(currentDef, os), nextBindings, os);
 
     const updatedDef: BusinessBundleDefinition = {
       ...currentDef,
@@ -87,12 +97,11 @@ export const EditBundleModal: React.FC<Props> = ({
       description: description.trim(),
       mode,
       fallback,
-      processes,
-      additionalExes: rawExes,
+      ...(os === "android" ? { androidPackages: rawExes } : os === "macos" ? { macosProcesses: processes } : { processes, additionalExes: rawExes }),
       domains: rawDomains,
     };
 
-    onSave(updatedDef);
+    onSave(updatedDef, os === "android" ? bundleInstance.processBindings : { ...bundleInstance.processBindings, [os]: nextBindings });
   };
 
   return (
@@ -109,7 +118,7 @@ export const EditBundleModal: React.FC<Props> = ({
                 编辑规则包定义
               </h3>
               <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                修改包名称、协同进程、匹配域名及接管模式（保存为本机独立配置）
+                当前编辑 {os === "android" ? "Android 应用包名" : os === "macos" ? "macOS 进程" : "Windows 进程"}；其他平台的定义保留
               </p>
             </div>
           </div>
@@ -218,9 +227,12 @@ export const EditBundleModal: React.FC<Props> = ({
               rows={4}
               value={exesText}
               onChange={(e) => setExesText(e.target.value)}
-              placeholder="例如：&#10;ChatGPT.exe&#10;codex.exe&#10;node.exe"
+              placeholder={os === "android" ? "例如：\ncom.example.app" : os === "macos" ? "例如：\nChatGPT\ncodex" : "例如：\nChatGPT.exe\ncodex.exe\nnode.exe"}
               className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-slate-800 text-slate-900 dark:text-white font-mono text-xs focus:outline-none focus:border-indigo-500"
             />
+            {platform.processTree && os !== "android" && <BundleDiscoveryTools platform={os} bundleId={bundleInstance.instanceId}
+              exesText={exesText} domainsText={domainsText} bindings={bindings} members={bundleProcesses(currentDef, os)}
+              onProcesses={(text, next) => { setExesText(text); setBindings(next); }} onDomains={setDomainsText} />}
           </div>
 
           {/* 匹配域名列表 */}

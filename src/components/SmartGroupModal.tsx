@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import { useMobileBack } from "../utils/mobileBack";
 import { SmartGroupRule, SmartGroupType } from "../types/smartGroup";
 import { X, Sparkles, Check, Shield, Wifi, Search, CheckSquare, Square, ArrowUp, ArrowDown, Plus, Trash2, Link2 } from "lucide-react";
 
@@ -45,6 +46,11 @@ export const SmartGroupModal: React.FC<Props> = ({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
   const submitting = useRef(false);
+  useMobileBack(() => {
+    if (!isOpen) return false;
+    if (!submitting.current) onClose();
+    return true;
+  }, 30);
 
   // 防抖锁：仅在弹窗刚打开瞬间或切换编辑规则时初始化表单，严禁因外部数据刷新冲掉用户刚选的地区
   const prevIsOpenRef = useRef(false);

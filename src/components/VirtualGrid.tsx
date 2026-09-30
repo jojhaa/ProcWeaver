@@ -25,15 +25,15 @@ export function VirtualGridScroller({ children, className, resetKey }: { childre
   </div>;
 }
 
-export function VirtualGrid<T>({ items, itemKey, renderItem, label }: {
+export function VirtualGrid<T>({ items, itemKey, renderItem, label, columns: fixedColumns, rowHeight = 112 }: {
   items: T[]; itemKey: (item: T) => string; renderItem: (item: T) => React.ReactNode; label: string;
+  columns?: number; rowHeight?: number;
 }) {
   const viewport = useContext(Viewport);
   const container = useRef<HTMLDivElement>(null);
   const [offset, setOffset] = useState(0);
   const [focused, setFocused] = useState<string | null>(null);
-  const columns = viewport.width >= 1280 ? 4 : viewport.width >= 1024 ? 3 : viewport.width >= 768 ? 2 : 1;
-  const rowHeight = 112;
+  const columns = fixedColumns ?? (viewport.width >= 1280 ? 4 : viewport.width >= 1024 ? 3 : viewport.width >= 768 ? 2 : 1);
   useLayoutEffect(() => {
     if (container.current && viewport.element) {
       setOffset(container.current.getBoundingClientRect().top - viewport.element.getBoundingClientRect().top + viewport.element.scrollTop);

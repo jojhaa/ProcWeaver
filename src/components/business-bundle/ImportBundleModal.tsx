@@ -2,6 +2,8 @@ import React, { useState, useRef } from "react";
 import { BusinessBundleDefinition } from "../../types/businessBundle";
 import { validateAndParseBundlePackage } from "../../services/bundleStorage";
 import { Download, X, Upload, CheckCircle2, AlertCircle } from "lucide-react";
+import { usePlatform } from "../../context/PlatformContext";
+import { bundleProcesses } from "../../utils/bundlePlatform";
 
 interface Props {
   isOpen: boolean;
@@ -18,6 +20,7 @@ export const ImportBundleModal: React.FC<Props> = ({
   onConfirm,
   onCancel,
 }) => {
+  const platform = usePlatform();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [parsedBundle, setParsedBundle] = useState<BusinessBundleDefinition | null>(null);
   const [errorMsg, setErrorMsg] = useState("");
@@ -116,7 +119,7 @@ export const ImportBundleModal: React.FC<Props> = ({
                 </div>
                 <p className="text-[11px] text-slate-600 dark:text-slate-400 leading-relaxed">{parsedBundle.description}</p>
                 <div className="flex flex-wrap items-center gap-1.5 pt-1">
-                  {parsedBundle.processes.map((p) => (
+                  {bundleProcesses(parsedBundle, platform.os === "android" ? "android" : platform.os === "macos" ? "macos" : "windows").map((p) => (
                     <span
                       key={p.exe}
                       className="px-2 py-0.5 rounded text-[10px] font-mono bg-indigo-50 text-indigo-700 border border-indigo-200 dark:bg-indigo-500/10 dark:text-indigo-300 dark:border-indigo-500/20"

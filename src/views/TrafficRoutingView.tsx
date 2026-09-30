@@ -3,6 +3,8 @@ import { RulesView } from "./RulesView";
 import { BusinessBundleView } from "./BusinessBundleView";
 import { Layers, Sparkles, Package } from "lucide-react";
 import { useBusinessBundles } from "../hooks/useBusinessBundles";
+import { usePlatform } from "../context/PlatformContext";
+import { AndroidAppsView } from "./AndroidAppsView";
 
 interface Props {
   mode: string | null;
@@ -12,10 +14,11 @@ interface Props {
 const STORAGE_KEY = "netbox_routing_active_tab";
 
 export const TrafficRoutingView: React.FC<Props> = ({ mode, coreMode }) => {
+  const platform = usePlatform();
   const routingState = useBusinessBundles();
   const isProcessEnabled = Boolean(routingState.view && routingState.view.config.bundlesEnabled !== false);
 
-  const [activeTab, setActiveTab] = useState<"rules" | "apps">(() => {
+  const [activeTab, setActiveTab] = useState<"rules" | "apps" | "android">(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved === "rules" || saved === "apps") return saved;
@@ -23,7 +26,7 @@ export const TrafficRoutingView: React.FC<Props> = ({ mode, coreMode }) => {
     return "apps";
   });
 
-  const handleTabChange = (tab: "rules" | "apps") => {
+  const handleTabChange = (tab: "rules" | "apps" | "android") => {
     setActiveTab(tab);
     try {
       localStorage.setItem(STORAGE_KEY, tab);
@@ -46,7 +49,7 @@ export const TrafficRoutingView: React.FC<Props> = ({ mode, coreMode }) => {
             }`}
           >
             <Package className={`w-4 h-4 ${activeTab === "apps" ? "text-indigo-600 dark:text-white" : "text-slate-400"}`} />
-            <span>📦 业务规则包分流 (Bundles)</span>
+            <span>业务规则包</span>
             <span
               className={`text-[10px] px-2 py-0.5 rounded-full font-mono font-medium ${
                 isProcessEnabled
@@ -71,7 +74,7 @@ export const TrafficRoutingView: React.FC<Props> = ({ mode, coreMode }) => {
             }`}
           >
             <Layers className={`w-4 h-4 ${activeTab === "rules" ? "text-indigo-600 dark:text-white" : "text-slate-400"}`} />
-            <span>📑 核心分流规则 (Rules)</span>
+            <span>核心规则</span>
             <span
               className={`text-[10px] px-1.5 py-0.2 rounded-full font-mono font-medium ${
                 activeTab === "rules"
@@ -82,6 +85,7 @@ export const TrafficRoutingView: React.FC<Props> = ({ mode, coreMode }) => {
               检索 · 沙盒
             </span>
           </button>
+          {platform.os === "android" && <button onClick={() => handleTabChange("android")} className={`px-3 py-2 rounded-lg text-xs font-bold ${activeTab === "android" ? "bg-indigo-600 text-white" : "text-slate-500"}`}>应用出口</button>}
         </div>
 
         {/* 右侧微型状态指示说明 */}
@@ -97,7 +101,7 @@ export const TrafficRoutingView: React.FC<Props> = ({ mode, coreMode }) => {
 
       {/* 视图内容容器 */}
       <div className="flex-1 overflow-hidden relative">
-        {activeTab === "rules" ? (
+        {activeTab === "android" ? <AndroidAppsView /> : activeTab === "rules" ? (
           <div className="h-full overflow-y-auto p-6 md:p-8">
             <div className="max-w-6xl mx-auto">
               <RulesView coreMode={coreMode} />

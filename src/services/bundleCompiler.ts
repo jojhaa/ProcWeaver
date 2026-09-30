@@ -1,6 +1,9 @@
 import type { BundleLocalInstance, BundleSlotId } from "../types/businessBundle";
 import type { ProcessRule, DnsRule, RoutingOverrides, RoutingTarget, RoutingView, BundleRoute } from "../types/routingOverrides";
 import { routingApi, type RoutingApi } from "../api/routingOverrides";
+import type { BundlePlatform } from "../types/platform";
+import { bundlePlatform } from "./platform";
+import { bundleExes, bundleProcesses, validAndroidPackage, processKey, bindingRuleKey, validateProcessBindings } from "../utils/bundlePlatform";
 
 export const sameTarget = (a: RoutingTarget, b: RoutingTarget) =>
   a.profileId === b.profileId && a.kind === b.kind && a.name === b.name;
@@ -39,26 +42,42 @@ function targetFor(instance: BundleLocalInstance, slot: BundleSlotId): RoutingTa
   return target;
 }
 
-export function compileBundlesToProcessRules(instances: BundleLocalInstance[]): ProcessRule[] {
+export function compileBundlesToProcessRules(instances: BundleLocalInstance[], platform: BundlePlatform = bundlePlatform()): ProcessRule[] {
   const rules: ProcessRule[] = [];
   const owners = new Map<string, BundleLocalInstance>();
   for (const instance of instances) {
     if (!instance.enabled || !instance.slotBindings.main) continue;
+    if (!bundleProcesses(instance.definition, platform).length) throw new BundleApplyError(`「${instance.definition.packageName}」没有 ${platform} 进程定义，请先编辑规则包的当前平台进程`, [instance.instanceId]);
+    if (platform === "macos" && bundleExes(instance.definition, platform).some(exe => exe.toLowerCase().endsWith(".app"))) {
+      throw new BundleApplyError(`「${instance.definition.packageName}」的 Mac 进程应填写 .app 内实际可执行文件名，不能填写应用包名称`, [instance.instanceId]);
+    }
     const target = targetFor(instance, "main");
+    if (platform === "android" && bundleExes(instance.definition, platform).some(pkg => !validAndroidPackage(pkg))) {
+      throw new BundleApplyError("Android 应用包名无效，请从已安装应用选择或填写完整包名", [instance.instanceId]);
+    }
     const exes = new Map<string, string>();
-    for (const exe of [...instance.definition.processes.map(p => p.exe), ...(instance.definition.additionalExes || [])]) {
-      if (exe.trim()) exes.set(exe.trim().toLowerCase(), exe.trim());
+    const bindings = platform === "android" ? [] : instance.processBindings?.[platform] ?? [];
+    validateProcessBindings(bindings, platform);
+    for (const exe of bundleExes(instance.definition, platform)) {
+      if (exe.trim()) exes.set(platform === "android" ? exe.trim() : exe.trim().toLowerCase(), exe.trim());
     }
     for (const [lower, exe] of exes) {
-      const owner = owners.get(lower);
+      const bound = bindings.filter(b => processKey(b.exe, platform) === processKey(exe, platform));
+      const member = bundleProcesses(instance.definition, platform).find(p => processKey(p.exe, platform) === processKey(exe, platform));
+      const matches = bound.length ? bound.map(b => ({ kind: "path" as const, value: b.executablePath, descendants: b.includeDescendants }))
+        : [{ kind: "name" as const, value: exe, descendants: platform !== "android" && member?.includeDescendants !== false }];
+      for (const match of matches) {
+      const key = `${match.kind}:${processKey(match.value, platform)}`;
+      const owner = owners.get(key);
       if (owner) throw new BundleApplyError(`进程 ${exe} 同时属于「${owner.definition.packageName}」和「${instance.definition.packageName}」，请停用其中一个套件或移除重复进程`, [owner.instanceId, instance.instanceId]);
-      owners.set(lower, instance);
+      owners.set(key, instance);
       rules.push({
-        id: `bundle-${instance.instanceId}-${lower}`, enabled: true,
-        label: `${instance.definition.packageName} - ${exe}`, matchKind: "name", matchValue: exe,
-        action: "proxy", target, includeDescendants: true,
+        id: `bundle-${instance.instanceId}-${match.kind === "path" ? bindingRuleKey(processKey(match.value, platform)) : lower}`, enabled: true,
+        label: `${instance.definition.packageName} - ${exe}`, matchKind: match.kind, matchValue: match.value,
+        action: "proxy", target, includeDescendants: match.descendants,
         ruleMode: instance.definition.mode === "strict" ? "strict" : "inherit",
       });
+      }
     }
   }
   return rules;
@@ -103,11 +122,11 @@ export function ruleSignature(rules: (ProcessRule | DnsRule)[]): string {
 }
 export function networkSignature(instance: BundleLocalInstance): string {
   return JSON.stringify([instance.enabled, instance.slotBindings, instance.slotTargets,
-    instance.definition.mode, instance.definition.fallback ?? "rules", instance.definition.processes.map(p => p.exe), instance.definition.additionalExes, instance.definition.domains]);
+    instance.definition.mode, instance.definition.fallback ?? "rules", instance.definition.processes.map(p => [p.exe, p.includeDescendants]), instance.definition.macosProcesses?.map(p => [p.exe, p.includeDescendants]), instance.definition.androidPackages, instance.definition.additionalExes, instance.definition.domains, instance.processBindings]);
 }
-export function compileBundleRoutes(instances: BundleLocalInstance[], previous: BundleRoute[] = []): BundleRoute[] {
+export function compileBundleRoutes(instances: BundleLocalInstance[], previous: BundleRoute[] = [], platform: BundlePlatform = bundlePlatform()): BundleRoute[] {
   return instances.map(instance => ({ id: instance.instanceId, name: instance.definition.packageName,
-    mainExe: instance.definition.processes.find(p => p.role === "main")?.exe || instance.definition.processes[0]?.exe || "",
+    mainExe: mainExecutable(instance, platform),
     enabled: instance.enabled && Boolean(instance.slotBindings.main), mode: instance.definition.mode,
     domains: normalizedDomains(instance.definition.domains),
     fallback: instance.definition.fallback ?? "rules",
@@ -115,6 +134,10 @@ export function compileBundleRoutes(instances: BundleLocalInstance[], previous: 
     mainTarget: instance.enabled && instance.slotBindings.main ? targetFor(instance, "main") : null,
     dnsTarget: instance.enabled && instance.slotBindings.main ? targetFor(instance, "dns") : null,
   }));
+}
+function mainExecutable(instance: BundleLocalInstance, platform: BundlePlatform): string {
+  const exe = bundleProcesses(instance.definition, platform).find(p => p.role === "main")?.exe || bundleProcesses(instance.definition, platform)[0]?.exe || "";
+  return (platform === "android" ? undefined : instance.processBindings?.[platform]?.find(b => processKey(b.exe, platform) === processKey(exe, platform))?.executablePath) ?? exe;
 }
 export const routeSignature = (routes: BundleRoute[] = []) => JSON.stringify(routes.map(r => [r.id, r.name, r.mainExe, r.enabled, r.mode, r.fallback ?? "rules", normalizedDomains(r.domains),
   r.mainTarget && [r.mainTarget.profileId, r.mainTarget.kind, r.mainTarget.name], r.dnsTarget && [r.dnsTarget.profileId, r.dnsTarget.kind, r.dnsTarget.name]]));
@@ -139,7 +162,7 @@ export async function syncBundlesToCore(instances: BundleLocalInstance[], api: P
     const manualProcesses = existing.processRules.filter(r => !r.id.startsWith("bundle-"));
     const manualDns = existing.dnsRules.filter(r => !r.id.startsWith("bundle-dns-"));
     for (const rule of processes) {
-      if (manualProcesses.some(r => r.enabled && r.matchKind === "name" && r.matchValue.toLowerCase() === rule.matchValue.toLowerCase())) {
+      if (manualProcesses.some(r => r.enabled && r.matchKind === rule.matchKind && r.matchValue.toLowerCase() === rule.matchValue.toLowerCase())) {
         const owner = resolved.find(instance => rule.id.startsWith(`bundle-${instance.instanceId}-`));
         throw new BundleApplyError(`进程 ${rule.matchValue} 与已有手动进程规则冲突，请先处理重复规则`, owner ? [owner.instanceId] : []);
       }

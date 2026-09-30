@@ -1,5 +1,7 @@
 //! Windows 纯应用层进程路由与状态管理。
 pub mod smart_arbiter;
+#[cfg(windows)]
+pub mod windivert;
 use crate::routing_overrides::{model::*, tracker::ProcessEntry};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
@@ -181,20 +183,38 @@ pub(super) fn record_error(stage: &str, error: &std::io::Error) {
 }
 pub fn status() -> Status {
     let mut s = STATUS.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    #[cfg(target_os = "android")]
+    {
+        s.active = crate::commands::process::ACTIVE.load(Ordering::SeqCst);
+        s.message = if s.active { "Android VPN 已连接；按应用出口需通过实际连接核验" } else { "Android VPN 未连接" }.into();
+    }
     s.tcp_connections = TCP.load(Ordering::Relaxed);
     s.udp_packets = UDP.load(Ordering::Relaxed);
     s.dns_queries = DNS.load(Ordering::Relaxed);
     s.failures = FAILURES.load(Ordering::Relaxed);
     s.unclassified = UNKNOWN.load(Ordering::Relaxed);
+    #[cfg(windows)]
+    if crate::commands::settings::get_general_settings().is_ok_and(|v| v.traffic_mode == windivert::plan::MODE) {
+        let actual = windivert::session::stats();
+        s.active = actual.active;
+        s.tcp_connections = actual.tcp; s.udp_packets = actual.udp; s.dns_queries = actual.dns;
+        s.unclassified = actual.unknown; s.failures = actual.failures;
+        if let Some(error) = windivert::session::error() { s.active=false; s.last_error=Some(error.clone()); s.message=error; }
+        else if s.active { s.message="WinDivert 已接管明确进程的新 TCP / UDP 连接；未知归属沿用原链路，域名规则依赖核心识别".into(); }
+    }
     s
 }
 pub fn stop() {
+    #[cfg(windows)]
+    windivert::session::stop();
     let mut s = STATUS.lock().unwrap_or_else(|p| p.into_inner());
     s.active = false;
     s.transitioning = false;
     s.message = "纯应用层引擎已就绪".into();
 }
 pub fn pause() {
+    #[cfg(windows)]
+    windivert::session::pause();
     let mut s = STATUS.lock().unwrap_or_else(|p| p.into_inner());
     s.active = false;
     s.transitioning = true;
@@ -205,7 +225,33 @@ pub fn failed(message: &str) {
     s.active = false; s.transitioning = false; s.message = message.into();
 }
 pub async fn confirm_runtime(raw: &str) -> Result<(), String> {
+    confirm_runtime_for_core(raw, crate::commands::process::PID.load(Ordering::SeqCst)).await
+}
+#[cfg(windows)]
+pub(crate) fn current_instance_plan(yaml: &Value) -> Result<windivert::plan::Plan, String> {
+    let mut plan: windivert::plan::Plan = serde_yaml::from_value(yaml[windivert::plan::KEY].clone())
+        .map_err(|_| "缺少 WinDivert 运行计划，请重新应用规则")?;
+    plan.validate()?;
+    if !yaml["netbox-capture"].is_null() {
+        let routing: Plan = serde_yaml::from_value(yaml["netbox-capture"].clone()).map_err(|_| "实例归属规则无效")?;
+        let config = routing.config.effective();
+        // Rollback restores the old routing policy, never its old PID snapshot.
+        // Resolve current verified children against the policy being restored.
+        plan.refresh_instances(&config, &crate::routing_overrides::tracker::status(&config))?;
+    } else if plan.entries.iter().any(|e| !e.owner.is_empty()) {
+        return Err("WinDivert 缺少实例归属规则，拒绝恢复过期快照".into());
+    }
+    Ok(plan)
+}
+pub async fn confirm_runtime_for_core(raw: &str, _core_pid:u32) -> Result<(), String> {
     let yaml: Value = serde_yaml::from_str(raw).map_err(|_| "接管计划无效")?;
+    #[cfg(windows)]
+    if crate::commands::settings::get_general_settings()?.traffic_mode == windivert::plan::MODE {
+        let plan = current_instance_plan(&yaml)?;
+        windivert::session::confirm(plan,_core_pid).await?;
+        let mut s=STATUS.lock().unwrap_or_else(|p|p.into_inner()); s.active=true;s.transitioning=false;
+        return Ok(());
+    }
     if yaml["netbox-capture"].is_null() { stop(); return Ok(()); }
     let plan: Plan = serde_yaml::from_value(yaml["netbox-capture"].clone()).map_err(|_| "接管计划无效")?;
     let port = crate::commands::settings::get_general_settings()?.controller_port;
@@ -226,6 +272,8 @@ pub async fn confirm_runtime(raw: &str) -> Result<(), String> {
     Ok(())
 }
 pub fn compose(raw: &str, config: &Overrides, profile_id: &str, fallback: &[Value]) -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    { return Ok(raw.into()); }
     let process_active = config.process_enabled && config.process_rules.iter().any(|r| r.enabled);
     let dns_active = config.dns_enabled && config.dns_rules.iter().any(|r| r.enabled);
     if !process_active && !dns_active && config.bundles.is_empty() {
@@ -393,7 +441,7 @@ pub async fn run() {
                 return Ok(());
             }
             let yaml: Value = serde_yaml::from_str(&raw).map_err(|_| "接管计划无效".to_string())?;
-            if yaml["netbox-capture"].is_null() {
+            if yaml["netbox-capture"].is_null() && yaml["procweaver-windivert-v1"].is_null() {
                 stop();
                 previous = Some(raw);
                 previous_has_plan = false;

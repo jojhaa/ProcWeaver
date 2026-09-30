@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::process::Child;
 use std::sync::Mutex;
 use crate::commands::sysproxy::{self, get_system_proxy_status, set_system_proxy_raw};
 pub static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub(crate) static PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 pub(crate) static LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static LAST_START_ERROR: Mutex<Option<String>> = Mutex::new(None);
 #[cfg(test)]
 pub(crate) static STARTUP_BARRIER: Mutex<Option<(std::sync::Arc<tokio::sync::Barrier>, std::sync::Arc<tokio::sync::Barrier>)>> = Mutex::new(None);
 
@@ -39,9 +39,9 @@ fn bind_core_lifetime(child: &Child) -> Result<(), String> {
     }
 }
 
-#[cfg(not(windows))]
-fn bind_core_lifetime(_child: &Child) -> Result<(), String> {
-    Ok(())
+#[cfg(target_os = "macos")]
+fn bind_core_lifetime(child: &Child) -> Result<(), String> {
+    crate::platform::macos::guardian::bind(child)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +55,8 @@ pub struct CpuInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoreStatus {
+    #[serde(rename = "lastStartError", default)]
+    pub last_start_error: Option<String>,
     pub running: bool,
     pub pid: Option<u32>,
     #[serde(rename = "systemProxyEnabled")]
@@ -100,12 +102,21 @@ pub fn stop_owned_child(state: &mut CoreState) -> Result<(), String> {
 }
 
 pub fn stop_owned_child_ex(state: &mut CoreState, keep_proxy: bool) -> Result<(), String> {
+    // 先恢复本程序接管的系统代理；失败时保留仍可服务的核心供重试。
+    if !keep_proxy { set_system_proxy_raw(false, None)?; }
     crate::routing_overrides::reset_system_proxy_observation();
     crate::capture::stop();
     if let Some(child) = state.child.as_mut() {
         if child.try_wait().map_err(|e| e.to_string())?.is_none() {
-            child.kill().map_err(|e| e.to_string())?;
-            child.wait().map_err(|e| e.to_string())?;
+            #[cfg(target_os = "macos")]
+            if !crate::platform::macos::processes::stop_core(child)? {
+                eprintln!("[核心] macOS 正常退出超时，已强制结束；TUN 尚未启用，未来启用前需独立验证路由恢复");
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                child.kill().map_err(|e| e.to_string())?;
+                child.wait().map_err(|e| e.to_string())?;
+            }
         }
     }
     state.child = None;
@@ -115,10 +126,23 @@ pub fn stop_owned_child_ex(state: &mut CoreState, keep_proxy: bool) -> Result<()
     state.active_core_path = None;
     state.core_mode = None;
     state.started_at = None;
-    if !keep_proxy {
-        set_system_proxy_raw(false, None)?;
-    }
     Ok(())
+}
+
+fn abort_spawned_core(child: &mut Child, cause: String) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return match crate::platform::macos::processes::stop_core(child) {
+            Ok(_) => cause,
+            Err(cleanup) => format!("{cause}；核心清理失败：{cleanup}"),
+        };
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        cause
+    }
 }
 
 #[tauri::command]
@@ -127,7 +151,7 @@ pub fn get_cpu_info() -> CpuInfo {
     CpuInfo {
         arch: std::env::consts::ARCH.to_string(),
         avx2_supported: avx2,
-        recommended_core: if avx2 { "v3".into() } else { "compatible".into() },
+        recommended_core: if cfg!(target_os = "macos") { "standard".into() } else if avx2 { "v3".into() } else { "compatible".into() },
     }
 }
 
@@ -138,7 +162,7 @@ pub async fn get_core_status(state: tauri::State<'_, CoreStateMutex>) -> Result<
     read_core_status(&state)
 }
 
-fn read_core_status(state: &CoreStateMutex) -> Result<CoreStatus, String> {
+pub(crate) fn read_core_status(state: &CoreStateMutex) -> Result<CoreStatus, String> {
     let mut state = state.lock().map_err(|e| e.to_string())?;
     let pid = match state.child.as_mut() {
         Some(child) => if child.try_wait().map_err(|_| "无法读取核心状态")?.is_none() { Some(child.id()) } else { None },
@@ -147,6 +171,7 @@ fn read_core_status(state: &CoreStateMutex) -> Result<CoreStatus, String> {
     let proxy = sysproxy::system_proxy_snapshot();
     Ok(CoreStatus {
         running: pid.is_some(), pid,
+        last_start_error: LAST_START_ERROR.lock().unwrap_or_else(|p| p.into_inner()).clone(),
         system_proxy_enabled: proxy.enabled(), system_proxy: proxy,
         mixed_port: state.mixed_port, controller_port: state.controller_port,
         active_core: state.active_core.clone(), started_at: if pid.is_some() { state.started_at } else { None },
@@ -186,6 +211,12 @@ pub(crate) async fn start_core_transaction(core_mode: Option<String>, state: &Co
 
 /// 调用方持有 LIFECYCLE，设置事务重启时避免重复获取同一锁。
 pub(crate) async fn start_core_locked(core_mode: Option<String>, state: &CoreStateMutex) -> Result<CoreStatus, String> {
+    let result = start_core_inner(core_mode, state).await;
+    *LAST_START_ERROR.lock().unwrap_or_else(|p| p.into_inner()) = result.as_ref().err().cloned();
+    result
+}
+
+async fn start_core_inner(core_mode: Option<String>, state: &CoreStateMutex) -> Result<CoreStatus, String> {
     if crate::shutdown::in_progress() { return Err("正在恢复网络并退出，暂不启动核心".into()); }
     // 如果已经在运行，先检查并返回
     {
@@ -194,6 +225,7 @@ pub(crate) async fn start_core_locked(core_mode: Option<String>, state: &CoreSta
             if child.try_wait().map(|s| s.is_none()).unwrap_or(false) {
                 let sys_proxy = sysproxy::system_proxy_snapshot();
                 return Ok(CoreStatus {
+                    last_start_error: None,
                     running: true,
                     pid: Some(child.id()),
                     system_proxy_enabled: sys_proxy.enabled(),
@@ -207,80 +239,13 @@ pub(crate) async fn start_core_locked(core_mode: Option<String>, state: &CoreSta
         }
     } // state_guard 在此被丢弃，后续操作不持有锁
 
+    #[cfg(target_os = "macos")]
+    crate::platform::macos::sysproxy::ensure_core_start_safe()?;
+
     let base_dir = crate::commands::profile::get_base_dir();
     let resource_dir = crate::storage::resource_dir();
     let mode = core_mode.unwrap_or_else(|| "auto".to_string());
-    let avx2_supported = check_avx2_support();
-
-    let find_bin = |name: &str| -> Option<PathBuf> {
-        let candidates = [
-            resource_dir.join("binaries").join(name),
-            base_dir.join("binaries").join(name),
-        ];
-        for c in &candidates {
-            if c.exists() { return Some(c.clone()); }
-        }
-        #[cfg(not(test))]
-        {
-            let has_any_binaries_dir = resource_dir.join("binaries").is_dir() || base_dir.join("binaries").is_dir();
-            if !has_any_binaries_dir {
-                if let Ok(exe) = std::env::current_exe() {
-                    if let Some(parent) = exe.parent() {
-                        let c1 = parent.join("binaries").join(name);
-                        if c1.exists() { return Some(c1); }
-                        let mut curr = parent;
-                        while let Some(up) = curr.parent() {
-                            let c2 = up.join("binaries").join(name);
-                            if c2.exists() { return Some(c2); }
-                            curr = up;
-                        }
-                    }
-                }
-            }
-        }
-        None
-    };
-
-    let v3_path = find_bin("mihomo-v3.exe");
-    let comp_path = find_bin("mihomo-compatible.exe");
-    let std_path = find_bin("mihomo.exe");
-
-    // 智能决策具体启动哪个二进制文件
-    let (chosen_exe, core_label) = match mode.as_str() {
-        "v3" => {
-            if let Some(p) = v3_path {
-                (p, "amd64-v3 (AVX2 高性能)")
-            } else {
-                return Err("未找到内核文件: binaries/mihomo-v3.exe".into());
-            }
-        }
-        "compatible" => {
-            if let Some(p) = comp_path {
-                (p, "amd64-compatible (通用兼容)")
-            } else {
-                return Err("未找到内核文件: binaries/mihomo-compatible.exe".into());
-            }
-        }
-        "standard" => {
-            if let Some(p) = std_path {
-                (p, "mihomo 标准版")
-            } else {
-                return Err("未找到标准版核心 mihomo.exe".into());
-            }
-        }
-        _ => {
-            // "auto" 模式：优先判断 CPU 是否支持 AVX2
-            if avx2_supported && v3_path.is_some() {
-                (v3_path.unwrap(), "amd64-v3 (AVX2 高性能 • 自动推荐)")
-            } else if let Some(p) = comp_path {
-                (p, "amd64-compatible (通用兼容)")
-            } else if let Some(p) = std_path {
-                (p, "mihomo 标准版")
-            } else {
-                return Err("未检测到任何可用的 mihomo 内核，请检查 binaries 目录".into());
-            }
-        }
-    };
+    let (chosen_exe, core_label) = crate::platform::resolve_core(&resource_dir, &base_dir, &mode)?;
 
     let mut cmd = std::process::Command::new(&chosen_exe);
 
@@ -322,6 +287,10 @@ pub(crate) async fn start_core_locked(core_mode: Option<String>, state: &CoreSta
             if let Some((read, resume)) = barriers { read.wait().await; resume.wait().await; }
         }
         let prepared = rule_startup_config(&crate::commands::settings::prepare_config(&raw)?)?;
+        #[cfg(windows)]
+        let prepared = super::dns_listener::resolve_for_apply(&prepared, 0).await?;
+        #[cfg(windows)]
+        let prepared = crate::capture::windivert::ports::resolve_for_apply(&prepared, 0).await?;
         crate::commands::profile::validate_config(&prepared)?;
         super::dns_runtime::preflight(&prepared, 0).await?;
         crate::storage::replace(&core_config, prepared.as_bytes())?;
@@ -340,10 +309,9 @@ pub(crate) async fn start_core_locked(core_mode: Option<String>, state: &CoreSta
         std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|_| format!("端口 {port} 已被占用，核心未启动"))?;
     }
     let mut child = cmd.spawn().map_err(|e| format!("启动内核 [{}] 失败: {}", chosen_exe.display(), e))?;
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     if let Err(error) = bind_core_lifetime(&child) {
-        let _ = child.kill(); let _ = child.wait();
-        return Err(error);
+        return Err(abort_spawned_core(&mut child, error));
     }
     
     // 监听端口与控制接口均就绪才报告成功，供自动重启事务判断是否回滚。
@@ -352,11 +320,10 @@ pub(crate) async fn start_core_locked(core_mode: Option<String>, state: &CoreSta
         let raw = std::fs::read_to_string(&core_config).map_err(|_| "读取核心启动配置失败")?;
         super::dns_runtime::confirm(&raw, child.id()).await?;
         crate::routing_overrides::bundles::select(&raw).await?;
-        crate::capture::confirm_runtime(&raw).await
+        crate::capture::confirm_runtime_for_core(&raw, child.id()).await
     }.await;
     if let Err(error) = ready {
-        let _ = child.kill(); let _ = child.wait();
-        return Err(error);
+        return Err(abort_spawned_core(&mut child, error));
     }
 
     let pid = child.id();
@@ -368,8 +335,7 @@ pub(crate) async fn start_core_locked(core_mode: Option<String>, state: &CoreSta
     let mut state_guard = match state.lock() {
         Ok(guard) => guard,
         Err(error) => {
-            let _ = child.kill(); let _ = child.wait();
-            return Err(error.to_string());
+            return Err(abort_spawned_core(&mut child, error.to_string()));
         }
     };
     state_guard.mixed_port = preferences.mixed_port;
@@ -391,10 +357,14 @@ pub(crate) async fn start_core_locked(core_mode: Option<String>, state: &CoreSta
     }.into());
     state_guard.started_at = Some(now);
 
+    #[cfg(windows)]
+    if let Ok(raw) = std::fs::read_to_string(&core_config) { super::dns_listener::remember_success(&raw); }
+
     let sys_proxy = sysproxy::system_proxy_snapshot();
 
     Ok(CoreStatus {
         running: true,
+        last_start_error: None,
         pid: Some(pid),
         system_proxy_enabled: sys_proxy.enabled(),
         system_proxy: sys_proxy,
@@ -432,6 +402,7 @@ pub async fn stop_core(state: tauri::State<'_, CoreStateMutex>) -> Result<CoreSt
 
     Ok(CoreStatus {
         running: false,
+        last_start_error: LAST_START_ERROR.lock().unwrap_or_else(|p| p.into_inner()).clone(),
         pid: None,
         system_proxy_enabled: proxy.enabled(),
         system_proxy: proxy,

@@ -1,5 +1,6 @@
 // IP 健康度/纯净度数据结构 (对应 https://my.ippure.com/v1/info)
 export interface IpHealthInfo {
+  catalogKey?: string;
   source?: string;
   ip: string;
   asn?: number;
@@ -35,6 +36,8 @@ export interface SystemProxyStatus {
 }
 
 export interface CoreStatus {
+  lastStartError?: string | null;
+  generation?: number;
   running: boolean;
   pid?: number;
   uptimeSeconds?: number;
@@ -77,6 +80,7 @@ export interface ProxyItem {
   udp?: boolean;
   history?: Array<{ time: string; delay: number }>;
   delay?: number;
+  catalogKey?: string;
 }
 
 // 策略组

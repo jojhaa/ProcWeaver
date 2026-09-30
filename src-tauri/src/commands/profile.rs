@@ -214,7 +214,12 @@ pub(crate) fn read_profiles_index() -> Vec<ProfileItem> {
                     get_base_dir().join(p)
                 };
                 if let Ok(c) = fs::read_to_string(actual_path) {
+                    #[cfg(target_os = "android")]
+                    { item.node_count = super::node_catalog::count(&c).unwrap_or(0); }
+                    #[cfg(not(target_os = "android"))]
+                    {
                     item.node_count = count_proxies(&c);
+                    }
                 }
             }
         }
@@ -319,6 +324,11 @@ pub async fn add_profile(name: String, url: String) -> Result<ProfileItem, Strin
         }
     }
 
+    #[cfg(target_os = "android")]
+    let raw_content = super::node_catalog::hydrate(&raw_content, &id).await?;
+    #[cfg(target_os = "android")]
+    let node_count = super::node_catalog::count(&raw_content)?;
+    #[cfg(not(target_os = "android"))]
     let node_count = count_proxies(&raw_content);
     let final_content = super::settings::prepare_with(&raw_content, &super::settings::get_general_settings()?)?;
     validate_config(&final_content)?;
@@ -356,6 +366,35 @@ pub async fn add_profile(name: String, url: String) -> Result<ProfileItem, Strin
     }
     write_profiles_index(&list)?;
 
+    Ok(item)
+}
+
+#[tauri::command]
+pub async fn import_profile_content(name: String, content: String) -> Result<ProfileItem, String> {
+    if name.trim().is_empty() || name.len() > 240 || content.len() > 8 * 1024 * 1024 { return Err("配置名称无效或文件超过 8 MB".into()); }
+    let _write = PROFILE_WRITE.lock().await;
+    ensure_profiles_dir()?;
+    #[cfg(target_os = "android")]
+    let content = super::node_catalog::hydrate(&content, &name).await?;
+    let prepared = super::settings::prepare_with(&content, &super::settings::get_general_settings()?)?;
+    validate_config(&prepared)?;
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let id = format!("file_{}", stamp.as_nanos());
+    let file_path = format!("config/profiles/{id}.yaml");
+    let path = get_base_dir().join(&file_path);
+    // The first mobile import becomes selected; an existing selection is retained.
+    let mut list = read_profiles_index();
+    let first_mobile = cfg!(target_os = "android") && list.is_empty();
+    #[cfg(target_os = "android")]
+    let node_count = super::node_catalog::count(&prepared)?;
+    #[cfg(not(target_os = "android"))]
+    let node_count = count_proxies(&prepared);
+    let item = ProfileItem { id, name: name.trim().into(), file_path, updated_at: chrono_or_simple_date(),
+        is_selected: first_mobile, node_count, last_updated_at_seconds: stamp.as_secs(), ..Default::default() };
+    crate::storage::replace_atomic(&path, prepared.as_bytes())?;
+    if first_mobile { apply_profile_to_core(&path.to_string_lossy()).await?; }
+    list.push(item.clone());
+    if let Err(error) = write_profiles_index(&list) { let _ = fs::remove_file(path); return Err(error); }
     Ok(item)
 }
 
@@ -408,6 +447,11 @@ pub async fn update_profile(id: String) -> Result<ProfileItem, String> {
         }
     }
 
+    #[cfg(target_os = "android")]
+    let raw_content = super::node_catalog::hydrate(&raw_content, &id).await?;
+    #[cfg(target_os = "android")]
+    let node_count = super::node_catalog::count(&raw_content)?;
+    #[cfg(not(target_os = "android"))]
     let node_count = count_proxies(&raw_content);
     let final_content = super::settings::prepare_with(&raw_content, &super::settings::get_general_settings()?)?;
     validate_config(&final_content)?;
@@ -549,9 +593,14 @@ pub async fn save_profile_content(id: String, content: String) -> Result<Profile
         get_base_dir().join(p)
     };
 
+    #[cfg(target_os = "android")]
+    let content = super::node_catalog::hydrate(&content, &id).await?;
     // 校验配置合法性
     validate_config(&content)?;
 
+    #[cfg(target_os = "android")]
+    let node_count = super::node_catalog::count(&content)?;
+    #[cfg(not(target_os = "android"))]
     let node_count = count_proxies(&content);
     let runtime_source = super::profile_switch::runtime_source_for_change(&list[idx])?;
     let previous = fs::read(&full_path).map_err(|e| e.to_string())?;
@@ -596,6 +645,30 @@ pub async fn export_profile_file(id: String, target_path: String) -> Result<bool
 }
 
 /// 订阅后台自动更新定时调度器
+static SCHEDULE_RUN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub(crate) async fn run_due_updates() -> Result<(), String> {
+    let Ok(_schedule) = SCHEDULE_RUN.try_lock() else { return Ok(()); };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let path = get_base_dir().join("config/profile-update-status.json");
+    let mut status: std::collections::BTreeMap<String, serde_json::Value> = fs::read(&path).ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+    let profiles = read_profiles_index();
+    status.retain(|id, _| profiles.iter().any(|profile| &profile.id == id));
+    let due = profiles.into_iter().filter(|p| p.auto_update_interval > 0 && (p.url.starts_with("https://") || p.url.starts_with("http://"))
+        && now >= p.last_updated_at_seconds.saturating_add(u64::from(p.auto_update_interval) * 3600)
+        && status.get(&p.id).and_then(|v| v["retryAt"].as_u64()).unwrap_or(0) <= now).take(8).collect::<Vec<_>>();
+    let mut failed = false;
+    for profile in due {
+        let result = update_profile(profile.id.clone()).await;
+        let success = result.is_ok(); failed |= !success;
+        status.insert(profile.id, serde_json::json!({"checkedAt":now, "success":success, "retryAt": if success {0} else {now + 1800},
+            "message":if success {"更新成功"} else {"更新失败，保留原配置，稍后重试"}}));
+        crate::storage::replace_atomic(&path, &serde_json::to_vec_pretty(&status).map_err(|_| "更新记录生成失败")?)?;
+    }
+    if failed { Err("部分订阅更新失败，已保留原配置".into()) } else { Ok(()) }
+}
+
 pub async fn run_profile_scheduler() {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -665,6 +738,10 @@ pub(crate) async fn apply_profile_with_overrides(yaml_path: &str, config: &crate
     Ok(())
 }
 
+#[cfg(target_os = "android")]
+pub fn validate_config(content: &str) -> Result<(), String> { crate::platform::android::validate(content) }
+
+#[cfg(not(target_os = "android"))]
 pub fn validate_config(content: &str) -> Result<(), String> {
     let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let dir = std::env::temp_dir().join(format!("netbox-validate-{id}"));
@@ -723,8 +800,7 @@ pub(crate) fn copy_validation_assets(source: &Path, target: &Path) -> Result<(),
 
 pub(crate) fn validation_core() -> Result<PathBuf, String> {
     let root = crate::storage::resource_dir().join("binaries");
-    for name in ["mihomo-compatible.exe", "mihomo.exe", "mihomo-v3.exe"] {
-        if name == "mihomo-v3.exe" && !super::process::check_avx2_support() { continue; }
+    for name in crate::platform::core_names("auto")? {
         let path = root.join(name);
         if path.is_file() { return Ok(path); }
     }
@@ -764,9 +840,15 @@ mod validation_tests {
         let root = std::env::temp_dir().join(format!("netbox-profile-race-{}", std::process::id()));
         fs::create_dir_all(root.join("config")).unwrap();
         crate::storage::initialize_test(root.clone(), PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf());
-        let listeners: Vec<_> = (0..2).map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+        // Windows may reserve a UDP range independently of TCP. Mihomo's mixed
+        // listener needs both protocols, so a TCP-only probe is insufficient.
+        let listeners: Vec<_> = (0..2).map(|_| (0..64).find_map(|_| {
+            let tcp = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+            let udp = std::net::UdpSocket::bind(tcp.local_addr().ok()?).ok()?;
+            Some((tcp, udp))
+        }).expect("no free TCP/UDP test port")).collect();
         let prefs = super::super::settings::GeneralSettings {
-            mixed_port: listeners[0].local_addr().unwrap().port(), controller_port: listeners[1].local_addr().unwrap().port(),
+            mixed_port: listeners[0].0.local_addr().unwrap().port(), controller_port: listeners[1].0.local_addr().unwrap().port(),
             ..Default::default()
         };
         drop(listeners);
@@ -1068,6 +1150,7 @@ pub fn save_smart_groups(rules: Vec<serde_json::Value>) -> Result<bool, String> 
 }
 
 #[tauri::command]
+#[cfg(not(target_os = "android"))]
 pub fn get_business_channels() -> Result<Vec<BusinessChannelSpec>, String> {
     let file = get_business_channels_file();
     if file.exists() {
@@ -1080,11 +1163,22 @@ pub fn get_business_channels() -> Result<Vec<BusinessChannelSpec>, String> {
 }
 
 #[tauri::command]
+#[cfg(not(target_os = "android"))]
 pub fn save_business_channels(channels: Vec<BusinessChannelSpec>) -> Result<bool, String> {
     let file = get_business_channels_file();
     let json = serde_json::to_vec_pretty(&channels).map_err(|e| e.to_string())?;
     crate::storage::replace_atomic(&file, &json).map_err(|e| format!("保存业务通道配置失败: {}", e))?;
     Ok(true)
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn get_business_channels() -> Result<Vec<BusinessChannelSpec>, String> { Ok(vec![]) }
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn save_business_channels(channels: Vec<BusinessChannelSpec>) -> Result<bool, String> {
+    if channels.is_empty() { Ok(true) } else { Err("此平台不支持业务通道".into()) }
 }
 
 /// 清洗订阅配置中历史遗留/已固化的业务通道规则 (例如用户已删除的自定义域名、旧节点目标或旧版通道规则)

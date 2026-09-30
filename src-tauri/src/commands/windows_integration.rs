@@ -8,7 +8,7 @@ pub struct Link {
     pub icon: String, pub icon_index: i32, pub description: String,
 }
 #[cfg(windows)]
-fn com<T>(action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+pub(super) fn com<T>(action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     use windows::Win32::System::Com::*;
     let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     // A caller may already own an STA. ShellLink also works in that apartment.
@@ -74,7 +74,8 @@ pub fn split_arguments(command: &str) -> Result<Vec<String>, String> {
         let result = std::slice::from_raw_parts(pointer, count as usize).iter().map(|p| p.to_string().unwrap_or_default()).collect();
         let _ = LocalFree(Some(HLOCAL(pointer.cast()))); Ok(result)
     }
-    #[cfg(not(windows))] { let _ = command; Err("仅支持 Windows".into()) }
+    #[cfg(target_os = "macos")] { serde_json::from_str(command).map_err(|_| "macOS 应用参数格式无效".into()) }
+    #[cfg(not(any(windows, target_os = "macos")))] { let _ = command; Err("当前系统不支持应用参数读取".into()) }
 }
 
 // Limit WMI reads to the selected executable name. Command lines stay in memory.
@@ -101,7 +102,7 @@ pub fn process_command_lines(names: &[&str]) -> Result<Vec<ProcessCommand>, Stri
             let mut objects = [None]; let mut count = 0;
             let status = rows.Next(1500, &mut objects, &mut count);
             if status.0 == WBEM_S_TIMEDOUT.0 { return Err("查询应用进程超时".into()); }
-            status.ok().map_err(|_| "读取应用进程失败")?;
+            status.ok().map_err(|error| format!("读取应用进程失败（WMI 0x{:08X}）", error.code().0 as u32))?;
             if count == 0 { break; }
             let object = objects[0].as_ref().ok_or("应用进程查询无效")?;
             let mut value = VARIANT::default(); object.Get(w!("ProcessId"),0,&mut value,None,None).map_err(|_| "进程身份不可读")?;
@@ -116,7 +117,20 @@ pub fn process_command_lines(names: &[&str]) -> Result<Vec<ProcessCommand>, Stri
             if result.len() > 2048 { return Err("应用进程过多，无法安全核对".into()); }
         } Ok(result)
     }) }
-    #[cfg(not(windows))] { let _ = filter; Err("仅支持 Windows".into()) }
+    #[cfg(target_os = "macos")] {
+        let _ = filter;
+        let mut result = Vec::new();
+        for entry in crate::routing_overrides::native::snapshot()? {
+            if !names.iter().any(|name| *name == entry.name) { continue; }
+            let args = crate::platform::macos::processes::arguments(entry.pid)?;
+            if crate::routing_overrides::native::inspect(entry.pid, 0, entry.name.clone()).identity != entry.identity {
+                return Err("应用实例已改变，请重新检测".into());
+            }
+            result.push(ProcessCommand { pid: entry.pid, name: entry.name, command: serde_json::to_string(&args).map_err(|_| "应用参数无效")? });
+        }
+        Ok(result)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))] { let _ = filter; Err("当前系统不支持进程查询".into()) }
 }
 
 #[cfg(all(test, windows))]
@@ -149,5 +163,6 @@ pub fn request_close(pid: u32, identity: &str) -> Result<(), String> {
         if WaitForSingleObject(handle,0) == WAIT_TIMEOUT { let _ = EnumWindows(Some(close), pid as LPARAM); }
         Ok(())
     }
-    #[cfg(not(windows))] { let _=(pid,identity); Err("仅支持 Windows".into()) }
+    #[cfg(target_os = "macos")] { crate::platform::macos::processes::request_close(pid, identity) }
+    #[cfg(not(any(windows, target_os = "macos")))] { let _=(pid,identity); Err("当前系统不支持请求应用退出".into()) }
 }

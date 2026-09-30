@@ -1,5 +1,6 @@
 use serde_json::Value;
 mod monitor;
+mod attribution;
 pub(crate) fn invalidate_monitor_types() { monitor::invalidate(); }
 
 fn is_proxy_connection(leaf: &str, kind: &str) -> bool {
@@ -10,12 +11,40 @@ fn is_proxy_connection(leaf: &str, kind: &str) -> bool {
 
 #[tauri::command]
 pub async fn get_traffic_snapshot(state: tauri::State<'_, super::process::CoreStateMutex>, include_connections: Option<bool>) -> Result<Value, String> {
+    #[cfg(target_os = "android")]
+    {
+        let mut sample: Value = crate::platform::android::call_async("stats", ()).await?;
+        if include_connections.unwrap_or(false) {
+            // Keep the native generation/counters when the connections page is opened.
+            sample["details"] = controller_client().timeout(std::time::Duration::from_secs(3))
+                .build().map_err(|_| "统计客户端初始化失败")?
+                .get(format!("{}/connections", base_url()?)).send().await
+                .map_err(|_| "读取连接详情失败")?.error_for_status()
+                .map_err(|_| "核心拒绝连接详情请求")?.json().await.map_err(|_| "连接详情响应无效")?;
+        }
+        let _ = state;
+        return Ok(sample);
+    }
+    #[cfg(not(target_os = "android"))]
     monitor::snapshot(&state, include_connections.unwrap_or(false)).await
 }
 
 /// 本地控制接口必须直连，避免系统代理形成回环或返回代理网关错误。
 pub(crate) fn controller_client() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().no_proxy()
+    let client = reqwest::Client::builder().no_proxy();
+    #[cfg(target_os = "android")]
+    {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(secret) = crate::platform::android::controller_secret() {
+            if let Ok(mut token) = reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}")) {
+                token.set_sensitive(true);
+                headers.insert(reqwest::header::AUTHORIZATION, token);
+            }
+        }
+        return client.default_headers(headers);
+    }
+    #[cfg(not(target_os = "android"))]
+    client
 }
 
 #[cfg(test)]
@@ -86,16 +115,22 @@ fn url_encode(input: &str) -> String {
 
 #[tauri::command]
 pub async fn get_mihomo_proxies() -> Result<Value, String> {
+    #[cfg(target_os = "android")]
+    let catalog = super::node_catalog::read()?.public();
+    #[cfg(target_os = "android")]
+    if !super::process::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) { return Ok(catalog); }
     let client = controller_client()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .map_err(|e| e.to_string())?;
 
-    let res = client
+    let response = client
         .get(format!("{}/proxies", base_url()?))
         .send()
-        .await
-        .map_err(|e| format!("无法连接 Mihomo 控制端口: {}", e))?;
+        .await;
+    #[cfg(target_os = "android")]
+    if response.is_err() { return Ok(catalog); }
+    let res = response.map_err(|e| format!("无法连接 Mihomo 控制端口: {}", e))?;
 
     if !res.status().is_success() {
         return Err(format!("Mihomo 返回错误状态: {}", res.status()));
@@ -106,6 +141,20 @@ pub async fn get_mihomo_proxies() -> Result<Value, String> {
         .await
         .map_err(|e| format!("解析节点数据失败: {}", e))?;
 
+    #[cfg(target_os = "android")]
+    {
+        let mut combined = catalog;
+        if let Some(runtime) = json["proxies"].as_object() {
+            for (name, proxy) in runtime {
+                let key = combined["proxies"][name]["catalogKey"].clone();
+                combined["proxies"][name] = proxy.clone();
+                if !key.is_null() { combined["proxies"][name]["catalogKey"] = key; }
+            }
+        }
+        combined["offline"] = false.into();
+        return Ok(combined);
+    }
+    #[cfg(not(target_os = "android"))]
     Ok(json)
 }
 
@@ -132,8 +181,8 @@ pub async fn switch_mihomo_proxy(group: String, proxy: String) -> Result<bool, S
     }
 
     // 若切换的是主策略组，同步将 GLOBAL 策略组切换至相同节点，确保全局模式下无缝生效
-    let g_lower = group.to_lowercase();
-    if g_lower.contains("节点选择") || g_lower == "proxy" {
+    #[cfg(not(target_os = "android"))]
+    if group.to_lowercase().contains("节点选择") || group.eq_ignore_ascii_case("proxy") {
         let global_url = format!("{}/proxies/GLOBAL", base_url()?);
         let global_body = serde_json::json!({ "name": &proxy });
         let _ = client.put(global_url).json(&global_body).send().await;
@@ -224,6 +273,10 @@ pub async fn set_mihomo_mode(mode: String) -> Result<bool, String> {
         _ => "Rule",
     };
 
+    #[cfg(target_os = "android")]
+    let _: Value = crate::platform::android::call_async("mode", serde_json::json!({"mode": standard_mode})).await?;
+    #[cfg(not(target_os = "android"))]
+    {
     let body = serde_json::json!({ "mode": standard_mode });
     let res = client
         .patch(format!("{}/configs", base_url()?))
@@ -235,6 +288,7 @@ pub async fn set_mihomo_mode(mode: String) -> Result<bool, String> {
     if !res.status().is_success() {
         let err_body = res.text().await.unwrap_or_default();
         return Err(format!("Mihomo 拒绝切换模式: {}", err_body));
+    }
     }
 
     // 切换模式后，根据设置断开所有旧的活动连接，使流量立刻按新模式路由

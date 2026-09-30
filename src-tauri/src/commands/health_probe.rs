@@ -22,6 +22,7 @@ static START: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
 static SESSION_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
 
+#[cfg(not(target_os = "android"))]
 pub fn shutdown() {
     if let Ok(mut sessions) = SESSIONS.lock() {
         for session in sessions.values() { session.stop(); }
@@ -81,6 +82,7 @@ fn build_config(raw: &str, ports: &HashMap<String, u16>) -> Result<String, Strin
 }
 
 #[tauri::command]
+#[cfg(not(target_os = "android"))]
 pub async fn begin_health_probe(names: Vec<String>) -> Result<String, String> {
     let slot = SESSION_SLOTS.clone().acquire_owned().await.map_err(|e| e.to_string())?;
     let _start = START.lock().await;
@@ -164,6 +166,7 @@ pub async fn begin_health_probe(names: Vec<String>) -> Result<String, String> {
 }
 
 #[tauri::command]
+#[cfg(not(target_os = "android"))]
 pub async fn probe_node_health(session: String, node: String) -> Result<IpHealthInfo, String> {
     let _permit = LIMIT.acquire().await.map_err(|e| e.to_string())?;
     let session = SESSIONS.lock().map_err(|e| e.to_string())?.get(&session).cloned().ok_or("检测批次已结束")?;
@@ -172,9 +175,47 @@ pub async fn probe_node_health(session: String, node: String) -> Result<IpHealth
 }
 
 #[tauri::command]
+#[cfg(not(target_os = "android"))]
 pub fn end_health_probe(session: String) -> Result<(), String> {
     SESSIONS.lock().map_err(|e| e.to_string())?.remove(&session);
     Ok(())
+}
+
+#[cfg(target_os = "android")]
+async fn mobile_probe(payload: serde_json::Value) -> Result<serde_json::Value, String> {
+    crate::platform::android::call_async("healthProbe", serde_json::json!({"payload":payload.to_string()})).await
+}
+
+#[cfg(target_os = "android")]
+pub fn shutdown() { /* Native lifecycle closes and cancels all diagnostic clients. */ }
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn begin_health_probe(names: Vec<String>) -> Result<String, String> {
+    if names.is_empty() || names.len() > 4 { return Err("每批体检限 1–4 个节点".into()); }
+    let _guard = super::process::LIFECYCLE.lock().await;
+    let catalog = super::node_catalog::read()?;
+    let nodes = names.iter().map(|name| catalog.nodes.get(name).cloned().ok_or_else(|| format!("节点「{name}」不在当前订阅或缓存中，请刷新节点列表"))).collect::<Result<Vec<_>, _>>()?;
+    let result = mobile_probe(serde_json::json!({"action":"begin","nodes":nodes})).await?;
+    result["session"].as_str().map(str::to_owned).ok_or("检测会话初始化失败".into())
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn probe_node_health(session: String, node: String) -> Result<IpHealthInfo, String> {
+    let result = mobile_probe(serde_json::json!({"action":"probe","session":session,"node":node})).await?;
+    let body = result["body"].as_str().ok_or("检测服务响应无效")?;
+    if result["source"] == "ippure" {
+        super::ip_health::parse_ippure_json(body).ok_or("检测服务未返回有效 IP".into())
+    } else {
+        super::ip_health::parse_fallback_ip_info(serde_json::from_str(body).map_err(|_| "检测服务响应格式无效")?)
+    }
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn end_health_probe(session: String) -> Result<(), String> {
+    mobile_probe(serde_json::json!({"action":"end","session":session})).await.map(|_| ())
 }
 
 #[tauri::command]

@@ -163,7 +163,9 @@ fn ownership(addr: SocketAddr, pid: u32, tcp: bool) -> Result<bool, String> {
         }
         Ok(pid != 0 && matching.iter().any(|(_, owner)| *owner == pid))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    { crate::platform::macos::processes::owns_socket(addr, pid, tcp) }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (addr, pid, tcp);
         Ok(false)
@@ -248,12 +250,12 @@ async fn probe(addr: SocketAddr, tcp: bool) -> Result<(), String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 async fn confirm_address(_addr: SocketAddr, _pid: u32) -> Result<(), String> {
     Err("当前平台暂不支持 DNS 监听进程归属核验".into())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn confirm_address(addr: SocketAddr, pid: u32) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {

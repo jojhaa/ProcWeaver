@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "android-main",
+  "description": "Android main window receives application status events.",
+  "platforms": ["android"],
+  "windows": ["main"],
+  "permissions": ["core:event:default"]
+}

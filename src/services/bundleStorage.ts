@@ -3,7 +3,12 @@ import {
   BundleLocalInstance,
   ExportableBundlePackage,
   BundleSlot,
+  BundleProcessMember,
+  BundleCategory,
+  BundleFallback,
 } from "../types/businessBundle";
+import type { BundlePlatform } from "../types/platform";
+import { validAndroidPackage, processMembers, validateProcessBindings } from "../utils/bundlePlatform";
 import type { BundleRepositoryOrigin } from "../types/bundleRepository";
 
 const STORAGE_KEY = "netbox_business_bundles_instances_v1";
@@ -35,7 +40,7 @@ export const PRESET_BUNDLES_CATALOG: BusinessBundleDefinition[] = [
     category: "dev",
     mode: "strict",
     icon: "🧠",
-    description: "包含 ChatGPT.exe、核心后台 codex.exe 及伴生 node.exe，强锁单出口杜绝异地风控封号",
+    description: "管理 ChatGPT、Codex 及已配置伴生进程的业务出口；目标应用须支持代理接入，实际效果以连接记录为准",
     slots: DEFAULT_SLOTS,
     processes: [
       { exe: "ChatGPT.exe", role: "main", description: "桌面主客户端" },
@@ -43,6 +48,10 @@ export const PRESET_BUNDLES_CATALOG: BusinessBundleDefinition[] = [
       { exe: "node.exe", role: "worker", description: "扩展脚本与本地运行依赖" },
     ],
     additionalExes: ["ChatGPT.exe", "codex.exe", "node.exe"],
+    macosProcesses: [
+      { exe: "ChatGPT", role: "main", description: "macOS 桌面客户端；需遵循系统代理设置" },
+      { exe: "codex", role: "cli", description: "命令行进程；需配置代理环境变量" },
+    ],
     domains: [
       "openai.com",
       "chatgpt.com",
@@ -58,7 +67,7 @@ export const PRESET_BUNDLES_CATALOG: BusinessBundleDefinition[] = [
     category: "dev",
     mode: "strict",
     icon: "🌌",
-    description: "包含 Antigravity.exe、核心语言服务 language_server.exe 及 CLI 工具，全套进程整包强锁",
+    description: "管理 Antigravity 主程序及当前平台已配置的协同进程；可观测子进程继承业务出口规则",
     slots: DEFAULT_SLOTS,
     processes: [
       { exe: "Antigravity.exe", role: "main", description: "主集成开发环境与核心进程" },
@@ -74,6 +83,7 @@ export const PRESET_BUNDLES_CATALOG: BusinessBundleDefinition[] = [
       "antigravity-service.exe",
       "Antigravity IDE.exe",
     ],
+    macosProcesses: [{ exe: "Antigravity", role: "main", description: "macOS 应用主进程及可观测的子进程" }],
     domains: [
       "antigravity.google",
       "gemini.google.com",
@@ -202,36 +212,47 @@ export function deleteBundleInstance(instanceId: string): BundleLocalInstance[] 
 export function createCustomBundle(
   name: string,
   exes: string[],
-  domains: string[]
+  domains: string[],
+  platform: BundlePlatform = "windows",
+  processBindings?: BundleLocalInstance["processBindings"],
+  options?: {
+    icon?: string;
+    mode?: "strict" | "sandbox";
+    category?: BundleCategory;
+    description?: string;
+    fallback?: BundleFallback;
+  }
 ): BundleLocalInstance {
   const instances = getBundleInstances();
   const packageId = `custom-${Date.now().toString(36)}`;
+  const bindings = platform === "android" ? [] : processBindings?.[platform] ?? [];
+  validateProcessBindings(bindings, platform);
 
+  const mode = options?.mode ?? "strict";
   const definition: BusinessBundleDefinition = {
     packageId,
     packageName: name,
     packageVersion: "v1.0",
-    category: "custom",
-    mode: "strict",
-    icon: "📦",
-    fallback: "system",
-    description: "用户自定义业务规则套件",
+    category: options?.category ?? "custom",
+    mode,
+    icon: options?.icon ?? "📦",
+    fallback: options?.fallback ?? (mode === "strict" ? "direct" : "rules"),
+    description: options?.description ?? "用户自定义业务规则套件",
     slots: DEFAULT_SLOTS,
-    processes: exes.map((e, idx) => ({
-      exe: e,
-      role: idx === 0 ? "main" : "worker",
-      description: idx === 0 ? "主程序" : "伴生依赖进程",
-    })),
-    additionalExes: exes,
+    processes: processMembers(platform === "windows" ? exes : [], [], bindings, platform),
+    additionalExes: platform === "windows" ? exes : [],
+    macosProcesses: platform === "macos" ? processMembers(exes, [], bindings, platform) : undefined,
+    androidPackages: platform === "android" ? exes : undefined,
     domains,
   };
 
   const newInstance: BundleLocalInstance = {
     instanceId: `inst-${packageId}`,
     definition,
+    processBindings,
     enabled: false, // 默认停用 (跟随系统默认)
     slotBindings: { main: null, dns: "FOLLOW_MAIN" },
-    watcherMode: "auto",
+    watcherMode: mode === "sandbox" ? "notify" : "auto",
     isModified: false,
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -266,7 +287,10 @@ export function exportBundlePackage(instance: BundleLocalInstance): ExportableBu
       exe: p.exe,
       role: p.role,
       description: p.description,
+      ...(p.includeDescendants !== undefined ? { includeDescendants: p.includeDescendants } : {}),
     })),
+    macosProcesses: def.macosProcesses?.map(p => ({ exe: p.exe, role: p.role, description: p.description, ...(p.includeDescendants !== undefined ? { includeDescendants: p.includeDescendants } : {}) })),
+    androidPackages: def.androidPackages ? [...def.androidPackages] : undefined,
     additionalExes: def.additionalExes ? [...def.additionalExes] : undefined,
     domains: def.domains ? [...def.domains] : undefined,
     author: def.author || "Net-Box User",
@@ -309,7 +333,7 @@ export function validateAndParseBundlePackage(jsonString: string): {
     if (!bundle.packageName || typeof bundle.packageName !== "string" || !bundle.packageName.trim()) {
       return { valid: false, error: "缺少必要的规则包名称 (packageName)" };
     }
-    if (!Array.isArray(bundle.processes) || bundle.processes.length === 0) {
+    if (!Array.isArray(bundle.processes) || (bundle.processes.length === 0 && !bundle.macosProcesses?.length && !bundle.androidPackages?.length)) {
       return { valid: false, error: "规则包中必须至少包含一个进程定义 (processes)" };
     }
     if (bundle.processes.length > 100) {
@@ -317,7 +341,7 @@ export function validateAndParseBundlePackage(jsonString: string): {
     }
 
     // 清洗并严格校验进程名（严禁路径遍历字符、斜杠以及纯数字）
-    const validProcesses: { exe: string; role: "main" | "worker" | "cli"; description: string }[] = [];
+    const validProcesses: BundleProcessMember[] = [];
     for (const p of bundle.processes) {
       const rawExe = (typeof p === "string" ? p : p?.exe || "").trim();
       if (!rawExe) continue;
@@ -334,10 +358,28 @@ export function validateAndParseBundlePackage(jsonString: string): {
         exe: rawExe,
         role,
         description: typeof p.description === "string" ? p.description : "",
+        ...(typeof p.includeDescendants === "boolean" ? { includeDescendants: p.includeDescendants } : {}),
       });
     }
 
-    if (validProcesses.length === 0) {
+    let macosProcesses: BundleProcessMember[] | undefined;
+    if (bundle.macosProcesses !== undefined) {
+      if (!Array.isArray(bundle.macosProcesses) || bundle.macosProcesses.length > 100) return { valid: false, error: "macOS 进程列表无效或超过 100 个" };
+      macosProcesses = [];
+      for (const p of bundle.macosProcesses) {
+        if (!p || typeof p.exe !== "string" || !p.exe.trim() || p.exe.length > 260 || /[/\\\x00-\x1f]/.test(p.exe) || p.exe.includes("..") || /^\d+$/.test(p.exe.trim()) || p.exe.trim().toLowerCase().endsWith(".app")) return { valid: false, error: "macOS 进程名无效；请填写 .app 内实际可执行文件名" };
+        if (!["main", "worker", "cli", "helper"].includes(p.role)) return { valid: false, error: "macOS 进程角色无效" };
+        macosProcesses.push({ exe: p.exe.trim(), role: p.role, description: typeof p.description === "string" ? p.description.slice(0, 512) : "", ...(typeof p.includeDescendants === "boolean" ? { includeDescendants: p.includeDescendants } : {}) });
+      }
+    }
+    let androidPackages: string[] | undefined;
+    if (bundle.androidPackages !== undefined) {
+      if (!Array.isArray(bundle.androidPackages) || bundle.androidPackages.length > 100 || bundle.androidPackages.some((p: unknown) => typeof p !== "string" || !validAndroidPackage(p))) {
+        return { valid: false, error: "Android 应用包名无效或超过 100 个" };
+      }
+      androidPackages = [...new Set<string>(bundle.androidPackages)];
+    }
+    if (validProcesses.length === 0 && !macosProcesses?.length && !androidPackages?.length) {
       return { valid: false, error: "经过过滤后，未找到任何有效的可执行进程定义" };
     }
 
@@ -364,6 +406,8 @@ export function validateAndParseBundlePackage(jsonString: string): {
       description: bundle.description || "导入的规则包",
       slots: Array.isArray(bundle.slots) && bundle.slots.length > 0 ? bundle.slots : DEFAULT_SLOTS,
       processes: validProcesses,
+      macosProcesses,
+      androidPackages,
       additionalExes: Array.isArray(bundle.additionalExes) ? bundle.additionalExes.filter((e: any) => typeof e === "string") : undefined,
       domains: validDomains,
       author: bundle.author,

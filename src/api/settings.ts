@@ -5,6 +5,8 @@ export interface GeneralSettings {
   controllerPort: number;
   enableControllerPort?: boolean;
   allowLan: boolean;
+  lanSharing?: { port: number; username: string; password: string; allowedNetworks: string[]; outbound: string };
+  vpnApps?: { mode: "all" | "include" | "exclude"; packages: string[] };
   tunMode: boolean;
   autoStart: boolean;
   unifiedDelay: boolean;
@@ -14,7 +16,7 @@ export interface GeneralSettings {
   silentStart: boolean;
   autoRun: boolean;
   onlyProxyTraffic: boolean;
-  trafficMode?: "app_proxy" | "tun" | "smart_hybrid";
+  trafficMode?: "app_proxy" | "tun" | "smart_hybrid" | "windivert_v1";
   routingPriority?: "domain_first" | "process_first" | "direct_first";
   speedTestUrl?: string;
   speedTestConcurrency?: number;

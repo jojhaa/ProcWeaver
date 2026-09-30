@@ -40,14 +40,16 @@ pub(crate) fn initialize_test(data: PathBuf, resources: PathBuf) {
     let _ = RESOURCES.set(resources);
 }
 
-fn resolve_resources(app: &tauri::App) -> PathBuf {
+#[cfg(not(target_os = "android"))]
+fn resolve_resources(app: &tauri::AppHandle) -> PathBuf {
     if cfg!(debug_assertions) {
+        if cfg!(target_os = "macos") { return PathBuf::from(env!("CARGO_MANIFEST_DIR")); }
         return PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
     }
 
     // 1. 优先检查 Tauri 原生资源目录
     if let Ok(dir) = app.path().resource_dir() {
-        if dir.join("binaries/mihomo-compatible.exe").exists() || dir.join("binaries/mihomo-v3.exe").exists() {
+        if has_core(&dir) {
             return dir;
         }
     }
@@ -55,14 +57,14 @@ fn resolve_resources(app: &tauri::App) -> PathBuf {
     // 2. 检查当前运行的可执行文件同级目录 (绿色免安装 / Portable)
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            if parent.join("binaries/mihomo-compatible.exe").exists() || parent.join("binaries/mihomo-v3.exe").exists() {
+            if has_core(parent) {
                 return parent.to_path_buf();
             }
 
             // 3. 向上逐级回溯寻找包含 binaries 的目录 (例如在 target/release/ 下直接运行时，回溯至工程根目录)
             let mut curr = parent;
             while let Some(up) = curr.parent() {
-                if up.join("binaries/mihomo-compatible.exe").exists() || up.join("binaries/mihomo-v3.exe").exists() {
+                if has_core(up) {
                     return up.to_path_buf();
                 }
                 curr = up;
@@ -73,7 +75,18 @@ fn resolve_resources(app: &tauri::App) -> PathBuf {
     app.path().resource_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-pub fn initialize(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+#[cfg(not(target_os = "android"))]
+fn has_core(path: &Path) -> bool {
+    crate::platform::core_names("auto").unwrap_or_default().iter().any(|name| path.join("binaries").join(name).is_file())
+}
+
+#[cfg(target_os = "android")]
+pub fn initialize(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    initialize_android(app.path().app_data_dir()?.join("files")).map_err(Into::into)
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn initialize(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let resources = resolve_resources(app);
     
     // 智能判定运行模式：
@@ -81,6 +94,7 @@ pub fn initialize(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // 2. 否则使用 Windows 官方标准独立数据目录: AppData/Local/com.procweaver.desktop
     let mut is_portable = false;
     let mut portable_data_dir = None;
+    #[cfg(not(any(target_os = "macos", target_os = "android")))]
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             let data_candidate = parent.join("data");
@@ -107,7 +121,25 @@ pub fn initialize(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(target_os = "android")]
+pub(crate) fn initialize_android(data: PathBuf) -> Result<(), String> {
+    fs::create_dir_all(data.join("config")).map_err(|_| "创建应用配置目录失败")?;
+    fs::create_dir_all(data.join("core_data")).map_err(|_| "创建核心目录失败")?;
+    copy_android_default(&data).map_err(|_| "初始化默认配置失败")?;
+    initialize_data(&data, &data).map_err(|_| "初始化应用资源失败")?;
+    if DATA.get_or_init(|| data.clone()) != &data || RESOURCES.get_or_init(|| data.clone()) != &data {
+        return Err("Android 应用数据路径不一致".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn copy_android_default(data: &Path) -> std::io::Result<()> {
+    write_missing_file(&data.join("config/default.yaml"), include_bytes!("../defaults/default.yaml"))
+}
+
 fn initialize_data(resources: &Path, data: &Path) -> std::io::Result<()> {
+    if DATA.get().is_none() { crate::commands::config_transfer::recover(data).map_err(std::io::Error::other)?; }
     fs::create_dir_all(data.join("config"))?;
     fs::create_dir_all(data.join("core_data"))?;
 

@@ -52,7 +52,7 @@ export async function getCpuInfo(): Promise<CpuInfo> {
 
 export async function toggleCore(
   start: boolean,
-  coreMode: "auto" | "v3" | "compatible" = "auto"
+  coreMode: "auto" | "v3" | "compatible" | "standard" = "auto"
 ): Promise<CoreStatus> {
   if (isTauri()) {
     if (start) {

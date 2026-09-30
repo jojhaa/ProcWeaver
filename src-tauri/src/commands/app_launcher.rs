@@ -54,31 +54,18 @@ pub fn find_chatgpt_executable() -> Option<PathBuf> {
                 return Some(pf_exe);
             }
 
-            // 3. 遍历 WindowsApps 商店版目录 (OpenAI.Codex_*)
-            let win_apps = Path::new(&prog_files).join("WindowsApps");
-            if win_apps.exists() {
-                if let Ok(entries) = std::fs::read_dir(&win_apps) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if name.starts_with("OpenAI.Codex_") {
-                            let candidate1 = entry.path().join("ChatGPT.exe");
-                            if candidate1.exists() {
-                                return Some(candidate1);
-                            }
-                            let candidate2 = entry.path().join("app").join("ChatGPT.exe");
-                            if candidate2.exists() {
-                                return Some(candidate2);
-                            }
-                        }
-                    }
-                }
-            }
         }
+        // 3. 只使用当前用户已注册的商店应用入口，不扫描残留版本目录。
+        return super::packaged_app::find("OpenAI.Codex_2p2nqsd0c76g0", "ChatGPT.exe").ok().flatten();
     }
+    #[cfg(not(windows))]
     None
 }
 
 /// 通用查找常用预设应用路径
+#[cfg(target_os = "macos")]
+pub fn find_app_executable(preset_id: &str) -> Option<PathBuf> { crate::platform::macos::apps::find(preset_id) }
+#[cfg(not(target_os = "macos"))]
 pub fn find_app_executable(preset_id: &str) -> Option<PathBuf> {
     let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
     let prog = std::env::var("ProgramFiles").unwrap_or_default();
@@ -158,12 +145,30 @@ pub fn launch_preset_app(preset_id: String) -> Result<LaunchResult, String> {
     }
 
     if let Some(exe_path) = find_app_executable(&preset_id) {
+        #[cfg(windows)]
+        if let Some(application)=super::packaged_app::resolve(&exe_path)? {
+            application.activate(&[
+                format!("--proxy-server={proxy_url}"),
+                "--proxy-bypass-list=<-loopback>;localhost;127.0.0.1;::1".into(),
+            ])?;
+            return Ok(LaunchResult { success:true, message:super::packaged_app::activation_note().into() });
+        }
+        #[cfg(target_os = "macos")]
+        if crate::platform::macos::apps::requires_system_proxy(&exe_path) && !super::sysproxy::get_system_proxy_status()? {
+            return Err("此原生应用需要先启用系统代理；启动后仍须核验实际连接出口".into());
+        }
         let mut cmd = Command::new(&exe_path);
         if preset_id == "discord" && exe_path.file_name().map_or(false, |n| n == "Update.exe") {
             cmd.args(["--processStart", "Discord.exe"]);
         }
-        cmd.arg(format!("--proxy-server={}", proxy_url));
-        cmd.arg("--proxy-bypass-list=<-loopback>;localhost;127.0.0.1;::1");
+        #[cfg(target_os = "macos")]
+        let supports_args = crate::platform::macos::apps::supports_proxy_arguments(&exe_path);
+        #[cfg(not(target_os = "macos"))]
+        let supports_args = true;
+        if supports_args {
+            cmd.arg(format!("--proxy-server={}", proxy_url));
+            cmd.arg("--proxy-bypass-list=<-loopback>;localhost;127.0.0.1;::1");
+        }
         cmd.env("HTTP_PROXY", &proxy_url);
         cmd.env("HTTPS_PROXY", &proxy_url);
         cmd.env("ALL_PROXY", &proxy_url);
@@ -180,33 +185,12 @@ pub fn launch_preset_app(preset_id: String) -> Result<LaunchResult, String> {
         match cmd.spawn() {
             Ok(_) => Ok(LaunchResult {
                 success: true,
-                message: format!("🚀 「{}」已唤起，代理参数与环境已直接注入 (127.0.0.1:{})", preset_id, port),
+                message: format!("「{}」已启动，代理入口 127.0.0.1:{}；目标应用须遵循代理设置，实际出口仍需核验", preset_id, port),
             }),
             Err(e) => Err(format!("启动 {} 失败: {}", preset_id, e)),
         }
     } else if preset_id == "chatgpt" {
-        // 商店应用无法直接读取 exe 文件时，通过 AppsFolder 唤起
-        #[cfg(windows)]
-        {
-            let mut cmd = Command::new("cmd");
-            cmd.args(["/c", "start", "shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App"]);
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                cmd.creation_flags(CREATE_NO_WINDOW);
-            }
-            match cmd.spawn() {
-                Ok(_) => Ok(LaunchResult {
-                    success: true,
-                    message: "🚀 已通过 Windows 应用通道唤起 ChatGPT，回环豁免已就绪".into(),
-                }),
-                Err(e) => Err(format!("唤起 ChatGPT 失败: {}", e)),
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            Err("未找到 ChatGPT 桌面端安装".into())
-        }
+        Err("未找到当前用户可用的 ChatGPT 安装入口，请在业务包中重新选择已安装的主程序".into())
     } else {
         Err(format!("未在系统标准路径检测到「{}」的安装，请确认是否已安装该应用", preset_id))
     }

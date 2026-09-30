@@ -65,8 +65,14 @@ pub fn process_list() -> Result<Vec<ProcessRecord>, String> {
         Ok(result)
     }
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub use crate::platform::macos::processes::{inspect, process_list, observe};
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn process_list() -> Result<Vec<ProcessRecord>, String> { Err("进程树仅支持 Windows".into()) }
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn inspect(pid: u32, parent_pid: u32, name: String) -> ProcessEntry {
+    ProcessEntry { pid, parent_pid, name, identity: String::new(), created_at: 0, executable_path: None, parent_identity: None, ancestors: vec![] }
+}
 
 pub fn snapshot() -> Result<Vec<ProcessEntry>, String> {
     let entries: Vec<_> = process_list()?.into_iter().map(|p| inspect(p.pid, p.parent_pid, p.name)).collect();
@@ -105,11 +111,13 @@ pub fn observe() -> Result<(), String> {
         let events = service.ExecNotificationQuery(&BSTR::from("WQL"), &BSTR::from("SELECT * FROM Win32_ProcessTrace"),
             WBEM_FLAG_RETURN_IMMEDIATELY | WBEM_FLAG_FORWARD_ONLY, None).map_err(|_| "无法订阅进程事件，请检查 WMI 权限；快照补偿不能保证短命进程")?;
         // 订阅成功后建立基线；排队事件与快照按实例身份去重。
-        super::tracker::reconcile(snapshot()?, true);
+        super::tracker::reconcile_observed(snapshot()?, true);
         let mut last = std::time::Instant::now();
         while super::tracker::ENABLED.load(std::sync::atomic::Ordering::Acquire) {
             let mut objects = [None]; let mut returned = 0;
             events.Next(200, &mut objects, &mut returned).ok().map_err(|_| "进程事件订阅中断")?;
+            if !super::tracker::ENABLED.load(std::sync::atomic::Ordering::Acquire) { break; }
+            super::tracker::observer_alive();
             if let Some(object) = objects[0].as_ref() {
                 let mut value = VARIANT::default();
                 object.Get(w!("ProcessID"), 0, &mut value, None, None).map_err(|_| "进程事件缺少 PID")?;
@@ -125,14 +133,23 @@ pub fn observe() -> Result<(), String> {
                     let mut parent = VARIANT::default();
                     object.Get(w!("ParentProcessID"), 0, &mut parent, None, None).map_err(|_| "进程事件缺少父 PID")?;
                     let ppid = VariantToUInt32(&parent).map_err(|_| "父 PID 无效")?;
-                    let item = inspect(pid, ppid, String::new());
+                    let mut name = VARIANT::default();
+                    object.Get(w!("ProcessName"), 0, &mut name, None, None).map_err(|_| "进程事件缺少名称")?;
+                    let mut name_buffer = [0u16; 512];
+                    let process_name = if VariantToString(&name, &mut name_buffer).is_ok() {
+                        String::from_utf16_lossy(&name_buffer[..name_buffer.iter().position(|c| *c == 0).unwrap_or(name_buffer.len())])
+                    } else { String::new() };
+                    let item = inspect(pid, ppid, process_name);
                     if item.created_at > 0 && item.created_at <= event_time && event_time - item.created_at < 50_000_000 {
                         super::tracker::created(item);
-                    } else { super::tracker::limited("部分短命或受保护进程无法核实身份"); }
+                    } else {
+                        super::tracker::unverified_process(pid, item.name, event_time);
+                        super::tracker::limited("部分短命或受保护进程无法核实身份");
+                    }
                 } else if class == "Win32_ProcessStopTrace" { super::tracker::exited(pid, event_time); }
             }
             if last.elapsed().as_secs() >= 5 {
-                super::tracker::reconcile(snapshot()?, false); last = std::time::Instant::now();
+                super::tracker::reconcile_observed(snapshot()?, false); last = std::time::Instant::now();
             }
         }
     }

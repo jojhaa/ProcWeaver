@@ -140,7 +140,7 @@ pub async fn enable_dns_guard() -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        Ok(())
+        Err("当前平台支持核心内 DNS 分流，暂不支持修改系统网卡 DNS".into())
     }
 }
 
@@ -273,7 +273,8 @@ pub async fn emergency_repair_network() -> Result<String, String> {
     }
     #[cfg(not(windows))]
     {
-        Ok("当前系统无需急救".into())
+        super::sysproxy::reset_system_proxy_emergency()?;
+        Ok("已释放本程序持有的系统代理；应用代理模式未修改系统 DNS".into())
     }
 }
 

@@ -66,7 +66,7 @@ fn run_powershell(script: &str) -> Result<String, String> {
     #[cfg(not(windows))]
     {
         let _ = script;
-        Ok(String::new())
+        Err("当前平台不支持 Windows 快捷方式操作，请从业务包启动应用".into())
     }
 }
 
@@ -254,6 +254,13 @@ pub fn patch_app_shortcut(app_id: String) -> Result<String, String> {
     let normalized = normalize_app_id(&app_id);
     let meta = get_app_meta(&normalized)?;
     let lnk = find_desktop_app_lnk(&normalized).ok_or(format!("未在桌面上找到「{}」的原生快捷方式", meta.display_name))?;
+    #[cfg(windows)]
+    {
+        let target=super::windows_integration::read_link(&lnk)?.target;
+        if target.is_empty() || super::packaged_app::resolve(std::path::Path::new(&target))?.is_some() {
+            return Err("此快捷方式使用商店应用入口，请在业务包中创建专属快捷方式，保留程序包身份；未改动原快捷方式".into());
+        }
+    }
     let port = get_proxy_port();
     let proxy_arg = format!("--proxy-server=http://127.0.0.1:{} --proxy-bypass-list=<-loopback>;localhost;127.0.0.1;::1", port);
 
@@ -365,6 +372,10 @@ pub fn create_dedicated_app_shortcut(app_id: String) -> Result<String, String> {
     let proxy_args = format!("--proxy-server=http://127.0.0.1:{} --proxy-bypass-list=<-loopback>;localhost;127.0.0.1;::1", port);
 
     if let Some(exe_path) = crate::commands::app_launcher::find_app_executable(&normalized) {
+        #[cfg(windows)]
+        if super::packaged_app::resolve(&exe_path)?.is_some() {
+            return Err("商店应用不能创建直接运行包内 EXE 的快捷方式，请在业务包中创建专属快捷方式".into());
+        }
         let parent = exe_path.parent().unwrap_or(&exe_path);
         let script = format!(
             "$sh = New-Object -ComObject WScript.Shell; $sc = $sh.CreateShortcut('{}'); $sc.TargetPath = '{}'; $sc.Arguments = '{}'; $sc.WorkingDirectory = '{}'; $sc.IconLocation = '{},0'; $sc.Description = '{} 专属应用层加速快捷方式 (由 ProcWeaver 生成)'; $sc.Save()",
@@ -377,16 +388,7 @@ pub fn create_dedicated_app_shortcut(app_id: String) -> Result<String, String> {
         );
         run_powershell(&script)?;
     } else if normalized == "chatgpt" {
-        let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let parent = current_exe.parent().unwrap_or(&current_exe);
-        let script = format!(
-            "$sh = New-Object -ComObject WScript.Shell; $sc = $sh.CreateShortcut('{}'); $sc.TargetPath = '{}'; $sc.Arguments = '--launch chatgpt'; $sc.WorkingDirectory = '{}'; $sc.IconLocation = '{},0'; $sc.Description = 'ChatGPT 专属应用层加速快捷方式 (由 ProcWeaver 生成)'; $sc.Save()",
-            target_lnk.to_string_lossy().replace('\'', "''"),
-            current_exe.to_string_lossy().replace('\'', "''"),
-            parent.to_string_lossy().replace('\'', "''"),
-            current_exe.to_string_lossy().replace('\'', "''")
-        );
-        run_powershell(&script)?;
+        return Err("未找到当前用户可用的 ChatGPT 安装入口，请在业务包中重新选择主程序后创建快捷方式".into());
     } else {
         return Err(format!("未检测到「{}」的安装路径，无法生成专属快捷方式", meta.display_name));
     }

@@ -49,7 +49,7 @@ pub(super) async fn snapshot(state: &super::super::process::CoreStateMutex, incl
     Ok(result)
 }
 async fn collect(client: &reqwest::Client, current: &Source, cache: &mut TypesCache, include_connections: bool) -> Result<Value, String> {
-    let connections = read(client, format!("{}/connections", current.base)).await?;
+    let mut connections = read(client, format!("{}/connections", current.base)).await?;
     if needs_refresh(cache, current, &connections) {
         let proxies = read(client, format!("{}/proxies", current.base)).await?;
         cache.types = proxies["proxies"].as_object().ok_or("出站类型响应无效")?.iter()
@@ -66,7 +66,10 @@ async fn collect(client: &reqwest::Client, current: &Source, cache: &mut TypesCa
     }).collect();
     let mut result = serde_json::json!({"epoch": current.epoch, "uploadTotal": connections["uploadTotal"],
         "downloadTotal": connections["downloadTotal"], "connections": entries});
-    if include_connections { result["details"] = connections; }
+    if include_connections {
+        super::attribution::annotate(&mut connections, current.epoch);
+        result["details"] = connections;
+    }
     Ok(result)
 }
 #[cfg(test)]

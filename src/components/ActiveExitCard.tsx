@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import { useMobileBack } from "../utils/mobileBack";
 import { useExitIpHealth } from "../hooks/useExitIpHealth";
 import { getPersistedHealthCache, savePersistedHealthCache } from "../api/nodeHealth";
 import {
@@ -25,13 +26,14 @@ interface Props {
 }
 
 export const ActiveExitCard: React.FC<Props> = ({ proxyPort, corePid, activeNodeName, activeNodeLabel }) => {
-  const { data, loading, phase, loadData } = useExitIpHealth(proxyPort, corePid);
+  const { data, loading, error, phase, loadData } = useExitIpHealth(proxyPort, corePid);
   const [copied, setCopied] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
+  useMobileBack(() => { if (!modalOpen) return false; setModalOpen(false); return true; }, 30);
 
   // 当探测到出口健康数据且存在活动节点名时，自动反哺写入大盘缓存
   useEffect(() => {
-    if (data && activeNodeName) {
+    if (data && activeNodeName && document.documentElement.dataset.platform !== "android") {
       getPersistedHealthCache()
         .then(async (currentCache) => {
           currentCache[activeNodeName] = data;
@@ -54,7 +56,8 @@ export const ActiveExitCard: React.FC<Props> = ({ proxyPort, corePid, activeNode
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const getScoreBadge = (score = 0) => {
+  const getScoreBadge = (score?: number | null) => {
+    if (score == null) return { level: "评分不可用", color: "text-slate-500 bg-slate-500/10 border-slate-500/30", barColor: "bg-slate-400", icon: <ShieldAlert className="w-3.5 h-3.5" /> };
     if (score <= 25) {
       return {
         level: "极佳 · 低风险",
@@ -79,7 +82,7 @@ export const ActiveExitCard: React.FC<Props> = ({ proxyPort, corePid, activeNode
     };
   };
 
-  const scoreMeta = getScoreBadge(data?.fraudScore ?? 0);
+  const scoreMeta = getScoreBadge(data?.fraudScore);
 
   return (
     <>
@@ -101,12 +104,12 @@ export const ActiveExitCard: React.FC<Props> = ({ proxyPort, corePid, activeNode
                     {data.country} {data.city ? `· ${data.city}` : ""}
                   </span>
                 )}
-                {data?.isResidential !== undefined && (
+                {data?.isResidential != null && (
                   <span className={`text-[10px] px-1.5 py-0.2 rounded-md font-semibold ${data.isResidential ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400" : "bg-blue-500/10 text-blue-600 dark:text-blue-400"}`}>
                     {data.isResidential ? "原生家庭宽带" : "机房数据中心"}
                   </span>
                 )}
-                {data?.isBroadcast !== undefined && (
+                {data?.isBroadcast != null && (
                   <span className="text-[10px] px-1.5 py-0.2 rounded-md bg-purple-500/10 text-purple-600 dark:text-purple-400 font-mono">
                     {data.isBroadcast ? "广播宣告" : "原生分配"}
                   </span>
@@ -146,7 +149,7 @@ export const ActiveExitCard: React.FC<Props> = ({ proxyPort, corePid, activeNode
               >
                 {scoreMeta.icon}
                 <span>{scoreMeta.level}</span>
-                <span className="font-mono text-[11px] opacity-80">({data.fraudScore ?? 0}分)</span>
+                {data.fraudScore != null && <span className="font-mono text-[11px] opacity-80">({data.fraudScore}分)</span>}
                 <ExternalLink className="w-3 h-3 ml-0.5 opacity-60" />
               </button>
             ) : (
@@ -182,6 +185,7 @@ export const ActiveExitCard: React.FC<Props> = ({ proxyPort, corePid, activeNode
           </div>
         </div>
 
+        {error && <p role="alert" className="text-sm text-amber-700 dark:text-amber-300 break-words">出口检测失败：{error}</p>}
         {/* 暂时隐藏：主流 AI 模型与流媒体解锁矩阵 (按需隐藏，保留底层接口) */}
       </div>
 
@@ -234,7 +238,7 @@ export const ActiveExitCard: React.FC<Props> = ({ proxyPort, corePid, activeNode
             <div className={`p-4 rounded-xl border ${scoreMeta.color}`}>
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-semibold">欺诈风险指数:</span>
-                <span className="font-mono font-bold text-base">{data?.fraudScore ?? 0} / 100</span>
+                <span className="font-mono font-bold text-base">{data?.fraudScore == null ? "暂无评分" : `${data.fraudScore} / 100`}</span>
               </div>
               <div className="w-full bg-slate-200 dark:bg-slate-950 rounded-full h-2 overflow-hidden">
                 <div
@@ -243,9 +247,10 @@ export const ActiveExitCard: React.FC<Props> = ({ proxyPort, corePid, activeNode
                 />
               </div>
               <div className="text-[11px] mt-2 opacity-85 leading-relaxed">
-                {data?.fraudScore !== undefined && data.fraudScore <= 25
-                  ? "该 IP 极度纯净，无滥用记录，OpenAI、海外数字银行及防欺诈风控畅通无阻。"
-                  : data?.fraudScore !== undefined && data.fraudScore <= 60
+                {data?.fraudScore == null ? "当前来源未提供风险评分，无法判断风险等级。"
+                  : data.fraudScore <= 25
+                  ? "当前来源报告的风险评分较低，实际服务可用性仍取决于目标网站。"
+                  : data?.fraudScore != null && data.fraudScore <= 60
                   ? "该 IP 为常见数据中心机房出口，偶有人机验证。"
                   : "该 IP 风险较高，可能频繁触发人机验证或封锁。"}
               </div>
@@ -262,14 +267,14 @@ export const ActiveExitCard: React.FC<Props> = ({ proxyPort, corePid, activeNode
                 ) : (
                   <>
                     <Server className="w-4 h-4 text-blue-500" />
-                    <span className="text-blue-600 dark:text-blue-400 font-semibold">机房数据中心</span>
+                    <span className="text-blue-600 dark:text-blue-400 font-semibold">{data?.isResidential === false ? "机房数据中心" : "网络类型未知"}</span>
                   </>
                 )}
               </div>
               <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800 flex items-center space-x-2">
                 <Radio className="w-4 h-4 text-purple-500" />
                 <span className="text-slate-700 dark:text-slate-300 font-semibold">
-                  {data?.isBroadcast ? "广播宣告 IP" : "原生分配 IP"}
+                  {data?.isBroadcast == null ? "分配类型未知" : data.isBroadcast ? "广播宣告 IP" : "原生分配 IP"}
                 </span>
               </div>
             </div>

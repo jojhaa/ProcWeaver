@@ -2,9 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 export interface LaunchRequest { instanceId: string; shortcutId?: string | null }
 export interface LaunchOutcome { state: "launched" | "reused" | "restart_required" | "not_running"; message: string; confirmation: string | null; entry: string; processCount: number }
 export interface BundleShortcuts { desktop: string; executableFound: boolean; candidates: { path: string; label: string }[]; managed: { id: string; path: string; dedicated: boolean; verified: boolean; backup: string | null }[] }
-export interface BundleEntryState { instanceId: string; state: string; message: string; chains: string[]; connectionState: string; connectionMessage: string; instanceKey?: string }
+export interface ProcessMonitorChange { refreshAll: boolean; instanceIds: string[] }
+export interface BundleEntryState { instanceId: string; state: string; message: string; chains: string[]; connectionState: string; connectionMessage: string; instanceKey?: string; monitorMessage?: string; monitorState?: "disabled" | "initializing" | "current" | "degraded" | "stale" | null; identityState?: string; identityMessage?: string }
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  if (!("__TAURI_INTERNALS__" in window)) throw new Error("此功能需要 Windows 桌面客户端");
+  if (!("__TAURI_INTERNALS__" in window)) throw new Error("此功能需要桌面客户端");
   try { return await invoke<T>(command, args); } catch (error) { throw new Error(typeof error === "string" ? error : error instanceof Error ? error.message : "操作失败，请重试"); }
 }
 export const bundleToolsApi = {

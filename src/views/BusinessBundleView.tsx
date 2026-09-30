@@ -3,34 +3,39 @@ import {
   BundleLocalInstance,
   BundleWatcherMode,
   BusinessBundleDefinition,
+  BundleProcessBindings,
 } from "../types/businessBundle";
 import {
   getBundleInstances,
   installPresetBundle,
   updateBundleInstance,
   deleteBundleInstance,
-  createCustomBundle,
 } from "../services/bundleStorage";
 import { bundleController, useBusinessBundles } from "../hooks/useBusinessBundles";
 import { getBundleStatus } from "../utils/bundleController";
 import { bundleTools } from "../services/bundleTools";
 import { useBundleEntries } from "../hooks/useBundleTools";
 import { BundleRow } from "../components/business-bundle/BundleRow";
-import { QuickBindModal } from "../components/business-bundle/QuickBindModal";
+import { TrafficModeSelector } from "../components/TrafficModeSelector";
+import { TrafficModeGuideModal } from "../components/TrafficModeGuideModal";
+import { SelectExitModal } from "../components/business-bundle/SelectExitModal";
+import { BundleDetailModal } from "../components/business-bundle/BundleDetailModal";
 import { ImportBundleModal } from "../components/business-bundle/ImportBundleModal";
 import { ExportBundleModal } from "../components/business-bundle/ExportBundleModal";
 import { EditBundleModal } from "../components/business-bundle/EditBundleModal";
+import { BundleStudio } from "../components/business-bundle/BundleStudio";
 import { RepositoryCenter } from "../components/business-bundle/RepositoryCenter";
 import { useBundleRepositories } from "../hooks/useBundleRepositories";
 import { DEFAULT_REPOSITORY, repositoryPage } from "../services/bundleRepositories";
 import type { RepositoryPackage } from "../types/bundleRepository";
+import { usePlatform } from "../context/PlatformContext";
+import { bundleExes, processKey } from "../utils/bundlePlatform";
 import { toggleDnsGuard, getDnsGuardStatus, isTauri } from "../api";
 import {
-  Package,
   Wrench,
   Download,
-  Plus,
   Sparkles,
+  HelpCircle,
 } from "lucide-react";
 
 interface Props {
@@ -38,6 +43,8 @@ interface Props {
 }
 
 export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
+  const platform = usePlatform();
+  const os = platform.os === "android" ? "android" : platform.os === "macos" ? "macos" : "windows";
   const bundleState = useBusinessBundles();
   const entryStates = useBundleEntries();
   const { instances } = bundleState;
@@ -47,27 +54,18 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
   const repoCount = repositories.state.repositories.filter(r => r.enabled).reduce((sum, r) => sum + (repositories.state.statuses[r.id]?.packages.length || 0), 0);
   const loadingRepo = repositories.state.repositories.some(r => r.enabled && repositories.state.statuses[r.id]?.loading);
 
-  // 折叠状态追踪 (默认第一项展开，其余折叠)
-  const [expandedMap, setExpandedMap] = useState<Record<string, boolean>>(() => ({
-    "inst-chatgpt": true,
-  }));
-  const [allExpanded, setAllExpanded] = useState<boolean>(false);
-
   // 弹窗状态
-  const [quickBindTarget, setQuickBindTarget] = useState<BundleLocalInstance | null>(null);
+  const [selectExitTarget, setSelectExitTarget] = useState<BundleLocalInstance | null>(null);
+  const [detailTarget, setDetailTarget] = useState<BundleLocalInstance | null>(null);
   const [exportTarget, setExportTarget] = useState<BundleLocalInstance | null>(null);
   const [editingTarget, setEditingTarget] = useState<BundleLocalInstance | null>(null);
   const [isImportOpen, setIsImportOpen] = useState<boolean>(false);
+  const [isModeGuideOpen, setIsModeGuideOpen] = useState<boolean>(false);
 
   // 全局 DNS 护航与提示 (C02: 加入 isDnsPending 防重入与反馈)
   const [dnsGuardEnabled, setDnsGuardEnabled] = useState<boolean>(false);
   const [isDnsPending, setIsDnsPending] = useState<boolean>(false);
   const [bannerToast, setBannerToast] = useState<string>("");
-
-  // 自定义工坊表单
-  const [customName, setCustomName] = useState<string>("");
-  const [customExesText, setCustomExesText] = useState<string>("");
-  const [customDomainsText, setCustomDomainsText] = useState<string>("");
 
   const showToast = (msg: string) => {
     setBannerToast(msg);
@@ -80,7 +78,7 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
 
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    const refreshDns = () => { void getDnsGuardStatus().then(status => { if (!disposed) setDnsGuardEnabled(status); }).catch(() => {}); };
+    const refreshDns = () => { if (platform.dnsGuard) void getDnsGuardStatus().then(status => { if (!disposed) setDnsGuardEnabled(status); }).catch(() => {}); };
     refreshDns();
     window.addEventListener("focus", refreshDns);
     if (isTauri()) void import("@tauri-apps/api/event").then(({ listen }) => listen("procweaver-dns-guard-changed", refreshDns))
@@ -97,25 +95,6 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
     });
   }, []);
 
-  // 切换折叠单个行
-  const handleToggleExpand = (instanceId: string) => {
-    setExpandedMap((prev) => ({
-      ...prev,
-      [instanceId]: !prev[instanceId],
-    }));
-  };
-
-  // 一键全部折叠 / 全部展开
-  const handleToggleAll = () => {
-    const nextState = !allExpanded;
-    setAllExpanded(nextState);
-    const nextMap: Record<string, boolean> = {};
-    for (const inst of instances) {
-      nextMap[inst.instanceId] = nextState;
-    }
-    setExpandedMap(nextMap);
-  };
-
   // 切换开关
   const handleToggleSwitch = (instanceId: string, nextState: boolean) => {
     const next = updateBundleInstance(instanceId, (prev) => ({
@@ -125,25 +104,30 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
     persistAndSync(next);
   };
 
-  // 直接在下拉框中选择节点
-  const handleSelectNodeChange = (instanceId: string, nodeName: string) => {
+  // 弹窗确认应用出口（含主出口与 DNS 出口联动）
+  const handleSelectExitConfirm = (instanceId: string, mainExit: string | null, dnsExit?: string | null) => {
     const next = updateBundleInstance(instanceId, (prev) => {
-      const isUnbinding = !nodeName || nodeName.trim() === "";
+      const isUnbinding = !mainExit || mainExit.trim() === "";
       return {
         ...prev,
         slotBindings: {
           ...prev.slotBindings,
-          main: isUnbinding ? null : nodeName,
+          main: isUnbinding ? null : mainExit,
+          dns: dnsExit !== undefined ? dnsExit : prev.slotBindings.dns,
         },
-        slotTargets: { ...prev.slotTargets, main: bundleState.view?.targets.find(t => t.name === nodeName) },
+        slotTargets: {
+          ...prev.slotTargets,
+          main: bundleState.view?.targets.find(t => t.name === mainExit),
+          dns: dnsExit && dnsExit !== "FOLLOW_MAIN" ? bundleState.view?.targets.find(t => t.name === dnsExit) : undefined,
+        },
         // 如果解除绑定，则自动停用；若选了有效节点，则自动开启强锁
         enabled: !isUnbinding,
       };
     });
     persistAndSync(next);
     showToast(
-      nodeName
-        ? `正在应用出口【${nodeName}】，请查看核心确认状态`
+      mainExit
+        ? `正在应用出口【${mainExit}】，请查看核心确认状态`
         : `正在解除绑定，请等待核心确认`
     );
   };
@@ -164,38 +148,15 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
     showToast("已移除本机规则包，正在确认核心规则已移除");
   };
 
-  // 方式 A：确认快捷绑定并开启
-  const handleConfirmQuickBind = (selectedNode: string) => {
-    if (!quickBindTarget) return;
-    const instanceId = quickBindTarget.instanceId;
-    const targetName = quickBindTarget.definition.packageName;
-
-    const next = updateBundleInstance(instanceId, (prev) => ({
-      ...prev,
-      slotBindings: {
-        ...prev.slotBindings,
-        main: selectedNode,
-      },
-      slotTargets: { ...prev.slotTargets, main: bundleState.view?.targets.find(t => t.name === selectedNode) },
-      enabled: true,
-    }));
-
-    persistAndSync(next);
-    setQuickBindTarget(null);
-    showToast(`正在为「${targetName}」应用出口【${selectedNode}】，请等待核心确认`);
-  };
-
   // 导入完成处理
   const handleImportConfirm = (
     bundle: BusinessBundleDefinition,
     autoEnable: boolean,
     boundNode: string | null
   ) => {
-    const newInst = installPresetBundle(bundle, autoEnable, boundNode);
+    installPresetBundle(bundle, autoEnable, boundNode);
     const next = getBundleInstances();
     persistAndSync(next);
-    // 自动展开新导入的行
-    setExpandedMap((prev) => ({ ...prev, [newInst.instanceId]: true }));
     setActiveTab("installed");
     showToast(
       autoEnable
@@ -207,46 +168,19 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
   // 预设中心装载
   const handleInstallFromPreset = (item: RepositoryPackage) => {
     const def = item.definition;
-    let newInst: BundleLocalInstance;
-    try { newInst = installPresetBundle(def, false, null, item.origin); }
+    try { installPresetBundle(def, false, null, item.origin); }
     catch (e) { showToast(e instanceof Error ? e.message : "装载失败，请重试"); return; }
     const next = getBundleInstances();
     persistAndSync(next);
-    setExpandedMap((prev) => ({ ...prev, [newInst.instanceId]: true }));
     setActiveTab("installed");
     showToast(`📦 已将「${def.packageName}」装载到本机列表（已停用跟随系统默认）！`);
   };
 
-  // 自定义工坊保存
-  const handleSaveCustomBundle = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!customName.trim()) {
-      showToast("⚠️ 请填写规则包名称");
-      return;
-    }
-    const exes = customExesText
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (exes.length === 0) {
-      showToast("⚠️ 请至少输入一个进程可执行文件名 (exe)");
-      return;
-    }
-    const domains = customDomainsText
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean);
-
-    const newInst = createCustomBundle(customName.trim(), exes, domains);
+  // 自定义工坊保存装载回调
+  const handleSaveCustomBundle = (_newInstance: BundleLocalInstance) => {
     const next = getBundleInstances();
     persistAndSync(next);
-
-    setCustomName("");
-    setCustomExesText("");
-    setCustomDomainsText("");
-    setExpandedMap((prev) => ({ ...prev, [newInst.instanceId]: true }));
     setActiveTab("installed");
-    showToast(`✨ 自定义规则包「${newInst.definition.packageName}」已创建并装载到本机！`);
   };
 
   // DNS 护航切换 (C01, C02: 防重入与 pending 反馈)
@@ -266,11 +200,12 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
   };
 
   // 保存二次编辑 (B03)
-  const handleSaveEdit = (updatedDef: BusinessBundleDefinition) => {
+  const handleSaveEdit = (updatedDef: BusinessBundleDefinition, processBindings?: BundleProcessBindings) => {
     if (!editingTarget) return;
     const next = updateBundleInstance(editingTarget.instanceId, (prev) => ({
       ...prev,
       definition: updatedDef,
+      processBindings,
       isModified: true,
     }));
     persistAndSync(next);
@@ -294,10 +229,10 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
     const activeInstances = instances.filter((i) => i.enabled && i.slotBindings.main);
     const exeCounts: Record<string, string[]> = {};
     for (const inst of activeInstances) {
-      const exes = new Set([
-        ...inst.definition.processes.map((p) => p.exe.toLowerCase()),
-        ...(inst.definition.additionalExes || []).map((e) => e.toLowerCase()),
-      ]);
+      const exes = new Set(bundleExes(inst.definition, os).flatMap(e => {
+        const paths = os === "android" ? [] : inst.processBindings?.[os]?.filter(b => processKey(b.exe, os) === processKey(e, os)) ?? [];
+        return paths.length ? paths.map(b => `路径 ${processKey(b.executablePath, os)}`) : [`名称 ${processKey(e, os)}`];
+      }));
       for (const exe of exes) {
         if (!exeCounts[exe]) exeCounts[exe] = [];
         exeCounts[exe].push(inst.definition.packageName);
@@ -322,12 +257,6 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
             <button type="button" disabled={bundleState.pending} onClick={() => persistAndSync(instances)} className="px-3 py-1 rounded border border-current disabled:opacity-50">重新应用</button>
           </div>
         )}
-        {bundleState.view?.running && Boolean(bundleState.view.tracking.warnings?.length) && (
-          <div role="status" aria-label="进程跟踪提示" className="p-3 rounded-xl border border-amber-300/70 bg-amber-50 dark:bg-amber-950/30 text-amber-900 dark:text-amber-200 text-xs break-words">
-            进程跟踪提示：{bundleState.view.tracking.warnings?.join("；")}。未核实的进程不会被标记为已接管。
-          </div>
-        )}
-        
         {/* 全局通知条 */}
         {bannerToast && (
           <div className="p-3 rounded-xl bg-indigo-600 text-white text-xs font-medium shadow-lg flex items-center justify-between animate-in fade-in">
@@ -345,67 +274,148 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
           </div>
         )}
 
-        {/* 顶部全局状态控制条 */}
-        <header className="flex flex-wrap items-center justify-between gap-4 p-4 rounded-2xl bg-white dark:bg-slate-900/90 border border-slate-200/80 dark:border-slate-800 shadow-sm dark:shadow-lg backdrop-blur-md transition-colors">
+        {/* 顶部全局状态与控制栏 (单行高度仅 ~42px) */}
+        <header className="px-3.5 py-2 rounded-2xl bg-white dark:bg-slate-900/90 border border-slate-200/80 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2.5 text-xs shrink-0 shadow-2xs relative z-30 backdrop-blur-md transition-colors">
+          {/* 左侧：全局分流总开关 + 底层接管模式下拉 + 核心状态 */}
           <div className="flex items-center space-x-3">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-500 to-purple-600 flex items-center justify-center text-xl shadow-md text-white">
-              <Package className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="flex items-center space-x-2">
-                <h1 className="text-base font-bold tracking-tight text-slate-900 dark:text-white">ProcWeaver 业务规则包中心</h1>
-                <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-indigo-500/10 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-400 border border-indigo-500/30">
-                  全控折叠架构
-                </span>
-              </div>
-              <p className="text-xs text-slate-500 dark:text-slate-400">独立启停开关 · 单包专属智能守护 · 语义插槽解耦装配</p>
-            </div>
-          </div>
-
-          {/* 全局健康状态 */}
-          <div className="flex flex-wrap items-center gap-3 text-xs">
-            <button type="button" role="switch" aria-label="业务包分流总开关"
+            {/* 业务包分流总开关 */}
+            <button
+              type="button"
+              role="switch"
+              aria-label="业务包分流总开关"
               aria-checked={bundleState.view?.config.bundlesEnabled !== false}
               disabled={!bundleState.view || bundleState.pending || Boolean(bundleState.readError)}
               onClick={() => void bundleController.setMasterEnabled(bundleState.view?.config.bundlesEnabled === false)}
-              className="flex items-center gap-2 px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 disabled:opacity-50 cursor-pointer">
-              <span>业务包分流 · {bundleState.masterPending ? "切换中" : bundleState.view?.config.bundlesEnabled === false ? "已暂停" : "已开启"}</span>
-              <span className={`relative w-9 h-5 rounded-full ${bundleState.view?.config.bundlesEnabled === false ? "bg-slate-300 dark:bg-slate-600" : "bg-emerald-500"}`}>
-                <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${bundleState.view?.config.bundlesEnabled === false ? "left-0.5" : "left-0.5 translate-x-4"}`} />
+              className="flex items-center space-x-2.5 px-1.5 py-1 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer select-none text-xs font-bold text-slate-800 dark:text-slate-200 disabled:opacity-50 transition"
+              title={bundleState.view?.config.bundlesEnabled === false ? "点击开启业务包分流" : "点击暂停业务包分流"}
+            >
+              {/* 1. 胶囊开关 */}
+              <span
+                aria-hidden="true"
+                className={`relative inline-flex items-center w-9 h-5 rounded-full shrink-0 transition-colors duration-200 ${
+                  bundleState.view?.config.bundlesEnabled === false
+                    ? "bg-slate-300 dark:bg-slate-600"
+                    : "bg-emerald-500 shadow-sm"
+                }`}
+              >
+                <span
+                  className={`inline-block w-4 h-4 rounded-full bg-white shadow-xs transition-transform duration-200 ${
+                    bundleState.view?.config.bundlesEnabled === false
+                      ? "translate-x-0.5"
+                      : "translate-x-[18px]"
+                  }`}
+                />
+              </span>
+
+              {/* 2. 状态指示灯 */}
+              <span
+                className={`w-2 h-2 rounded-full shrink-0 ${
+                  bundleState.masterPending
+                    ? "bg-amber-500 animate-pulse"
+                    : bundleState.view?.config.bundlesEnabled === false
+                    ? "bg-slate-400"
+                    : "bg-emerald-500 ring-2 ring-emerald-500/20"
+                }`}
+              />
+
+              {/* 3. 状态说明文字 */}
+              <span className="text-[11px] sm:text-xs">
+                业务包分流 · {bundleState.masterPending ? "切换中" : bundleState.view?.config.bundlesEnabled === false ? "已暂停" : "已开启"}
               </span>
             </button>
-            <div className="flex items-center space-x-2 px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
-              <span className={`w-2 h-2 rounded-full ${bundleState.view?.running && !bundleState.readError ? "bg-emerald-500" : "bg-slate-400"}`} />
-              <span className="text-slate-700 dark:text-slate-300 font-medium">{bundleState.readError ? "核心状态读取失败" : bundleState.view?.running ? "Mihomo 核心运行中" : "核心尚未运行或未确认"}</span>
-              <span className="text-slate-300 dark:text-slate-600">|</span>
+
+            <span className="h-3.5 w-px bg-slate-200 dark:bg-slate-700 hidden sm:inline-block" />
+
+            {/* 全局底层接管模式下拉选择器 (WinDivert / TUN / 智能双模式 / 纯应用层) */}
+            {platform.os === "windows" && (
+              <TrafficModeSelector
+                variant="compact"
+                onModeChanged={() => { void bundleController.refresh(); }}
+              />
+            )}
+
+            {/* 模式说明信息按钮 (点击查看模式架构说明与 WinDivert 优缺点) */}
+            {platform.os === "windows" && (
               <button
                 type="button"
-                onClick={handleToggleDns}
-                disabled={isDnsPending}
-                className={`font-medium transition ${
-                  isDnsPending ? "opacity-60 cursor-wait" : "cursor-pointer"
-                } ${
-                  dnsGuardEnabled ? "text-emerald-600 dark:text-emerald-400" : "text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200"
-                }`}
-                title="开启后将 Windows 网卡首选 DNS 指向本地 127.0.0.1 核心以抵御污染"
+                onClick={() => setIsModeGuideOpen(true)}
+                className="h-7 w-7 rounded-lg bg-slate-100 hover:bg-slate-200/80 dark:bg-slate-800 dark:hover:bg-slate-750 border border-slate-200 dark:border-slate-700 text-slate-500 hover:text-indigo-600 dark:text-slate-400 dark:hover:text-indigo-400 flex items-center justify-center transition shadow-2xs cursor-pointer shrink-0"
+                title="查看各底层接管模式说明及 WinDivert 优缺点"
+                aria-label="模式说明"
               >
-                {isDnsPending
-                  ? "⏳ DNS 切换中..."
-                  : dnsGuardEnabled
-                  ? "🛡️ DNS 防投毒已护航"
-                  : "⚪ DNS 护航未开启"}
+                <HelpCircle className="w-3.5 h-3.5" />
               </button>
+            )}
+
+            {/* 核心正常状态小绿点 */}
+            <div className="hidden sm:flex items-center space-x-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+              <span className={`w-2 h-2 rounded-full ${bundleState.view?.running && !bundleState.readError ? "bg-emerald-500" : "bg-slate-400"}`} />
+              <span>{bundleState.readError ? "核心异常" : bundleState.view?.running ? "核心正常" : "核心未运行"}</span>
             </div>
+          </div>
+
+          {/* 右侧：DNS 护航开关 + 冲突体检 + 进程跟踪说明悬停气泡 */}
+          <div className="flex items-center space-x-2">
+            {/* DNS 护航 */}
+            <button
+              type="button"
+              onClick={handleToggleDns}
+              disabled={!platform.dnsGuard || isDnsPending}
+              className={`px-2.5 py-1 rounded-xl bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 hover:border-slate-300 dark:hover:border-slate-600 text-xs font-medium flex items-center space-x-1.5 shadow-2xs transition ${
+                isDnsPending ? "opacity-60 cursor-wait" : "cursor-pointer"
+              } ${
+                dnsGuardEnabled ? "text-emerald-600 dark:text-emerald-400 border-emerald-300 dark:border-emerald-700/60" : "text-slate-600 dark:text-slate-400"
+              }`}
+              title={platform.dnsGuard ? "开启后将 Windows 网卡首选 DNS 指向本地核心" : "macOS 首版不修改网卡 DNS；核心 DNS 策略仅作用于进入核心的查询"}
+            >
+              <span>🛡️</span>
+              <span>DNS护航: <strong className={dnsGuardEnabled ? "text-emerald-600 dark:text-emerald-400" : "text-slate-700 dark:text-slate-300"}>
+                {!platform.dnsGuard ? "暂不支持" : isDnsPending ? "切换中..." : dnsGuardEnabled ? "已护航" : "关闭"}
+              </strong></span>
+            </button>
+
+            {/* 冲突体检 */}
             <button
               type="button"
               onClick={handleConflictCheck}
-              className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-750 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 cursor-pointer transition shadow-2xs"
+              className="px-2.5 py-1 rounded-xl bg-slate-50 dark:bg-slate-800/80 hover:bg-slate-100 dark:hover:bg-slate-750 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 cursor-pointer transition text-xs font-medium flex items-center space-x-1 shadow-2xs"
             >
-              🔍 冲突体检
+              <span>🔍</span>
+              <span>冲突体检</span>
             </button>
+
+            {/* 进程跟踪说明悬停气泡 (替代原大黄条) */}
+            <div className="relative group">
+              <button
+                type="button"
+                className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold transition cursor-help ${
+                  bundleState.view?.running && Boolean(bundleState.view.tracking.warnings?.length)
+                    ? "text-amber-500 hover:bg-amber-500/10"
+                    : "text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+                }`}
+                aria-label="进程跟踪说明"
+              >
+                {bundleState.view?.running && Boolean(bundleState.view.tracking.warnings?.length) ? "⚠️" : "ⓘ"}
+              </button>
+              <div className="hidden group-hover:block absolute right-0 top-7 z-50 w-72 bg-slate-800 dark:bg-slate-900 text-white text-[11px] p-2.5 rounded-xl shadow-xl leading-relaxed border border-slate-700 dark:border-slate-800 pointer-events-none">
+                <span className="font-bold text-amber-300 block mb-1">
+                  {bundleState.view?.running && Boolean(bundleState.view.tracking.warnings?.length)
+                    ? "进程跟踪提示："
+                    : "进程跟踪说明："}
+                </span>
+                {bundleState.view?.running && Boolean(bundleState.view.tracking.warnings?.length)
+                  ? `${bundleState.view.tracking.warnings?.join("；") ?? ""}。未核实的进程不会被标记为已接管。`
+                  : "部分短命或受系统保护的后台进程无法直接核验身份；未核实归属的进程不会被强制标记为已接管。"}
+              </div>
+            </div>
           </div>
         </header>
-        {bundleState.view?.config.bundlesEnabled === false && <p className="text-xs text-slate-500 dark:text-slate-400">业务包已暂停，单包设置与快捷方式保留，新连接沿用原有规则。已有连接可能继续使用原出口。</p>}
+
+        {bundleState.view?.config.bundlesEnabled === false && (
+          <p className="text-xs text-amber-600 dark:text-amber-400 px-1">
+            业务包已暂停，单包设置与快捷方式保留，新连接沿用原有规则。已有连接可能继续使用原出口。
+          </p>
+        )}
 
         {/* 主导航切换器与动作区 */}
         <nav className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
@@ -458,17 +468,8 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
             </button>
           </div>
 
-          {/* 右侧动作区：一键折叠/展开 & 导入向导 */}
+          {/* 右侧动作区：导入向导 */}
           <div className="flex items-center space-x-2 text-xs">
-            {activeTab === "installed" && (
-              <button
-                type="button"
-                onClick={handleToggleAll}
-                className="px-3 py-1.5 rounded-xl font-medium bg-white hover:bg-slate-100 dark:bg-slate-900 dark:hover:bg-slate-850 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-800 shadow-2xs flex items-center space-x-1 cursor-pointer transition"
-              >
-                <span>{allExpanded ? "↕️ 全部折叠" : "↕️ 全部展开"}</span>
-              </button>
-            )}
             <button
               type="button"
               onClick={() => setIsImportOpen(true)}
@@ -482,7 +483,7 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
 
         {/* ================= 视图 1：已装载套件列表 ================= */}
         {activeTab === "installed" && (
-          <main className="space-y-3.5">
+          <main className="space-y-2.5">
             {instances.length === 0 ? (
               <div className="p-12 text-center rounded-2xl bg-white dark:bg-slate-900/60 border border-slate-200/80 dark:border-slate-800 space-y-3 shadow-xs">
                 <div className="text-3xl">📦</div>
@@ -499,35 +500,45 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
                 </button>
               </div>
             ) : (
-              instances.map((instance, idx) => (
-                <BundleRow
-                  key={instance.instanceId}
-                  instance={instance}
-                  status={getBundleStatus(instance, bundleState)}
-                  entry={entryStates[instance.instanceId]}
-                  onLaunch={() => void bundleTools.launch({ instanceId: instance.instanceId })}
-                  onShortcuts={() => void bundleTools.shortcuts(instance.instanceId)}
-                  availableProxies={availableProxies}
-                  proxyLabels={bundleState.view?.targetLabels}
-                  preservedBinding={bundleState.view?.preservedTargets?.some(target => {
-                    const stored = instance.slotTargets?.main;
-                    return stored && target.profileId === stored.profileId && target.kind === stored.kind && target.name === stored.name;
-                  })}
-                  isExpanded={Boolean(expandedMap[instance.instanceId])}
-                  onToggleExpand={() => handleToggleExpand(instance.instanceId)}
-                  onToggleSwitch={handleToggleSwitch}
-                  onTriggerQuickBind={(inst) => setQuickBindTarget(inst)}
-                  onSelectNodeChange={handleSelectNodeChange}
-                  onChangeWatcherMode={handleChangeWatcherMode}
-                  onEdit={(inst) => setEditingTarget(inst)}
-                  onExport={(inst) => setExportTarget(inst)}
-                  onDelete={handleDeleteInstance}
-                  onMoveUp={() => handleMoveInstance(idx, "up")}
-                  onMoveDown={() => handleMoveInstance(idx, "down")}
-                  canMoveUp={idx > 0}
-                  canMoveDown={idx < instances.length - 1}
-                />
-              ))
+              <>
+                {/* 列表表头 */}
+                <div className="flex items-center justify-between px-4 py-1 text-[11px] font-bold text-slate-400 dark:text-slate-500 select-none">
+                  <div className="flex items-center space-x-3.5">
+                    <span className="w-10 text-center">开关</span>
+                    <span>业务应用 / 规则包</span>
+                  </div>
+                  <div className="flex items-center space-x-6 pr-2">
+                    <span className="hidden sm:inline">模式</span>
+                    <span className="w-[170px] text-left pl-2">出站出口</span>
+                    <span className="w-16 text-center">操作</span>
+                  </div>
+                </div>
+
+                {/* 列表项 */}
+                <div className="space-y-2">
+                  {instances.map((instance, idx) => (
+                    <BundleRow
+                      key={instance.instanceId}
+                      instance={instance}
+                      status={getBundleStatus(instance, bundleState)}
+                      entry={entryStates[instance.instanceId]}
+                      proxyLabels={bundleState.view?.targetLabels}
+                      onLaunch={() => void bundleTools.launch({ instanceId: instance.instanceId })}
+                      onShortcuts={() => void bundleTools.shortcuts(instance.instanceId)}
+                      onToggleSwitch={handleToggleSwitch}
+                      onOpenSelectExit={(inst) => setSelectExitTarget(inst)}
+                      onOpenDetail={(inst) => setDetailTarget(inst)}
+                      onEdit={(inst) => setEditingTarget(inst)}
+                      onExport={(inst) => setExportTarget(inst)}
+                      onDelete={handleDeleteInstance}
+                      onMoveUp={() => handleMoveInstance(idx, "up")}
+                      onMoveDown={() => handleMoveInstance(idx, "down")}
+                      canMoveUp={idx > 0}
+                      canMoveDown={idx < instances.length - 1}
+                    />
+                  ))}
+                </div>
+              </>
             )}
           </main>
         )}
@@ -538,84 +549,44 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
           onSave={repositories.actions.upsert} onToggle={repositories.actions.toggle} onRemove={repositories.actions.remove}
           onInstall={handleInstallFromPreset} repositoryLink={repositoryPage} />}
 
-        {/* ================= 视图 3：自定义工坊 ================= */}
+        {/* ================= 视图 3：自定义工坊 (全新重构) ================= */}
         {activeTab === "studio" && (
-          <section className="space-y-4">
-            <div className="p-5 rounded-2xl bg-white dark:bg-slate-900/90 border border-slate-200/80 dark:border-slate-800 space-y-4 text-xs shadow-xs dark:shadow-md">
-              <div>
-                <h2 className="text-base font-bold text-slate-900 dark:text-white flex items-center space-x-2">
-                  <Wrench className="w-4 h-4 text-indigo-500 dark:text-indigo-400" />
-                  <span>业务规则包工坊</span>
-                </h2>
-                <p className="text-slate-500 dark:text-slate-400 mt-1">
-                  定义好您的进程和域名规则后，一键生成抽象语义插槽，可保存到本机或导出为脱敏纯净的 .pwpack.json 规则包。
-                </p>
-              </div>
-
-              <form onSubmit={handleSaveCustomBundle} className="space-y-3">
-                <div>
-                  <label className="block text-slate-700 dark:text-slate-300 font-bold mb-1">规则包名称：</label>
-                  <input
-                    type="text"
-                    required
-                    value={customName}
-                    onChange={(e) => setCustomName(e.target.value)}
-                    placeholder="例如：跨国商务通讯套件 或 全栈开发工具箱"
-                    className="w-full bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-xl p-2.5 text-slate-900 dark:text-white focus:bg-white dark:focus:bg-slate-950 focus:border-indigo-500 focus:outline-none transition-colors"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-slate-700 dark:text-slate-300 font-bold mb-1">
-                    进程列表（每行一个可执行程序文件名）：
-                  </label>
-                  <textarea
-                    rows={4}
-                    required
-                    value={customExesText}
-                    onChange={(e) => setCustomExesText(e.target.value)}
-                    placeholder={"Telegram.exe\nSlack.exe\nzoom.exe"}
-                    className="w-full bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-xl p-2.5 text-slate-900 dark:text-white font-mono focus:bg-white dark:focus:bg-slate-950 focus:border-indigo-500 focus:outline-none transition-colors"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-slate-700 dark:text-slate-300 font-bold mb-1">
-                    匹配域名群（可选，每行一个域名）：
-                  </label>
-                  <textarea
-                    rows={3}
-                    value={customDomainsText}
-                    onChange={(e) => setCustomDomainsText(e.target.value)}
-                    placeholder={"telegram.org\nslack.com\nzoom.us"}
-                    className="w-full bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-xl p-2.5 text-slate-900 dark:text-white font-mono focus:bg-white dark:focus:bg-slate-950 focus:border-indigo-500 focus:outline-none transition-colors"
-                  />
-                </div>
-
-                <div className="pt-2 flex justify-end">
-                  <button
-                    type="submit"
-                    className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold cursor-pointer transition shadow-md flex items-center space-x-1.5"
-                  >
-                    <Plus className="w-4 h-4" />
-                    <span>保存并装载到本机列表</span>
-                  </button>
-                </div>
-              </form>
-            </div>
-          </section>
+          <BundleStudio
+            os={os}
+            existingInstances={instances}
+            availableProxies={availableProxies}
+            proxyLabels={bundleState.view?.targetLabels}
+            processTreeSupported={Boolean(platform.processTree)}
+            onSave={handleSaveCustomBundle}
+            showToast={showToast}
+          />
         )}
 
       </div>
 
-      {/* 方式 A：快捷指定出口节点弹窗 */}
-      <QuickBindModal
-        isOpen={Boolean(quickBindTarget)}
-        bundleInstance={quickBindTarget}
+      {/* 业务出口选择弹窗 (弹窗形式选择出口) */}
+      <SelectExitModal
+        isOpen={Boolean(selectExitTarget)}
+        instance={selectExitTarget}
         availableProxies={availableProxies}
         proxyLabels={bundleState.view?.targetLabels}
-        onConfirm={handleConfirmQuickBind}
-        onCancel={() => setQuickBindTarget(null)}
+        onConfirm={handleSelectExitConfirm}
+        onCancel={() => setSelectExitTarget(null)}
+      />
+
+      {/* 业务包详情与运行状态审计弹窗 (原第二张图信息) */}
+      <BundleDetailModal
+        isOpen={Boolean(detailTarget)}
+        instance={detailTarget}
+        status={detailTarget ? getBundleStatus(detailTarget, bundleState) : undefined}
+        entry={detailTarget ? entryStates[detailTarget.instanceId] : undefined}
+        proxyLabels={bundleState.view?.targetLabels}
+        onChangeWatcherMode={handleChangeWatcherMode}
+        onShortcuts={(id) => void bundleTools.shortcuts(id)}
+        onLaunch={(id) => void bundleTools.launch({ instanceId: id })}
+        onEdit={(inst) => setEditingTarget(inst)}
+        onOpenSelectExit={(inst) => setSelectExitTarget(inst)}
+        onClose={() => setDetailTarget(null)}
       />
 
       {/* 导入向导弹窗 */}
@@ -640,6 +611,14 @@ export const BusinessBundleView: React.FC<Props> = ({ mode: _mode }) => {
         bundleInstance={editingTarget}
         onSave={handleSaveEdit}
         onCancel={() => setEditingTarget(null)}
+      />
+
+      {/* 接管模式说明及 WinDivert 优缺点详解弹窗 */}
+      <TrafficModeGuideModal
+        isOpen={isModeGuideOpen}
+        onClose={() => setIsModeGuideOpen(false)}
+        onConfirm={() => setIsModeGuideOpen(false)}
+        currentMode="windivert_v1"
       />
     </div>
   );

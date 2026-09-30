@@ -5,6 +5,39 @@ fn target(name: &str) -> Target { Target { profile_id: "default".into(), kind: "
 fn config() -> Overrides { Overrides { process_enabled: true, process_rules: vec![rule(r"C:\apps\root.exe")], ..Overrides::default() } }
 const RAW: &str = "proxies:\n- {name: node, type: socks5, server: 127.0.0.1, port: 1, udp: false}\nrules: ['DOMAIN,example.net,DIRECT', 'MATCH,DIRECT']\n";
 
+#[cfg(windows)]
+#[test]
+fn picked_program_files_path_preserves_rules_and_rejects_delimiters() {
+    let path = r"C:\Program Files (x86)\Reader\reader.exe";
+    let mut c = config();
+    c.process_rules[0].id = "bundle-reader-picked".into();
+    c.process_rules[0].label = "阅读器".into();
+    c.process_rules[0].match_value = path.into();
+    c.bundles.push(BundleRoute { id: "reader".into(), name: "阅读器".into(), main_exe: path.into(), enabled: true,
+        main_target: Some(target("node")), dns_target: None, port: 34000, mode: "sandbox".into(), domains: vec!["example.test".into()], fallback: "rules".into() });
+    let text = composer::compose(RAW, &c, "default", &[]).unwrap();
+    assert!(text.contains(path));
+    let yaml: Value = serde_yaml::from_str(&text).unwrap();
+    let contexts = crate::capture::windivert::context::compile(&yaml, &[
+        crate::capture::windivert::context::ProcessContext { id: "picked".into(), executable_path: path.into() },
+        crate::capture::windivert::context::ProcessContext { id: "other".into(), executable_path: r"D:\Reader\reader.exe".into() },
+    ]).unwrap();
+    assert!(contexts[0].rules.iter().any(|r| r == "DOMAIN,example.test,node"));
+    assert!(!contexts[1].rules.iter().any(|r| r.contains("example.test")));
+    // Parse with the bundled real core without opening ports or a driver.
+    use std::os::windows::process::CommandExt;
+    let dir = std::env::temp_dir().join(format!("procweaver-picker-rules-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_file = dir.join("config.yaml"); std::fs::write(&config_file, &text).unwrap();
+    let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("binaries/mihomo-compatible.exe");
+    let result = std::process::Command::new(core).args(["-t", "-f"]).arg(&config_file).arg("-d").arg(&dir).creation_flags(0x08000000).output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stdout));
+    for invalid in [r"C:\Reader)\reader.exe", r"C:\Reader\reader.exe),MATCH,DIRECT"] {
+        c.process_rules[0].match_value = invalid.into(); assert!(model::normalize(c.clone()).is_err());
+    }
+}
+
 #[test]
 fn bundle_master_and_manual_switches_are_independent() {
     let mut c = config();
@@ -372,6 +405,81 @@ rules:
 
 #[cfg(windows)]
 #[test]
+fn native_monitor_discovers_existing_and_external_targets_with_core_stopped() {
+    const FLAG:&str="PROCWEAVER_MONITOR_NATIVE_TEST";
+    if std::env::var_os(FLAG).is_none() {
+        let status=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","routing_overrides::tests::native_monitor_discovers_existing_and_external_targets_with_core_stopped","--nocapture"])
+            .env(FLAG,"1").status().unwrap();
+        assert!(status.success()); return;
+    }
+    use std::os::windows::process::CommandExt;
+    struct OwnedProcess(std::process::Child);
+    impl Drop for OwnedProcess { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+    struct Observer(tokio::task::JoinHandle<()>);
+    impl Drop for Observer { fn drop(&mut self) {
+        self.0.abort();
+        tracker::ENABLED.store(false, Ordering::Release);
+    } }
+    let spawn=|| OwnedProcess(std::process::Command::new("pwsh").args(["-NoLogo","-NoProfile","-Command","Start-Sleep -Seconds 30"])
+        .creation_flags(0x08000000).spawn().unwrap());
+    let wait=|check:&dyn Fn()->bool| {
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(12);
+        while std::time::Instant::now()<deadline { if check() {return true;} std::thread::sleep(std::time::Duration::from_millis(100)); }
+        false
+    };
+    assert!(!crate::commands::process::ACTIVE.load(Ordering::SeqCst));
+    let existing=spawn();
+    let mut c=config(); c.process_rules[0].match_kind="name".into(); c.process_rules[0].match_value="pwsh.exe".into(); c.process_rules[0].include_descendants=false;
+    c.process_rules[0].action="direct".into(); c.process_rules[0].target=None;
+    let executable=native::inspect(existing.0.id(),0,"pwsh.exe".into()).executable_path.unwrap();
+    for (id,port) in [("monitor-a",34011),("monitor-b",34012)] {
+        c.bundles.push(serde_json::from_value(serde_json::json!({"id":id,"name":id,"mainExe":executable,"enabled":true,"mainTarget":target("fixture-node"),"dnsTarget":null,"port":port,"mode":"strict"})).unwrap());
+    }
+    c=model::normalize(c).unwrap();
+    let dir=std::env::temp_dir().join(format!("procweaver-monitor-{}",std::process::id()));
+    std::fs::create_dir_all(dir.join("config")).unwrap();
+    crate::storage::initialize_test(dir.clone(),std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().into());
+    let bytes=serde_json::to_vec(&c).unwrap(); std::fs::write(path(),&bytes).unwrap();
+    let runtime=tokio::runtime::Runtime::new().unwrap();
+    // Verify snapshot-only degradation before creating a real event observer.
+    // Aborting the async coordinator does not join its WMI thread: re-enabling
+    // ENABLED immediately after abort would let a late heartbeat race this check.
+    tracker::ENABLED.store(true, Ordering::Release); tracker::disconnected("测试订阅中断");
+    tracker::reconcile(native::snapshot().unwrap(),false);
+    let observation=tracker::observation();
+    assert_eq!(observation.state,tracker::MonitorState::Degraded); assert!(observation.entries.iter().any(|p|p.pid==existing.0.id()));
+    assert!(!crate::commands::process::ACTIVE.load(Ordering::SeqCst));
+    tracker::ENABLED.store(false,Ordering::Release);
+    let notifications=std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter=notifications.clone();
+    let observer=Observer(runtime.spawn(tracker::run(move|_| {counter.fetch_add(1,Ordering::Relaxed);} )));
+    assert!(wait(&||tracker::status(&c).subscribed), "WMI 订阅未就绪");
+    assert!(tracker::observation().entries.iter().any(|p|p.pid==existing.0.id()), "启动监控前的目标未补扫");
+    let future=spawn();
+    assert!(wait(&||tracker::observation().entries.iter().any(|p|p.pid==future.0.id() && p.name.eq_ignore_ascii_case("pwsh.exe"))), "外部入口启动的目标未发现");
+    assert!(tracker::status(&c).derived.is_empty(), "主目标启动不应生成多余派生规则");
+    let states=runtime.block_on(crate::commands::bundle_launch::get_bundle_entry_states(vec!["monitor-a".into(),"monitor-b".into()])).unwrap();
+    assert_eq!(states.len(),2);
+    for state in &states {
+        assert_eq!(state.identity_state,"path_verified");
+        assert!(matches!(state.state.as_str(),"restart_required"|"partial"),"普通外部启动尚未携带本包参数：{}",state.message);
+        assert!(!state.instance_key.is_empty()); assert_eq!(state.connection_state,"core_stopped");
+    }
+    let partial=runtime.block_on(crate::commands::bundle_launch::get_bundle_entry_states(vec!["monitor-b".into()])).unwrap();
+    assert_eq!(partial.len(),1); assert_eq!(partial[0].instance_id,"monitor-b");
+    let pid=future.0.id(); drop(future);
+    assert!(wait(&||!tracker::observation().entries.iter().any(|p|p.pid==pid)), "退出目标未移除");
+    assert!(wait(&||notifications.load(Ordering::Relaxed)>1), "目标变化没有通知界面");
+    assert_eq!(std::fs::read(path()).unwrap(),bytes);
+    assert_eq!(std::fs::read_dir(dir.join("config")).unwrap().count(),1,"核心关闭时不得生成运行配置");
+    c.process_enabled=false; c.bundles_enabled=false; std::fs::write(path(),serde_json::to_vec(&c).unwrap()).unwrap();
+    assert!(wait(&||!tracker::ENABLED.load(Ordering::Acquire) && tracker::observation().entries.is_empty()),"关闭规则未停止监控并清除快照");
+    drop(observer);
+}
+
+#[cfg(windows)]
+#[test]
 fn native_events_discover_future_child_without_open_page() {
     use std::os::windows::process::CommandExt;
     tracker::ENABLED.store(true, Ordering::Release);
@@ -519,7 +627,7 @@ fn native_save_revision_rollback_and_dns_proxy_egress() {
         assert_eq!(std::fs::read(path()).unwrap(), original); assert_eq!(std::fs::read(dir.join("core_data/config.yaml")).unwrap(), before_runtime);
         // 未来子进程在没有页面的情况下由后台任务生成并热加载路径规则。
         use std::os::windows::process::CommandExt;
-        let background = tokio::spawn(tracker::run());
+        let background = tokio::spawn(tracker::run(|_| {}));
         let mut child = std::process::Command::new("pwsh").args(["-NoProfile", "-Command", "Start-Sleep -Seconds 20"]).creation_flags(0x08000000).spawn().unwrap();
         let started = tokio::time::Instant::now(); let mut inherited = false;
         while started.elapsed().as_secs() < 12 {

@@ -35,8 +35,11 @@ pub fn set_tun_escalated(val: bool) {
 /// 获取当前系统物理上正在生效的接管驱动类型
 /// 返回: "app_proxy" | "tun"
 pub fn get_active_driver_name() -> String {
+    if !crate::platform::supports_tun() { return "app_proxy".into(); }
     let settings = crate::commands::settings::get_general_settings().unwrap_or_default();
     match settings.traffic_mode.as_str() {
+        #[cfg(windows)]
+        "windivert_v1" => if super::windivert::session::stats().active { "windivert".into() } else { "windivert_pending".into() },
         "tun" => "tun".to_string(),
         "smart_hybrid" => {
             if is_tun_escalated() {
@@ -50,6 +53,7 @@ pub fn get_active_driver_name() -> String {
 }
 
 async fn set_mihomo_tun(enable: bool) -> bool {
+    if !crate::platform::supports_smart_hybrid() { return false; }
     if let Ok(settings) = crate::commands::settings::get_general_settings() {
         let port = settings.controller_port;
         let client = crate::commands::mihomo_api::controller_client()
@@ -77,6 +81,7 @@ async fn set_mihomo_tun(enable: bool) -> bool {
 
 /// 智能双模式后台仲裁器主循环
 pub async fn run_arbiter() {
+    if !crate::platform::supports_smart_hybrid() { return; }
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 

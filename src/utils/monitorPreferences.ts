@@ -12,5 +12,5 @@ export function subscribeMonitorPreferences(cb: () => void) {
   listeners.add(cb);
   return () => { listeners.delete(cb); };
 }
-export const monitorInterval = () => lowPower ? 2500 : 1000;
+export const monitorInterval = () => lowPower || (typeof document !== "undefined" && document.documentElement.dataset.platform === "android") ? 2500 : 1000;
 export const logFlushInterval = () => lowPower ? 750 : 250;

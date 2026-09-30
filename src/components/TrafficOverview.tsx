@@ -6,9 +6,10 @@ interface Props {
   reading: TrafficReading;
   onlyProxy: boolean;
   error: string;
+  nativeTotals?: boolean;
 }
 
-export const TrafficOverview: React.FC<Props> = ({ reading, onlyProxy, error }) => {
+export const TrafficOverview: React.FC<Props> = ({ reading, onlyProxy, error, nativeTotals = false }) => {
   const { upSpeed, downSpeed, download: totalDownload, upload: totalUpload } = reading;
 
   const formatSpeed = (bytesPerSec: number) => {
@@ -37,14 +38,14 @@ export const TrafficOverview: React.FC<Props> = ({ reading, onlyProxy, error }) 
         <div className="flex items-center space-x-2 text-[11px]">
           <span className="inline-flex items-center space-x-1.5 px-2.5 py-0.5 rounded-full bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700/60 text-slate-600 dark:text-slate-400">
             <span className={`w-1.5 h-1.5 rounded-full ${downSpeed > 0 || upSpeed > 0 ? "bg-emerald-500 animate-pulse" : "bg-slate-400 dark:bg-slate-500"}`} />
-            <span>{onlyProxy ? "仅代理 · 连接采样" : "全流量 · 含直连"}</span>
+            <span>{onlyProxy ? (nativeTotals ? "仅代理 · 本次连接累计" : "仅代理 · 连接采样") : "全流量 · 含直连"}</span>
           </span>
           {error && <span className="text-rose-500 dark:text-rose-400 font-mono">({error})</span>}
         </div>
       </div>
 
       {/* 4 列流量指标卡片 */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="mobile-traffic-grid grid grid-cols-2 md:grid-cols-4 gap-4">
         {/* 1. 实时下行 */}
         <div className="bg-white/90 dark:bg-slate-900/80 border border-slate-200/90 dark:border-slate-800/80 hover:border-cyan-500/40 dark:hover:border-cyan-500/40 rounded-2xl p-4 shadow-sm dark:shadow-lg transition-all duration-200 group">
           <div className="flex items-center justify-between mb-2">

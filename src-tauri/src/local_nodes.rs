@@ -52,7 +52,7 @@ pub fn get_local_nodes() -> Result<View, String> { Ok(view(&read()?)) }
 #[tauri::command]
 pub fn get_local_node(id: String) -> Result<Node, String> { read()?.nodes.into_iter().find(|n| n.id == id).ok_or("本地节点已不存在".into()) }
 
-fn check_store(store: &Store) -> Result<(), String> {
+pub(crate) fn check_store(store: &Store) -> Result<(), String> {
     if store.nodes.len() > 256 { return Err("本地节点最多 256 个".into()); }
     let mut ids = HashSet::new(); let mut names = HashSet::new();
     for node in &store.nodes {

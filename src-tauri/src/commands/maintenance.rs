@@ -170,7 +170,7 @@ pub async fn check_app_update(
         for asset in assets {
             let name = asset.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let lower = name.to_lowercase();
-            if lower.ends_with(".zip") && (lower.contains("portable") || lower.contains("procweaver")) {
+            if cfg!(windows) && lower.ends_with(".zip") && !lower.contains("macos") && !lower.contains("darwin") && (lower.contains("portable") || lower.contains("procweaver")) {
                 asset_name = Some(name.to_string());
                 download_url = asset.get("browser_download_url").and_then(|v| v.as_str()).map(|s| s.to_string());
                 asset_size_bytes = asset.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -182,7 +182,13 @@ pub async fn check_app_update(
             for asset in assets {
                 let name = asset.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let lower = name.to_lowercase();
-                if lower.ends_with(".zip") || lower.ends_with(".exe") || lower.ends_with(".msi") {
+                let mac_arch: &[&str] = if cfg!(target_arch = "aarch64") { &["aarch64", "arm64"] } else { &["x86_64", "amd64", "x64"] };
+                let supported = if cfg!(target_os = "macos") {
+                    lower.ends_with(".dmg") && (mac_arch.iter().any(|arch| lower.contains(arch)) || lower.contains("universal"))
+                } else if cfg!(target_os = "android") {
+                    lower.ends_with(".apk") && !lower.contains("debug") && !lower.contains("unsigned") && (lower.contains("arm64") || lower.contains("aarch64") || lower.contains("universal"))
+                } else { lower.ends_with(".exe") || lower.ends_with(".msi") || lower.ends_with(".zip") && !lower.contains("macos") && !lower.contains("darwin") };
+                if supported {
                     asset_name = Some(name.to_string());
                     download_url = asset.get("browser_download_url").and_then(|v| v.as_str()).map(|s| s.to_string());
                     asset_size_bytes = asset.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -240,6 +246,16 @@ pub async fn download_app_update(
     file_name: String,
     state: State<'_, CoreStateMutex>,
 ) -> Result<String, String> {
+    if file_name.is_empty() || file_name.len() > 200 || file_name.contains(['/', '\\', ':', '\0']) || file_name == "." || file_name == ".." {
+        return Err("更新文件名无效".into());
+    }
+    #[cfg(target_os = "android")]
+    {
+        let url = reqwest::Url::parse(&download_url).map_err(|_| "更新地址无效")?;
+        if url.scheme() != "https" || url.host_str() != Some("github.com") || !url.path().starts_with("/jojhaa/ProcWeaver/releases/download/") || !file_name.ends_with(".apk") {
+            return Err("仅接受官方仓库的 Android APK 更新".into());
+        }
+    }
     let base_dir = crate::commands::profile::get_base_dir();
     let cache_dir = base_dir.join(".update_cache");
     std::fs::create_dir_all(&cache_dir).map_err(|e| format!("创建更新缓存目录失败: {}", e))?;
@@ -258,22 +274,40 @@ pub async fn download_app_update(
         return Err(format!("下载更新包失败: HTTP {}", response.status()));
     }
 
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| format!("读取更新包数据失败: {}", e))? {
-        bytes.extend_from_slice(&chunk);
+    let temporary = dest_path.with_extension("download");
+    use std::io::Write;
+    let mut file = std::fs::File::create(&temporary).map_err(|_| "创建更新临时文件失败")?;
+    let result = async {
+    let mut received = 0usize;
+    while let Some(chunk) = response.chunk().await.map_err(|_| "读取更新包数据失败".to_string())? {
+        received += chunk.len();
+        if received > 512 * 1024 * 1024 { return Err("更新文件超过 512 MB".to_string()); }
+        file.write_all(&chunk).map_err(|_| "写入更新文件失败")?;
     }
 
-    if bytes.is_empty() {
+    if received == 0 {
         return Err("下载的更新包为空".into());
     }
 
-    std::fs::write(&dest_path, &bytes).map_err(|e| format!("保存更新包失败: {}", e))?;
+    file.sync_all().map_err(|_| "保存更新包失败")?;
+    Ok::<(), String>(())
+    }.await;
+    drop(file);
+    if let Err(error) = result { let _ = std::fs::remove_file(&temporary); return Err(error); }
+    if dest_path.exists() { std::fs::remove_file(&dest_path).map_err(|_| "替换更新缓存失败")?; }
+    std::fs::rename(&temporary, &dest_path).map_err(|_| "保存更新包失败")?;
     Ok(dest_path.to_string_lossy().to_string())
 }
 
 /// 执行客户端更新替换安装（便携模式保护：绝不碰 data/ 目录）
 #[tauri::command]
 pub async fn install_app_update(archive_path: String) -> Result<bool, String> {
+    #[cfg(target_os = "android")]
+    {
+        let _: serde_json::Value = crate::platform::android::call_async("installUpdate", serde_json::json!({"path":archive_path})).await?;
+        return Ok(true);
+    }
+    if !cfg!(windows) { return Err("macOS 请从版本页面下载对应架构的 DMG，退出应用后替换安装；当前不支持应用内覆盖安装".into()); }
     let archive = PathBuf::from(&archive_path);
     if !archive.exists() {
         return Err("更新包文件不存在".into());
@@ -398,6 +432,18 @@ pub async fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
 pub async fn get_mihomo_core_detail(
     state: State<'_, CoreStateMutex>,
 ) -> Result<MihomoCoreDetail, String> {
+    #[cfg(target_os = "android")]
+    {
+        let status = crate::commands::process::get_core_status(state).await?;
+        let info: serde_json::Value = crate::platform::android::call_async("stats", ()).await?;
+        let version = info["version"].as_str().ok_or("Android 核心未返回版本")?.to_owned();
+        return Ok(MihomoCoreDetail { active_core_mode: "standard".into(), active_core_path: None,
+            core_version_raw: format!("Mihomo {version} Android ARM64"), core_version_tag: version,
+            cpu_arch: std::env::consts::ARCH.into(), avx2_supported: false, recommended_core: "standard".into(),
+            is_running: status.running, pid: status.pid, mixed_port: status.mixed_port, controller_port: status.controller_port, started_at: status.started_at });
+    }
+    #[cfg(not(target_os = "android"))]
+    {
     let base_dir = crate::commands::profile::get_base_dir();
     let resource_dir = crate::storage::resource_dir();
 
@@ -417,7 +463,7 @@ pub async fn get_mihomo_core_detail(
     };
 
     let avx2 = check_avx2_support();
-    let recommended = if avx2 { "v3" } else { "compatible" };
+    let recommended = if cfg!(target_os = "macos") { "standard" } else if avx2 { "v3" } else { "compatible" };
 
     // 定位实际内核二进制文件
     let find_bin = |name: &str| -> Option<PathBuf> {
@@ -431,28 +477,10 @@ pub async fn get_mihomo_core_detail(
         None
     };
 
-    let candidate_path = if let Some(ref p) = active_path {
-        let pb = PathBuf::from(p);
-        if pb.exists() {
-            pb
-        } else if avx2 && find_bin("mihomo-v3.exe").is_some() {
-            find_bin("mihomo-v3.exe").unwrap()
-        } else if let Some(p) = find_bin("mihomo-compatible.exe") {
-            p
-        } else if let Some(p) = find_bin("mihomo.exe") {
-            p
-        } else {
-            base_dir.join("binaries").join("mihomo.exe")
-        }
-    } else if avx2 && find_bin("mihomo-v3.exe").is_some() {
-        find_bin("mihomo-v3.exe").unwrap()
-    } else if let Some(p) = find_bin("mihomo-compatible.exe") {
-        p
-    } else if let Some(p) = find_bin("mihomo.exe") {
-        p
-    } else {
-        base_dir.join("binaries").join("mihomo.exe")
-    };
+    let names = crate::platform::core_names("auto")?;
+    let candidate_path = active_path.as_ref().map(PathBuf::from).filter(|path| path.is_file())
+        .or_else(|| names.iter().find_map(|name| find_bin(name)))
+        .unwrap_or_else(|| base_dir.join("binaries").join(names[0]));
 
     // 探测真实内核版本 -v
     let mut core_version_raw = "未知内核版本".to_string();
@@ -519,6 +547,7 @@ pub async fn get_mihomo_core_detail(
         controller_port,
         started_at,
     })
+    }
 }
 
 /// 检查 MetaCubeX/mihomo 官方 Release
@@ -568,11 +597,13 @@ pub async fn check_mihomo_update(
 
     if let Some(assets) = release_val.get("assets").and_then(|v| v.as_array()) {
         // 根据 CPU 是否支持 AVX2，寻找 windows-amd64-v3 或 windows-amd64-compatible
-        let target_kw = if avx2 { "windows-amd64-v3" } else { "windows-amd64-compatible" };
+        let target_kw = if cfg!(target_os = "macos") {
+            if cfg!(target_arch = "aarch64") { "darwin-arm64" } else { "darwin-amd64-compatible" }
+        } else if avx2 { "windows-amd64-v3" } else { "windows-amd64-compatible" };
         for asset in assets {
             let name = asset.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let lower = name.to_lowercase();
-            if lower.contains("windows") && lower.contains("amd64") && (lower.contains(target_kw) || lower.ends_with(".zip")) {
+            if lower.contains(&format!("{target_kw}-")) && (lower.ends_with(".zip") || lower.ends_with(".gz")) {
                 asset_name = Some(name.to_string());
                 download_url = asset.get("browser_download_url").and_then(|v| v.as_str()).map(|s| s.to_string());
                 asset_size_bytes = asset.get("size").and_then(|v| v.as_u64()).unwrap_or(0);

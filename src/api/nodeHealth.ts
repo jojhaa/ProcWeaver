@@ -3,14 +3,15 @@ import { getStoredHealthProbeConcurrency } from "../utils/taskQueue";
 
 export async function probeNodeHealthBatch(
   names: string[],
-  onResult: (node: string, result: IpHealthInfo | null, completed: number, total: number) => void,
+  onResult: (node: string, result: IpHealthInfo | null, completed: number, total: number, error?: string) => void,
   signal?: AbortSignal,
 ): Promise<void> {
   const unique = [...new Set(names)];
   if (!unique.length) return;
 
   const { invoke } = await import("@tauri-apps/api/core");
-  const concurrency = getStoredHealthProbeConcurrency();
+  const mobile = typeof document !== "undefined" && document.documentElement.dataset.platform === "android";
+  const concurrency = mobile ? Math.min(4, getStoredHealthProbeConcurrency()) : getStoredHealthProbeConcurrency();
   const chunkSize = Math.max(1, Math.min(concurrency, 32));
 
   let completed = 0;
@@ -20,8 +21,12 @@ export async function probeNodeHealthBatch(
     if (signal?.aborted) break;
     const chunk = unique.slice(start, start + chunkSize);
     let session: string | null = null;
+    let release: Promise<unknown> | null = null;
+    const cancel = () => { if (session && !release) release = invoke("end_health_probe", { session }); void release?.catch(() => {}); };
     try {
       session = await invoke<string>("begin_health_probe", { names: chunk });
+      signal?.addEventListener("abort", cancel, { once: true });
+      if (signal?.aborted) { cancel(); break; }
 
       await Promise.allSettled(
         chunk.map(async (node, index) => {
@@ -31,20 +36,24 @@ export async function probeNodeHealthBatch(
           }
           if (signal?.aborted) return;
           let result: IpHealthInfo | null = null;
+          let error: string | undefined;
           try {
             result = await invoke<IpHealthInfo>("probe_node_health", { session, node });
           } catch (e) {
+            error = String(e);
             /* 节点失败以 null 返回，继续处理排队任务 */
             console.warn(`节点 [${node}] 体检失败:`, e);
           }
           completed++;
-          if (!signal?.aborted) onResult(node, result, completed, total);
+          if (!signal?.aborted) onResult(node, result, completed, total, error);
         })
       );
     } finally {
+      signal?.removeEventListener("abort", cancel);
       if (session) {
         try {
-          await invoke("end_health_probe", { session });
+          cancel();
+          await release;
         } catch (e) {
           console.error("释放体检内核会话失败:", e);
         }

@@ -16,7 +16,16 @@ export interface BundleProcessMember {
   exe: string;
   role: "main" | "worker" | "cli" | "helper";
   description: string;
+  includeDescendants?: boolean;
 }
+
+// 本机程序定位；不导出路径、PID 或采集记录。
+export interface BundleProcessBinding {
+  exe: string;
+  executablePath: string;
+  includeDescendants: boolean;
+}
+export type BundleProcessBindings = Partial<Record<"windows" | "macos", BundleProcessBinding[]>>;
 
 export type BundleCategory = "dev" | "chat" | "browser" | "game" | "media" | "custom";
 export type BundleTrafficMode = "strict" | "sandbox"; // strict = 强锁独占, sandbox = 智能沙盒
@@ -35,6 +44,9 @@ export interface BusinessBundleDefinition {
   icon: string;
   slots: BundleSlot[];
   processes: BundleProcessMember[];
+  // 旧规则的 processes / additionalExes 属于 Windows；macOS 必须明确提供进程定义。
+  macosProcesses?: BundleProcessMember[];
+  androidPackages?: string[];
   additionalExes?: string[];
   domains?: string[];
   author?: string;
@@ -52,6 +64,7 @@ export interface BundleLocalInstance {
   createdAt: number;
   updatedAt: number;
   repositoryOrigin?: BundleRepositoryOrigin; // 本机来源记录，不进入规则包导出
+  processBindings?: BundleProcessBindings;
 }
 
 // 规范的 .pwpack.json 纯净脱敏导出文件结构 (白名单脱敏)

@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsListenerMode { Auto, Fixed, Off }
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct DnsSettings {
@@ -9,6 +13,9 @@ pub struct DnsSettings {
     pub status: bool,
     #[serde(default = "default_listen")]
     pub listen: String,
+    // Missing in existing preferences: preserve their listener until explicitly changed.
+    #[serde(default)]
+    pub listener_mode: Option<DnsListenerMode>,
     #[serde(default = "default_enhanced_mode")]
     pub enhanced_mode: String,
     #[serde(default = "default_fake_ip_range")]
@@ -50,7 +57,10 @@ pub struct DnsSettings {
 }
 
 fn default_true() -> bool { true }
-fn default_listen() -> String { "0.0.0.0:1053".into() }
+fn default_listen() -> String { default_listen_for(std::env::consts::OS) }
+fn default_listen_for(os: &str) -> String {
+    if os == "macos" { "127.0.0.1:1053" } else { "0.0.0.0:1053" }.into()
+}
 fn default_enhanced_mode() -> String { "fake-ip".into() }
 fn default_fake_ip_range() -> String { "198.18.0.1/16".into() }
 fn default_geoip_code() -> String { "CN".into() }
@@ -89,6 +99,7 @@ impl Default for DnsSettings {
             enable_override: false,
             status: true,
             listen: default_listen(),
+            listener_mode: if cfg!(windows) { Some(DnsListenerMode::Auto) } else { None },
             enhanced_mode: default_enhanced_mode(),
             fake_ip_range: default_fake_ip_range(),
             fake_ip_filter: default_fake_ip_filter(),
@@ -124,7 +135,9 @@ pub fn get_dns_settings() -> Result<DnsSettings, String> {
 
 impl DnsSettings {
     pub fn validate(&self) -> Result<(), String> {
-        super::dns_runtime::parse_listen(&self.listen)?;
+        if !matches!(self.listener_mode, Some(DnsListenerMode::Auto | DnsListenerMode::Off)) {
+            super::dns_runtime::parse_listen(&self.listen)?;
+        }
 
         if !matches!(self.enhanced_mode.as_str(), "fake-ip" | "redir-host" | "normal") {
             return Err(format!("未知的增强模式: {}", self.enhanced_mode));
@@ -136,17 +149,52 @@ impl DnsSettings {
 
         Ok(())
     }
+
+    fn validate_listen_policy(&self, allow_lan: bool, os: &str) -> Result<(), String> {
+        if os == "macos" && self.enable_override && !allow_lan
+            && !super::dns_runtime::parse_listen(&self.listen)?.ip().is_loopback() {
+            return Err("关闭局域网访问时，macOS DNS 覆写监听只能绑定回环地址".into());
+        }
+        Ok(())
+    }
 }
 
 #[tauri::command]
 pub async fn save_dns_settings(
-    mut settings: DnsSettings,
+    settings: DnsSettings,
     state: tauri::State<'_, super::process::CoreStateMutex>,
 ) -> Result<DnsSettings, String> {
+    save_dns_settings_transaction(settings, &state).await
+}
+
+pub(crate) async fn save_dns_settings_transaction(
+    mut settings: DnsSettings,
+    state: &super::process::CoreStateMutex,
+) -> Result<DnsSettings, String> {
     settings.validate()?;
-    settings.listen = super::dns_runtime::parse_listen(&settings.listen)?.to_string();
+    settings.listen = super::dns_runtime::parse_listen(&settings.listen).map(|address| address.to_string())
+        .unwrap_or_else(|_| default_listen());
 
     let _lifecycle = super::process::LIFECYCLE.lock().await;
+    #[cfg(windows)]
+    super::dns_listener::validate_guard(&settings, super::dns_adapter::get_dns_guard_status()?)?;
+    #[cfg(windows)]
+    if settings.listener_mode == Some(DnsListenerMode::Off) {
+        let config = crate::routing_overrides::read()?.effective();
+        if config.dns_enabled && config.dns_rules.iter().any(|rule| rule.enabled) {
+            return Err("DNS 规则接管需要本地监听，请先关闭 DNS 接管规则或选择自动模式".into());
+        }
+    }
+    settings.validate_listen_policy(super::settings::get_general_settings()?.allow_lan, std::env::consts::OS)?;
+    let (running, mode, proxy_port) = {
+        let mut core = state.lock().map_err(|_| "读取核心状态失败")?;
+        let is_running = match core.child.as_mut() {
+            Some(child) => child.try_wait().map_err(|_| "读取核心状态失败")?.is_none(),
+            None => false,
+        };
+        (is_running, core.core_mode.clone(), core.mixed_port)
+    };
+    let proxy_enabled = if running { super::sysproxy::get_system_proxy_status()? } else { false };
     let path = crate::storage::data_dir().join("config/dns-preferences.json");
     let bytes = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
     let write_path = path.clone();
@@ -161,34 +209,47 @@ pub async fn save_dns_settings(
     }).await.map_err(|_| "保存 DNS 配置任务失败")??;
 
     // 若核心当前正在运行，由于 DNS 覆写影响底层网络，重启核心以应用新 DNS
-    let (running, mode) = {
-        let mut core = state.lock().map_err(|_| "读取核心状态失败")?;
-        let is_running = match core.child.as_mut() {
-            Some(child) => child.try_wait().map_err(|_| "读取核心状态失败")?.is_none(),
-            None => false,
-        };
-        let mode = core.core_mode.clone();
-        (is_running, mode)
-    };
-
     if running {
-        {
+        let stopped = {
             let mut core = state.lock().map_err(|_| "读取核心状态失败")?;
-            super::process::stop_owned_child(&mut core)?;
+            super::process::stop_owned_child(&mut core)
+        };
+        if let Err(error) = stopped {
+            if let Err(rollback_error) = rollback_dns_preferences(path, previous_bytes).await {
+                return Err(format!("核心停止失败：{error}；旧 DNS 设置回滚失败：{rollback_error}"));
+            }
+            return Err(format!("核心停止失败：{error}；旧 DNS 设置已恢复"));
         }
         if let Err(e) = super::process::start_core_locked(mode.clone(), &state).await {
             // 核心加载新配置失败，回滚原始 DNS 配置
-            let rollback = tokio::task::spawn_blocking(move || match previous_bytes {
-                Some(previous) => crate::storage::replace(&path, &previous),
-                None => std::fs::remove_file(&path).map_err(|error| error.to_string()),
-            }).await.map_err(|_| "DNS 配置回滚任务失败")?;
-            if let Err(error) = rollback { return Err(format!("应用新 DNS 配置失败：{e}；回滚失败：{error}")); }
+            if let Err(error) = rollback_dns_preferences(path, previous_bytes).await {
+                return Err(format!("应用新 DNS 配置失败：{e}；回滚失败：{error}"));
+            }
             let restored = super::process::start_core_locked(mode, &state).await;
-            return Err(format!("应用新 DNS 配置失败：{e}；原配置已回滚{}", restored.err().map(|error| format!("，但核心恢复失败：{error}")).unwrap_or_default()));
+            if let Err(error) = restored {
+                return Err(format!("应用新 DNS 配置失败：{e}；旧 DNS 设置已恢复，但核心恢复失败：{error}"));
+            }
+            if proxy_enabled {
+                if let Err(error) = super::sysproxy::set_system_proxy_locked(true, Some(proxy_port)).await {
+                    return Err(format!("应用新 DNS 配置失败：{e}；旧 DNS 设置和核心已恢复，但系统代理重新启用失败：{error}"));
+                }
+            }
+            return Err(format!("应用新 DNS 配置失败：{e}；旧 DNS 设置和核心已恢复"));
+        }
+        if proxy_enabled {
+            super::sysproxy::set_system_proxy_locked(true, Some(proxy_port)).await
+                .map_err(|error| format!("新 DNS 设置和核心已启用，但系统代理重新启用失败：{error}"))?;
         }
     }
 
     Ok(settings)
+}
+
+async fn rollback_dns_preferences(path: std::path::PathBuf, previous_bytes: Option<Vec<u8>>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || match previous_bytes {
+        Some(previous) => crate::storage::replace(&path, &previous),
+        None => std::fs::remove_file(&path).map_err(|error| error.to_string()),
+    }).await.map_err(|_| "DNS 配置回滚任务失败")?
 }
 
 /// 将 DNS 偏好构建为标准 Mihomo (Clash.Meta) YAML 映射
@@ -303,6 +364,8 @@ mod tests {
 
     #[test]
     fn test_dns_defaults_and_yaml_builder() {
+        assert_eq!(default_listen_for("macos"), "127.0.0.1:1053");
+        assert_eq!(default_listen_for("windows"), "0.0.0.0:1053");
         let mut settings = DnsSettings::default();
         assert_eq!(settings.enhanced_mode, "fake-ip");
         assert_eq!(settings.fallback_filter_geoip_code, "CN");
@@ -326,5 +389,16 @@ mod tests {
         assert_eq!(yaml["fallback-filter"]["domain"][0].as_str(), Some("+.google.com"));
         assert_eq!(yaml["nameserver-policy"]["geosite:cn"].as_str(), Some("https://dns.alidns.com/dns-query"));
         assert!(yaml["nameserver"].as_sequence().unwrap().len() >= 2);
+    }
+    #[test]
+    fn macos_dns_override_requires_loopback_when_lan_is_disabled() {
+        let mut settings = DnsSettings::default();
+        settings.enable_override = true;
+        settings.listen = "0.0.0.0:1053".into();
+        assert!(settings.validate_listen_policy(false, "macos").is_err());
+        assert!(settings.validate_listen_policy(true, "macos").is_ok());
+        assert!(settings.validate_listen_policy(false, "windows").is_ok());
+        settings.listen = "127.0.0.1:1053".into();
+        assert!(settings.validate_listen_policy(false, "macos").is_ok());
     }
 }

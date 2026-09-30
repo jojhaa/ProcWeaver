@@ -1,6 +1,7 @@
 import { bundleToolsApi, type LaunchRequest, type LaunchOutcome, type BundleShortcuts, type BundleEntryState } from "../api/bundleTools";
 import { bundleController } from "./bundleRuntime";
 import { getBundleStatus } from "../utils/bundleController";
+import { getPlatform } from "./platform";
 export interface BundleToolsState {
   open: boolean; kind: "launch" | "shortcuts"; title: string; request: LaunchRequest | null;
   busy: boolean; message: string; error: string; outcome: LaunchOutcome | null;
@@ -21,14 +22,17 @@ const publish = (patch: Partial<BundleToolsState>) => {
   state = { ...state, ...patch }; listeners.forEach(fn => fn());
 };
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+const entryIsCurrent = (entry?: BundleEntryState) => Boolean(entry?.instanceKey && ["restart_required", "partial"].includes(entry.state)
+  && entry.connectionState !== "core_stopped" && (!entry.monitorState || ["current", "degraded"].includes(entry.monitorState))
+  && (!entry.identityState || entry.identityState === "path_verified"));
 const title = (id: string) => bundleController.getSnapshot().instances.find(i => i.instanceId === id)?.definition.packageName || id;
 async function beforeLaunch(id: string, hotSwap = false) {
   await bundleController.whenIdle();
   const current = bundleController.getSnapshot();
   const item = current.instances.find(i => i.instanceId === id);
-  if (!item) throw new Error("业务包已移除，请重新装载后创建快捷方式");
+  if (!item) throw new Error("业务包已移除，请重新装载后再操作");
   const status = getBundleStatus(item, current);
-  if (hotSwap && (!item.enabled || !item.slotBindings.main || item.watcherMode !== "hot_swap" || status.phase !== "applied")) {
+  if (hotSwap && (!item.enabled || !item.slotBindings.main || item.watcherMode !== "hot_swap" || status.phase !== "applied" || !entryIsCurrent(state.entries[id]))) {
     throw new Error("业务包或热替换状态已改变，未重启应用；请检查核心与本包设置后重试");
   }
   if (item.enabled && !["applied", "saved", "paused"].includes(status.phase)) throw new Error(status.message);
@@ -76,13 +80,17 @@ async function shortcuts(instanceId: string) {
 // instance can prompt again, at most once a minute per bundle, without extra polling.
 const hotSwapPrompts = new Map<string, { key: string; after: number }>();
 let inspecting: Promise<void> | undefined;
+let inspectingFull = false;
+let pendingFull = false;
+const pendingIds = new Set<string>();
 function hotSwapEligible(id: string) {
   const current = bundleController.getSnapshot();
   const item = current.instances.find(i => i.instanceId === id);
   return Boolean(item?.enabled && item.slotBindings.main && item.watcherMode === "hot_swap"
-    && getBundleStatus(item, current).phase === "applied");
+    && getBundleStatus(item, current).phase === "applied" && entryIsCurrent(state.entries[id]));
 }
-async function prepareHotSwap() {
+async function prepareHotSwap(refreshedIds: ReadonlySet<string>) {
+  if (!getPlatform().processWatcher) return;
   const current = bundleController.getSnapshot();
   for (const [id, record] of hotSwapPrompts) {
     const item = current.instances.find(i => i.instanceId === id);
@@ -92,7 +100,7 @@ async function prepareHotSwap() {
   if (state.open || state.busy) return;
   const entry = Object.values(state.entries).find(item => {
     const previous = hotSwapPrompts.get(item.instanceId);
-    return ["restart_required", "partial"].includes(item.state) && item.instanceKey
+    return refreshedIds.has(item.instanceId) && ["restart_required", "partial"].includes(item.state) && item.instanceKey
       && item.connectionState !== "core_stopped" && hotSwapEligible(item.instanceId)
       && previous?.key !== item.instanceKey && (!previous || Date.now() >= previous.after);
   });
@@ -103,6 +111,7 @@ async function prepareHotSwap() {
   hotSwapPrompts.set(entry.instanceId, { key: entry.instanceKey!, after: Date.now() + 60000 });
   let presented = false;
   const stillCurrent = () => ticket === sequence && !state.open && !state.busy && hotSwapEligible(entry.instanceId)
+    && state.entries[entry.instanceId]?.instanceKey === entry.instanceKey
     && definition === JSON.stringify(bundleController.getSnapshot().instances.find(i => i.instanceId === entry.instanceId));
   try {
     // Only obtain a confirmation token. The native command must not start an app
@@ -132,26 +141,50 @@ async function prepareHotSwap() {
     }
   }
 }
-function refreshEntries(): Promise<void> {
-  if (inspecting) return inspecting;
-  const fingerprint = () => { const current = bundleController.getSnapshot(); return JSON.stringify([current.instances, current.view?.config.bundlesEnabled]); };
-  const snapshot = fingerprint();
+function activeEntryIds(): Set<string> {
   const current = bundleController.getSnapshot();
-  const ids = current.view?.config.bundlesEnabled === false ? [] : current.instances.filter(i => i.enabled && i.slotBindings.main && i.watcherMode !== "disabled").map(i => i.instanceId);
+  return new Set(current.view?.config.bundlesEnabled === false ? [] : current.instances.filter(i => i.enabled && i.slotBindings.main && i.watcherMode !== "disabled").map(i => i.instanceId));
+}
+function mergeEntries(ids: ReadonlySet<string>, results: BundleEntryState[]) {
+  const active = activeEntryIds();
+  const entries = Object.fromEntries(Object.entries(state.entries).filter(([id]) => active.has(id) && !ids.has(id)));
+  for (const entry of results) if (ids.has(entry.instanceId) && active.has(entry.instanceId)) entries[entry.instanceId] = entry;
+  publish({ entries });
+}
+const unavailableEntry = (instanceId: string, message: string): BundleEntryState => ({
+  instanceId, state: "unverified", message, chains: [],
+  connectionState: "error", connectionMessage: "检测未完成，无法核验连接分流；下次检测会重试",
+  monitorState: "stale", monitorMessage: "检测未完成，旧结果已失效", identityState: "unverified", identityMessage: "当前身份未核实",
+});
+async function refreshEntryBatch(requested?: string[]) {
+  const active = activeEntryIds();
+  const ids = new Set(requested === undefined ? active : requested.filter(id => active.has(id)));
+  mergeEntries(new Set(), []); // Disabled/removed packages are pruned even during a partial refresh.
+  const fingerprint = () => { const current = bundleController.getSnapshot(); return JSON.stringify([current.instances.filter(i => ids.has(i.instanceId)), current.view?.config.bundlesEnabled]); };
+  const snapshot = fingerprint();
+  try {
+    const result = ids.size ? await bundleToolsApi.entries([...ids]) : [];
+    if (snapshot !== fingerprint()) { mergeEntries(new Set(), []); return; }
+    const returned = new Set(result.map(entry => entry.instanceId));
+    mergeEntries(ids, [...result, ...[...ids].filter(id => !returned.has(id)).map(id => unavailableEntry(id, "本次未返回该业务包的核验结果，请等待重新检测"))]);
+    await prepareHotSwap(ids);
+  } catch (error) {
+    if (snapshot !== fingerprint()) { mergeEntries(new Set(), []); return; }
+    mergeEntries(ids, [...ids].map(id => unavailableEntry(id, `检测失败：${errorText(error)}`)));
+  }
+}
+function refreshEntries(instanceIds?: string[]): Promise<void> {
+  if (inspecting && instanceIds === undefined && inspectingFull) return inspecting;
+  if (instanceIds === undefined) pendingFull = true;
+  else for (const id of instanceIds) pendingIds.add(id);
+  if (inspecting) return inspecting;
   inspecting = (async () => {
-    try {
-      const result = ids.length ? await bundleToolsApi.entries(ids) : [];
-      if (snapshot !== fingerprint()) return;
-      publish({ entries: Object.fromEntries(result.filter(item => ids.includes(item.instanceId)).map(item => [item.instanceId, item])) });
-      await prepareHotSwap();
-    } catch (error) {
-      if (snapshot !== fingerprint()) return;
-      publish({ entries: Object.fromEntries(ids.map(instanceId => [instanceId, {
-        instanceId, state: "unverified", message: `检测失败：${errorText(error)}`, chains: [],
-        connectionState: "error", connectionMessage: "检测未完成，无法核验连接分流；下次检测会重试",
-      }])) });
-    }
-  })().finally(() => { inspecting = undefined; });
+    do {
+      const ids = pendingFull ? undefined : [...pendingIds];
+      inspectingFull = pendingFull; pendingFull = false; pendingIds.clear();
+      await refreshEntryBatch(ids);
+    } while (pendingFull || pendingIds.size > 0);
+  })().finally(() => { inspecting = undefined; inspectingFull = false; });
   return inspecting;
 }
 export const bundleTools = {
@@ -166,8 +199,16 @@ export const bundleTools = {
   select: (selected: string) => publish({ selected }),
   choose: async () => {
     if (!state.request || state.busy) return;
-    const id = state.request.instanceId; publish({ busy: true, error: "" });
-    try { await bundleToolsApi.choose(id); publish({ busy: false }); await shortcuts(id); }
+    const { request, kind, hotSwap } = state;
+    cancelAutoClose();
+    publish({ busy: true });
+    try {
+      const selected = await bundleToolsApi.choose(request.instanceId);
+      publish({ busy: false });
+      if (!selected) return;
+      if (kind === "launch") await launch(request, null, hotSwap);
+      else await shortcuts(request.instanceId);
+    }
     catch (error) { publish({ busy: false, error: errorText(error) }); }
   },
   change: async (action: "patch" | "create" | "restore", recordId: string | null = null) => {

@@ -43,7 +43,7 @@ pub struct IpHealthInfo {
 }
 
 // 解析来自 IPpure 的标准返回数据
-fn parse_ippure_json(text: &str) -> Option<IpHealthInfo> {
+pub(crate) fn parse_ippure_json(text: &str) -> Option<IpHealthInfo> {
     let val: serde_json::Value = serde_json::from_str(text).ok()?;
     let ip = val.get("ip").and_then(|v| v.as_str())?.to_string();
     if ip.is_empty() {
@@ -131,8 +131,12 @@ async fn fetch_fallback_ip_info(proxy_port: Option<u16>) -> Result<IpHealthInfo,
         .map_err(|e| format!("备用探测连接失败: {}", e))?;
 
     let val: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    parse_fallback_ip_info(val)
+}
+
+pub(crate) fn parse_fallback_ip_info(val: serde_json::Value) -> Result<IpHealthInfo, String> {
     let ip = val.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    if ip.is_empty() {
+    if ip.parse::<std::net::IpAddr>().is_err() {
         return Err("未获取到出口 IP".to_string());
     }
 

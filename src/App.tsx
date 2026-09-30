@@ -9,6 +9,8 @@ import { ChannelDispatcherView } from "./views/ChannelDispatcherView";
 import { TrafficRoutingView } from "./views/TrafficRoutingView";
 import { ProfilesView } from "./views/ProfilesView";
 import { SettingsView } from "./views/SettingsView";
+import { AndroidSettingsView } from "./views/AndroidSettingsView";
+import { AndroidApp } from "./views/AndroidApp";
 import { MaintenanceView } from "./views/MaintenanceView";
 import { ConnectionsView } from "./views/ConnectionsView";
 import { LogsView } from "./views/LogsView";
@@ -19,6 +21,7 @@ import { useBundleTools } from "./hooks/useBundleTools";
 import { BundleToolsDialog } from "./components/business-bundle/BundleToolsDialog";
 import { useCoreStatus } from "./hooks/useCoreStatus";
 import { appendAppLog } from "./api/logs";
+import { getGeneralSettings } from "./api/settings";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { WindowControls } from "./components/WindowControls";
 import { windowToggleMaximize, windowStartDragging, getProfiles, isTauri } from "./api";
@@ -38,6 +41,7 @@ import {
   Activity,
   ScrollText,
   Wrench,
+  Menu,
 } from "lucide-react";
 
 // 页面级 ErrorBoundary，防止任何单个组件渲染错误导致应用崩溃白屏
@@ -66,7 +70,7 @@ class ErrorBoundary extends React.Component<
             <AlertTriangle className="w-6 h-6" />
           </div>
           <div>
-            <h3 className="text-base font-bold text-white">视图渲染遇到异常</h3>
+            <h3 className="text-base font-bold text-slate-900 dark:text-white">视图渲染遇到异常</h3>
             <p className="text-xs text-rose-300/80 mt-1 font-mono">
               {this.state.error?.message || "未知错误"}
             </p>
@@ -86,12 +90,19 @@ class ErrorBoundary extends React.Component<
 }
 
 import { TrayContextMenuView } from "./views/TrayContextMenuView";
+import { usePlatform } from "./context/PlatformContext";
+
+function DesktopTrayRuntime(props: Parameters<typeof useTrayManager>[0]) { useTrayManager(props); return null; }
 
 export function App() {
+  const platform = usePlatform();
+  const mobile = platform.os === "android";
+  const [navigationOpen, setNavigationOpen] = useState(false);
   const isTrayMenuWindow = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("window") === "tray-menu";
   if (isTrayMenuWindow) {
     return <TrayContextMenuView />;
   }
+  if (mobile) return <ErrorBoundary><AndroidApp /></ErrorBoundary>;
 
   const exclusions = useExclusions();
   useBundleRuntime();
@@ -132,11 +143,6 @@ export function App() {
 
 
   // 全局托盘状态调度与看门狗（解耦页面依赖，冷启动与常驻无缝保活）
-  useTrayManager({
-    coreStatus,
-    mode,
-    activeNodeName,
-  });
 
   React.useEffect(() => {
     const handleNodeChange = (e: any) => {
@@ -204,6 +210,10 @@ export function App() {
     window.addEventListener("netbox-profile-changed", onProfileChanged);
     window.addEventListener("procweaver-navigate-tab", onNavigateTab);
     window.addEventListener("netbox-navigate-tab", onNavigateTab);
+    if ((window as unknown as { __PROCWEAVER_IMPORT_PENDING__?: boolean }).__PROCWEAVER_IMPORT_PENDING__) {
+      setActiveTab("profiles");
+      delete (window as unknown as { __PROCWEAVER_IMPORT_PENDING__?: boolean }).__PROCWEAVER_IMPORT_PENDING__;
+    }
 
     let unlisteners: Array<() => void> = [];
 
@@ -251,14 +261,21 @@ export function App() {
       });
     }
 
-    const onSettingsSaved = () => {
+    let settingsRead = 0;
+    let settingsDisposed = false;
+    const onSettingsSaved = async () => {
+      const request = ++settingsRead;
       try {
-        setTabAnimation(localStorage.getItem("netbox_tab_animation") !== "false");
-      } catch {}
+        const enabled = isTauri() ? (await getGeneralSettings()).tabAnimation !== false
+          : localStorage.getItem("netbox_tab_animation") !== "false";
+        if (!settingsDisposed && request === settingsRead) setTabAnimation(enabled);
+      } catch { /* Preserve the last confirmed preference when reading fails. */ }
     };
+    void onSettingsSaved();
     window.addEventListener("netbox-settings-saved", onSettingsSaved);
 
     return () => {
+      settingsDisposed = true;
       window.removeEventListener("procweaver-profile-changed", onProfileChanged);
       window.removeEventListener("netbox-profile-changed", onProfileChanged);
       window.removeEventListener("procweaver-navigate-tab", onNavigateTab);
@@ -279,7 +296,7 @@ export function App() {
       case "proxies":
         return "节点管理 (全部节点池 · 自定义分组 · 链式中继)";
       case "routing":
-        return "分流规则 (常用业务 · 软件进程 · 域名与 DNS)";
+        return mobile ? "分流规则（业务 · 应用 · 域名）" : "分流规则 (常用业务 · 软件进程 · 域名与 DNS)";
       case "connections":
         return "连接追踪 (活跃连接 · 请求流水 · 实时断开)";
       case "logs":
@@ -323,16 +340,17 @@ export function App() {
   };
 
   return (
-    <div className="flex h-screen w-screen bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-100 overflow-hidden font-sans transition-colors duration-200 border border-slate-200/80 dark:border-slate-800/80">
-      <MonitoringRuntime />
+    <div className={`${mobile ? "android-layout" : ""} flex h-screen w-screen bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-100 overflow-hidden font-sans transition-colors duration-200 border border-slate-200/80 dark:border-slate-800/80`}>
+      {!mobile && <><MonitoringRuntime /><DesktopTrayRuntime coreStatus={coreStatus} mode={mode} activeNodeName={activeNodeName} /></>}
+      {mobile && navigationOpen && <button className="fixed inset-0 w-full z-30 bg-black/40" aria-label="关闭导航" onClick={() => setNavigationOpen(false)} />}
       {/* 左侧侧边栏 */}
-      <aside className="w-60 bg-white/90 dark:bg-slate-900/60 border-r border-slate-200/90 dark:border-slate-800/80 flex flex-col justify-between p-4 backdrop-blur-xl shrink-0 transition-colors duration-200">
+      <aside className={`${mobile ? `android-nav ${navigationOpen ? "open" : ""}` : ""} w-60 bg-white/90 dark:bg-slate-900/60 border-r border-slate-200/90 dark:border-slate-800/80 flex flex-col justify-between p-4 backdrop-blur-xl shrink-0 transition-colors duration-200`}>
         <div>
           {/* Logo 区域 (支持拖拽移动窗口与双击最大化) */}
           <div
-            data-tauri-drag-region
-            onMouseDown={handleWindowDrag}
-            onDoubleClick={() => windowToggleMaximize()}
+            data-tauri-drag-region={!mobile || undefined}
+            onMouseDown={mobile ? undefined : handleWindowDrag}
+            onDoubleClick={mobile ? undefined : () => windowToggleMaximize()}
             className="flex items-center space-x-3 px-3 py-4 mb-4 select-none cursor-default"
           >
             <div className="w-11 h-11 rounded-2xl flex items-center justify-center pointer-events-none shrink-0 overflow-hidden shadow-lg shadow-indigo-500/15 dark:shadow-[0_0_20px_rgba(56,189,248,0.25)] bg-gradient-to-br from-indigo-500/10 via-sky-500/5 to-purple-600/10 dark:from-indigo-950/80 dark:via-slate-900/90 dark:to-cyan-950/60 border border-indigo-200/80 dark:border-indigo-500/40 p-1 transition-all">
@@ -353,7 +371,7 @@ export function App() {
           </div>
 
           {/* 导航菜单 (7 项收敛一级导航) */}
-          <nav className="space-y-1.5">
+          <nav className="space-y-1.5" onClick={() => { if (mobile) setNavigationOpen(false); }}>
             {/* 1. 运行概览 */}
             <button
               onClick={() => setActiveTab("dashboard")}
@@ -402,7 +420,7 @@ export function App() {
                 <span>分流规则</span>
               </div>
               <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-purple-100 text-purple-700 dark:bg-purple-500/20 dark:text-purple-300 font-mono">
-                业务/进程/规则
+                {mobile ? "业务/应用/规则" : "业务/进程/规则"}
               </span>
             </button>
 
@@ -474,7 +492,7 @@ export function App() {
                 <span>偏好设置</span>
               </div>
               <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-slate-200/80 text-slate-700 dark:bg-slate-800 dark:text-slate-300 font-mono">
-                TUN/驱动
+                {mobile ? "VPN/性能" : platform.tun ? "TUN/驱动" : "macOS"}
               </span>
             </button>
 
@@ -528,28 +546,61 @@ export function App() {
         {/* 顶部标题栏 (支持拖拽移动窗口与双击最大化) */}
         <header
           data-tauri-drag-region
-          onMouseDown={handleWindowDrag}
-          onDoubleClick={() => windowToggleMaximize()}
+          onMouseDown={mobile ? undefined : handleWindowDrag}
+          onDoubleClick={mobile ? undefined : () => windowToggleMaximize()}
           className="h-14 border-b border-slate-200 dark:border-slate-800/80 pl-8 pr-3 flex items-center justify-between bg-white/70 dark:bg-slate-900/40 backdrop-blur-md shrink-0 transition-colors duration-200 select-none cursor-default"
         >
-          <div className="flex items-center space-x-2 pointer-events-none">
-            <span className="text-sm font-semibold text-slate-800 dark:text-slate-200">
+          <div className="flex items-center space-x-2 min-w-0">
+            {mobile && (
+              <button
+                type="button"
+                aria-label="打开导航抽屉"
+                onClick={() => setNavigationOpen(true)}
+                className="p-1.5 -ml-1 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition cursor-pointer"
+              >
+                <Menu size={20} />
+              </button>
+            )}
+            <span className="text-sm font-semibold text-slate-800 dark:text-slate-200 truncate">
               {getPageTitle()}
             </span>
           </div>
 
           <div
-            className="flex items-center space-x-3 text-xs"
+            className="flex items-center space-x-2 text-xs shrink-0"
             data-tauri-drag-region="false"
           >
+            {/* 移动端顶栏快速模式切换 */}
+            {mobile && mode && (
+              <div className="flex rounded-lg bg-slate-200/70 dark:bg-slate-800 p-0.5 border border-slate-300/60 dark:border-slate-700 text-[10px]">
+                {(["rule", "global", "direct"] as const).map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => handleModeChange(m)}
+                    disabled={coreMode.busy}
+                    className={`px-2 py-0.5 rounded-md font-semibold transition cursor-pointer ${
+                      mode === m
+                        ? "bg-indigo-600 text-white shadow-xs"
+                        : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
+                    }`}
+                  >
+                    {m === "rule" ? "规则" : m === "global" ? "全局" : "直连"}
+                  </button>
+                ))}
+              </div>
+            )}
+
             {/* 顶栏快速主题切换 */}
             <ThemeToggle compact={false} />
 
-            {/* 分隔竖线 */}
-            <div className="h-4 w-px bg-slate-200 dark:bg-slate-800 mx-1" />
-
-            {/* 自定义窗口控制按钮 (最小化、最大化/还原、关闭) */}
-            <WindowControls />
+            {/* 分隔竖线与桌面窗口控制 */}
+            {!mobile && (
+              <>
+                <div className="h-4 w-px bg-slate-200 dark:bg-slate-800 mx-1" />
+                <WindowControls />
+              </>
+            )}
           </div>
         </header>
 
@@ -588,7 +639,7 @@ export function App() {
             {activeTab === "settings" && (
               <div className="h-full overflow-y-auto p-6 md:p-8">
                 <div className="max-w-5xl mx-auto space-y-6">
-                  <SettingsView />
+                  {mobile ? <AndroidSettingsView /> : <SettingsView />}
                 </div>
               </div>
             )}
@@ -666,6 +717,33 @@ export function App() {
           </ErrorBoundary>
         </div>
       </div>
+      {mobile && (
+        <nav className="shrink-0 z-20 flex items-center justify-around border-t border-slate-200/90 dark:border-slate-800/80 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md py-1.5 px-2 select-none shadow-[0_-4px_12px_rgba(0,0,0,0.03)]">
+          {[
+            { id: "dashboard", label: "控制台", icon: LayoutDashboard },
+            { id: "proxies", label: "节点池", icon: Radio },
+            { id: "routing", label: "分流规则", icon: ArrowRightLeft },
+            { id: "settings", label: "偏好设置", icon: Settings },
+          ].map(({ id, label, icon: Icon }) => {
+            const active = activeTab === id;
+            return (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setActiveTab(id)}
+                className={`flex flex-col items-center justify-center flex-1 py-1 px-1 rounded-xl transition cursor-pointer ${
+                  active
+                    ? "text-indigo-600 dark:text-indigo-400 font-bold bg-indigo-50/80 dark:bg-indigo-950/40"
+                    : "text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200"
+                }`}
+              >
+                <Icon className={`w-5 h-5 mb-0.5 ${active ? "stroke-[2.2]" : "stroke-[1.8]"}`} />
+                <span className="text-[10px] leading-tight tracking-tight">{label}</span>
+              </button>
+            );
+          })}
+        </nav>
+      )}
     </main>
     <BundleToolsDialog {...bundleTools} />
     </div>

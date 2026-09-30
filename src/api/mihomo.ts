@@ -32,6 +32,8 @@ async function invokeTauri<T>(cmd: string, args?: Record<string, unknown>): Prom
 export async function fetchProxies(): Promise<{
   groups: ProxyGroup[];
   proxies: Record<string, ProxyItem>;
+  offline?: boolean;
+  warnings?: string[];
 }> {
   if (isTauri()) {
     // 自动重试机制：最多尝试 4 次（间隔 350ms），确保核心启动阶段稳妥拉取到全部真实节点
@@ -39,7 +41,7 @@ export async function fetchProxies(): Promise<{
       try {
         const data = await invokeTauri<any>("get_mihomo_proxies");
         const allProxies = data?.proxies || {};
-        if (Object.keys(allProxies).length > 0) {
+        if (Object.keys(allProxies).length > 0 || data?.offline !== undefined) {
           const groups: ProxyGroup[] = [];
           const proxies: Record<string, ProxyItem> = {};
 
@@ -58,11 +60,13 @@ export async function fetchProxies(): Promise<{
               udp: val.udp,
               history: val.history,
               delay: val.history?.length ? val.history[val.history.length - 1].delay : undefined,
+              catalogKey: val.catalogKey,
             };
           }
-          return { groups, proxies };
+          return { groups, proxies, offline: data.offline, warnings: data.catalogWarnings };
         }
       } catch (err) {
+        if (typeof document !== "undefined" && document.documentElement.dataset.platform === "android") throw err;
         // 内核可能刚拉起，等待 350ms 后重试
         await new Promise((resolve) => setTimeout(resolve, 350));
       }

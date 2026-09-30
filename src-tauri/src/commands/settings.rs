@@ -8,6 +8,10 @@ pub struct GeneralSettings {
     #[serde(default = "default_enable_controller_port")]
     pub enable_controller_port: bool,
     pub allow_lan: bool,
+    #[serde(default)]
+    pub lan_sharing: super::mobile_settings::LanSharing,
+    #[serde(default)]
+    pub vpn_apps: super::mobile_settings::VpnApps,
     pub tun_mode: bool,
     pub auto_start: bool,
     #[serde(default = "default_true")]
@@ -51,15 +55,15 @@ pub struct GeneralSettings {
 }
 fn default_enable_controller_port() -> bool { true }
 fn default_true() -> bool { true }
-fn default_tray_menu_style() -> String { "modern".into() }
+fn default_tray_menu_style() -> String { if cfg!(target_os = "macos") { "classic".into() } else { "modern".into() } }
 fn default_find_process_mode() -> String { "auto".into() }
 fn default_auto_close_connections() -> bool { true }
-fn default_traffic_mode() -> String { "app_proxy".into() }
+fn default_traffic_mode() -> String { if cfg!(target_os = "android") { "tun".into() } else { "app_proxy".into() } }
 fn default_routing_priority() -> String { "domain_first".into() }
 fn default_geo_low_memory() -> bool { true }
 fn default_speed_test_url() -> String { "https://cp.cloudflare.com/generate_204".into() }
-fn default_speed_test_concurrency() -> usize { 10 }
-fn default_health_probe_concurrency() -> usize { 4 }
+fn default_speed_test_concurrency() -> usize { if cfg!(target_os = "android") { 3 } else { 10 } }
+fn default_health_probe_concurrency() -> usize { if cfg!(target_os = "android") { 2 } else { 4 } }
 impl Default for GeneralSettings {
     fn default() -> Self {
         Self {
@@ -67,7 +71,9 @@ impl Default for GeneralSettings {
             controller_port: 9090,
             enable_controller_port: true,
             allow_lan: false,
-            tun_mode: false,
+            lan_sharing: Default::default(),
+            vpn_apps: Default::default(),
+            tun_mode: cfg!(target_os = "android"),
             auto_start: false,
             unified_delay: true,
             tcp_concurrent: false,
@@ -76,18 +82,18 @@ impl Default for GeneralSettings {
             silent_start: false,
             auto_run: true,
             only_proxy_traffic: true,
-            traffic_mode: "app_proxy".into(),
+            traffic_mode: default_traffic_mode(),
             routing_priority: "domain_first".into(),
             speed_test_url: "https://cp.cloudflare.com/generate_204".into(),
-            speed_test_concurrency: 10,
-            health_probe_concurrency: 4,
+            speed_test_concurrency: default_speed_test_concurrency(),
+            health_probe_concurrency: default_health_probe_concurrency(),
             ipv6: false,
             find_process_mode: "auto".into(),
             auto_close_connections: true,
             append_system_dns: false,
             log_capture: true,
             tab_animation: true,
-            tray_menu_style: "modern".into(),
+            tray_menu_style: default_tray_menu_style(),
         }
     }
 }
@@ -95,7 +101,15 @@ impl Default for GeneralSettings {
 pub fn get_general_settings() -> Result<GeneralSettings, String> {
     let path = crate::storage::data_dir().join("config/preferences.json");
     if !path.exists() { return Ok(GeneralSettings::default()); }
-    serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|_| "偏好设置损坏，请恢复备份".into())
+    let mut settings: GeneralSettings = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|_| "偏好设置损坏，请恢复备份")?;
+    if !crate::platform::supports_tun() { settings.traffic_mode = "app_proxy".into(); settings.tun_mode = false; }
+    if cfg!(target_os = "macos") { settings.tray_menu_style = "classic".into(); }
+    if cfg!(target_os = "android") {
+        settings.traffic_mode = "tun".into(); settings.tun_mode = true;
+        settings.speed_test_concurrency = settings.speed_test_concurrency.clamp(1, 4);
+        settings.health_probe_concurrency = settings.health_probe_concurrency.clamp(1, 4);
+    }
+    Ok(settings)
 }
 #[tauri::command]
 pub async fn save_general_settings(settings: GeneralSettings, state: tauri::State<'_, super::process::CoreStateMutex>) -> Result<GeneralSettings, String> {
@@ -105,16 +119,23 @@ pub async fn save_general_settings(settings: GeneralSettings, state: tauri::Stat
 async fn save_and_restart(settings: GeneralSettings, state: &super::process::CoreStateMutex) -> Result<GeneralSettings, String> {
     let _lifecycle = super::process::LIFECYCLE.lock().await;
     let previous = get_general_settings()?;
+    #[cfg(windows)]
+    if settings.traffic_mode == crate::capture::windivert::plan::MODE && previous.traffic_mode != settings.traffic_mode {
+        crate::capture::windivert::assets::validate_resource(&crate::capture::windivert::assets::resource()?)?;
+    }
     let (restart, mode) = {
         let mut core = state.lock().map_err(|_| "读取核心状态失败")?;
+        #[cfg(not(target_os = "android"))]
         let running = match core.child.as_mut() { Some(child) => child.try_wait().map_err(|_| "读取核心状态失败")?.is_none(), None => false };
+        #[cfg(target_os = "android")]
+        let running = crate::platform::android::call::<serde_json::Value>("status", ())?["running"] == true;
         let mode = core.core_mode.clone();
         (running && core_settings_changed(&previous, &settings), mode)
     };
     let proxy_enabled = super::sysproxy::get_system_proxy_status()?;
     let preference_path = crate::storage::data_dir().join("config/preferences.json");
     let original = if preference_path.exists() { Some(std::fs::read(&preference_path).map_err(|_| "备份偏好失败")?) } else { None };
-    persist_general_settings(settings.clone(), &state)?;
+    let settings = persist_general_settings(settings, &state)?;
     if restart {
         let result = async {
             { let mut core = state.lock().map_err(|_| "读取核心状态失败")?; super::process::stop_owned_child(&mut core)?; }
@@ -137,6 +158,14 @@ async fn save_and_restart(settings: GeneralSettings, state: &super::process::Cor
 }
 
 fn persist_general_settings(mut settings: GeneralSettings, state: &super::process::CoreStateMutex) -> Result<GeneralSettings, String> {
+    crate::platform::validate_traffic_mode(&settings.traffic_mode, settings.tun_mode)?;
+    if cfg!(target_os = "android") {
+        if !settings.enable_controller_port { return Err("Android 要求内部控制端口开启".into()); }
+        settings.speed_test_concurrency = settings.speed_test_concurrency.clamp(1, 4);
+        settings.health_probe_concurrency = settings.health_probe_concurrency.clamp(1, 4);
+        super::mobile_settings::validate(&settings.lan_sharing, settings.allow_lan, &settings.vpn_apps, settings.mixed_port, settings.controller_port)?;
+    }
+    if cfg!(target_os = "macos") { settings.tray_menu_style = "classic".into(); }
     if settings.mixed_port == 0 {
         return Err("Mixed 端口须为 1–65535".into());
     }
@@ -152,7 +181,7 @@ fn persist_general_settings(mut settings: GeneralSettings, state: &super::proces
         settings.tun_mode = true;
     } else {
         settings.tun_mode = false;
-        if settings.traffic_mode != "smart_hybrid" {
+        if settings.traffic_mode != "smart_hybrid" && settings.traffic_mode != "windivert_v1" {
             settings.traffic_mode = "app_proxy".into();
         }
     }
@@ -181,7 +210,13 @@ fn persist_general_settings(mut settings: GeneralSettings, state: &super::proces
         }
         Some((key, previous))
     } else { None };
+    #[cfg(target_os = "macos")]
+    let mac_autostart_previous = get_general_settings()?.auto_start;
+    #[cfg(target_os = "macos")]
+    if mac_autostart_previous != settings.auto_start { crate::platform::macos::apps::set_autostart(settings.auto_start)?; }
     if let Err(error) = crate::storage::replace(&crate::storage::data_dir().join("config/preferences.json"), &bytes) {
+        #[cfg(target_os = "macos")]
+        if mac_autostart_previous != settings.auto_start { crate::platform::macos::apps::set_autostart(mac_autostart_previous).map_err(|_| format!("{error}；登录启动项恢复失败"))?; }
         #[cfg(windows)] if let Some((key, previous)) = autostart_rollback {
             let restored = match previous {
                 Some(value) => key.set_raw_value("ProcWeaver", &value),
@@ -210,10 +245,13 @@ fn core_settings_changed(a: &GeneralSettings, b: &GeneralSettings) -> bool {
         || a.routing_priority != b.routing_priority
         || a.ipv6 != b.ipv6 || a.find_process_mode != b.find_process_mode
         || a.append_system_dns != b.append_system_dns
+        || a.lan_sharing != b.lan_sharing || a.vpn_apps != b.vpn_apps
 }
 
 #[tauri::command]
 pub fn get_active_traffic_driver() -> String {
+    #[cfg(target_os = "android")]
+    { return "tun".into(); }
     crate::capture::smart_arbiter::get_active_driver_name()
 }
 
@@ -223,6 +261,11 @@ pub fn prepare_config(raw: &str) -> Result<String, String> {
 }
 
 pub fn prepare_with(raw: &str, settings: &GeneralSettings) -> Result<String, String> {
+    prepare_with_runtime(raw, settings, std::env::consts::OS, super::dns::get_dns_settings().ok())
+}
+
+fn prepare_with_runtime(raw: &str, settings: &GeneralSettings, os: &str, dns_settings: Option<super::dns::DnsSettings>) -> Result<String, String> {
+    crate::platform::validate_traffic_mode(&settings.traffic_mode, settings.tun_mode)?;
     let mut legacy_groups = Vec::new();
     let mut yaml: serde_yaml::Value = match serde_yaml::from_str(raw) {
         Ok(value) => value,
@@ -284,7 +327,7 @@ pub fn prepare_with(raw: &str, settings: &GeneralSettings) -> Result<String, Str
     }
 
     // DNS 覆写逻辑：若开启了 DNS 覆写，则合成标准化 DNS 块并覆盖订阅原 DNS
-    if let Ok(mut dns_settings) = super::dns::get_dns_settings() {
+    if let Some(mut dns_settings) = dns_settings {
         if dns_settings.enable_override {
             if settings.append_system_dns {
                 dns_settings.append_system_dns = true;
@@ -297,7 +340,104 @@ pub fn prepare_with(raw: &str, settings: &GeneralSettings) -> Result<String, Str
         dns_map.insert("append-system-dns".into(), settings.append_system_dns.into());
     }
 
+    // Windows 订阅常见的 DNS 通配监听随“允许局域网”收敛到回环。
+    // 只调整最终运行配置；不改订阅文件、解析上游、端口或用户的 DNS 偏好。
+    if os == "windows" && !settings.allow_lan {
+        if let Some(dns) = map.get_mut(serde_yaml::Value::from("dns")).and_then(serde_yaml::Value::as_mapping_mut) {
+            if let Some(listen) = dns.get(serde_yaml::Value::from("listen")).and_then(serde_yaml::Value::as_str).filter(|value| !value.trim().is_empty()) {
+                let mut address = super::dns_runtime::parse_listen(listen)?;
+                if address.ip().is_unspecified() {
+                    address.set_ip(if address.is_ipv4() { std::net::Ipv4Addr::LOCALHOST.into() } else { std::net::Ipv6Addr::LOCALHOST.into() });
+                }
+                dns.insert("listen".into(), address.to_string().into());
+            }
+        }
+    }
+    // 先合成 DNS 覆写，再校验实际运行配置，避免被已被覆盖的订阅字段拦截。
+    if os != "android" { validate_profile_inbounds(map, settings.allow_lan, os)?; }
+    if os == "android" {
+        // VpnService owns TUN and DNS. REST reloads must not replace its descriptor.
+        map.insert("tun".into(), serde_yaml::to_value(serde_json::json!({"enable":false})).map_err(|e| e.to_string())?);
+        map.insert("allow-lan".into(), false.into());
+        map.insert("bind-address".into(), "127.0.0.1".into());
+        #[cfg(target_os = "android")]
+        map.insert("secret".into(), crate::platform::android::controller_secret()?.into());
+        map.insert("log-level".into(), "warning".into());
+        let dns = map.entry("dns".into()).or_insert(serde_yaml::Mapping::new().into());
+        let dns = dns.as_mapping_mut().ok_or("dns 必须为对象")?;
+        dns.insert("enable".into(), true.into());
+        dns.insert("listen".into(), "".into());
+        // Real destination addresses are required by Android's UID lookup.
+        dns.insert("enhanced-mode".into(), "redir-host".into());
+        dns.entry("nameserver".into()).or_insert(serde_yaml::to_value(["https://1.1.1.1/dns-query"] ).unwrap());
+        for field in ["port", "socks-port", "redir-port", "tproxy-port"] { map.remove(serde_yaml::Value::from(field)); }
+        for field in ["external-controller-tls", "external-controller-unix", "external-controller-pipe"] { map.remove(serde_yaml::Value::from(field)); }
+        super::mobile_settings::remove_managed_listener(map);
+        validate_profile_inbounds(map, false, os)?;
+        super::mobile_settings::validate(&settings.lan_sharing, settings.allow_lan, &settings.vpn_apps, settings.mixed_port, settings.controller_port)?;
+    }
     serde_yaml::to_string(&yaml).map_err(|e| e.to_string())
+}
+
+fn validate_profile_inbounds(map: &serde_yaml::Mapping, allow_lan: bool, os: &str) -> Result<(), String> {
+    let key = |name| map.get(serde_yaml::Value::from(name));
+    if os == "macos" {
+        for name in ["redir-port", "tproxy-port"] {
+            if key(name).is_some_and(|value| !value.is_null() && value.as_i64() != Some(0)) {
+                return Err(format!("macOS 尚未启用透明接管，订阅不能包含 {name}"));
+            }
+        }
+        if key("secret").is_some_and(|value| !value.is_null() && value.as_str() != Some("")) {
+            return Err("订阅设置了控制接口 secret，但应用内部控制请求尚不支持该密钥；请移除订阅中的 secret 后重试".into());
+        }
+        for name in ["external-controller-tls", "external-controller-unix"] {
+            if key(name).is_some_and(|value| !value.is_null() && value.as_str() != Some("")) {
+                return Err(format!("macOS 控制接口仅允许应用管理的回环地址，订阅不能包含 {name}"));
+            }
+        }
+    }
+    if let Some(listeners) = key("listeners").filter(|value| !value.is_null()) {
+        let listeners = listeners.as_sequence().ok_or("订阅 listeners 必须是数组")?;
+        for listener in listeners {
+            let listener = listener.as_mapping().ok_or("订阅 listener 必须是对象")?;
+            let field = |name| listener.get(serde_yaml::Value::from(name));
+            let kind = field("type").and_then(serde_yaml::Value::as_str).ok_or("订阅 listener 缺少 type")?;
+            if os == "macos" && matches!(kind.to_ascii_lowercase().as_str(), "tun" | "redir" | "redirect" | "tproxy") {
+                return Err("macOS 尚未启用 TUN 或透明接管，订阅不能包含此类 listener".into());
+            }
+            // Windows may use a TUN listener without a TCP/UDP bind address.
+            if !allow_lan && !(os == "windows" && kind.eq_ignore_ascii_case("tun")) {
+                let listen = field("listen").and_then(serde_yaml::Value::as_str).ok_or("关闭局域网访问时，订阅 listener 必须显式绑定回环地址")?;
+                if !listen.parse::<std::net::IpAddr>().is_ok_and(|address| address.is_loopback()) {
+                    return Err("关闭局域网访问时，订阅 listener 只能绑定 127.0.0.1 或 ::1 等回环地址".into());
+                }
+            }
+        }
+    }
+    if !allow_lan {
+        for name in ["ss-config", "vmess-config", "tuic-server"] {
+            let active = key(name).is_some_and(|value| {
+                if value.is_null() { return false; }
+                if name != "tuic-server" { return true; }
+                value.as_mapping().and_then(|options| options.get(serde_yaml::Value::from("enable")))
+                    .and_then(serde_yaml::Value::as_bool) != Some(false)
+            });
+            if active {
+                return Err(format!("关闭局域网访问时，订阅不能包含独立入站 {name}"));
+            }
+        }
+        if let Some(dns) = key("dns").and_then(serde_yaml::Value::as_mapping) {
+            if let Some(listen) = dns.get(serde_yaml::Value::from("listen")) {
+                // Empty DNS listen disables the separate listener on Windows/Android.
+                if matches!(os, "windows" | "android") && (listen.is_null() || listen.as_str().is_some_and(|value| value.trim().is_empty())) { return Ok(()); }
+                let address = listen.as_str().and_then(|value| value.parse::<std::net::SocketAddr>().ok());
+                if !address.is_some_and(|address| address.ip().is_loopback()) {
+                    return Err("关闭局域网访问时，订阅 DNS 监听只能绑定回环地址".into());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn repair_legacy_members(yaml: &mut serde_yaml::Value, legacy_names: &[String]) {
@@ -362,6 +502,28 @@ fn repair_legacy_rule_indentation(raw: &str) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn android_profile_normalization_can_be_repeated_after_import() {
+        let settings = GeneralSettings::default();
+        for listen in ["", "0.0.0.0:1053", "127.0.0.1:1053"] {
+            let raw = format!("proxies: []\nrules: [MATCH,DIRECT]\ndns:\n  listen: '{listen}'\n");
+            let imported = prepare_with_runtime(&raw, &settings, "android", None).unwrap();
+            let restarted = prepare_with_runtime(&imported, &settings, "android", None).unwrap();
+            let value: serde_yaml::Value = serde_yaml::from_str(&restarted).unwrap();
+            assert_eq!(value["dns"]["listen"].as_str(), Some(""));
+            assert_eq!(value["tun"]["enable"].as_bool(), Some(false));
+            assert_eq!(serde_yaml::from_str::<serde_yaml::Value>(&imported).unwrap(), value);
+        }
+    }
+    #[test]
+    fn android_normalization_still_rejects_unmanaged_public_listeners() {
+        let settings = GeneralSettings { allow_lan: true, lan_sharing: super::super::mobile_settings::LanSharing {
+            username: "test".into(), password: "test-only-password".into(), ..Default::default()
+        }, ..GeneralSettings::default() };
+        let raw = "proxies: []\nlisteners:\n- {name: unsafe, type: mixed, listen: 0.0.0.0, port: 19876}\n";
+        assert!(prepare_with_runtime(raw, &settings, "android", None).is_err());
+        assert!(prepare_with_runtime(&raw.replace("0.0.0.0", "127.0.0.1"), &settings, "android", None).is_ok());
+    }
+    #[test]
     fn repairs_old_rule_insertion_without_dropping_existing_rules() {
         let raw = "proxies: []\nrules:\n    - 'RULE-SET,openai,DIRECT'\n- DOMAIN,example.org,DIRECT\n- MATCH,DIRECT\n";
         assert!(serde_yaml::from_str::<serde_yaml::Value>(raw).is_err());
@@ -401,6 +563,97 @@ mod tests {
         for raw in ["<html>Forbidden</html>", "unavailable", "[]", "error: denied"] {
             assert!(prepare_with(raw, &GeneralSettings::default()).is_err());
         }
+    }
+    #[test]
+    fn profile_listeners_obey_local_binding_and_macos_capture_gate() {
+        let settings = GeneralSettings::default();
+        for listen in ["127.0.0.1", "127.0.0.2", "::1"] {
+            let raw = format!("proxies: []\nlisteners:\n- name: local\n  type: mixed\n  listen: '{listen}'\n  port: 1080\n");
+            let result = prepare_with(&raw, &settings).unwrap();
+            let value: serde_yaml::Value = serde_yaml::from_str(&result).unwrap();
+            assert_eq!(value["listeners"][0]["listen"].as_str(), Some(listen));
+        }
+        for listen in ["0.0.0.0", "::", "192.168.1.10", "localhost", ""] {
+            let raw = format!("proxies: []\nlisteners:\n- name: remote\n  type: mixed\n  listen: '{listen}'\n  port: 1080\n");
+            assert!(prepare_with(&raw, &settings).is_err(), "unexpectedly accepted {listen}");
+        }
+        assert!(prepare_with("proxies: []\nlisteners:\n- name: implicit-wildcard\n  type: mixed\n  port: 1080\n", &settings).is_err());
+        for kind in ["tun", "redir", "redirect", "tproxy"] {
+            let raw = format!("listeners:\n- name: capture\n  type: {kind}\n  listen: 127.0.0.1\n  port: 1080\n");
+            let yaml: serde_yaml::Value = serde_yaml::from_str(&raw).unwrap();
+            assert!(validate_profile_inbounds(yaml.as_mapping().unwrap(), true, "macos").is_err(), "unexpectedly accepted {kind}");
+        }
+        let yaml: serde_yaml::Value = serde_yaml::from_str("listeners:\n- name: local\n  type: mixed\n  listen: ::1\n  port: 1080\n").unwrap();
+        assert!(validate_profile_inbounds(yaml.as_mapping().unwrap(), false, "macos").is_ok());
+        let yaml: serde_yaml::Value = serde_yaml::from_str("listeners:\n- name: windows-tun\n  type: tun\n").unwrap();
+        assert!(validate_profile_inbounds(yaml.as_mapping().unwrap(), false, "windows").is_ok());
+    }
+    #[test]
+    fn profile_shortcut_and_dns_inbounds_obey_allow_lan() {
+        let settings = GeneralSettings::default();
+        for inbound in ["ss-config: 'ss://example'", "vmess-config: 'vmess://example'", "tuic-server:\n  enable: true\n  listen: '0.0.0.0:10443'"] {
+            assert!(prepare_with(&format!("proxies: []\n{inbound}\n"), &settings).is_err());
+        }
+        assert!(prepare_with("proxies: []\ntuic-server:\n  enable: false\n  listen: '0.0.0.0:10443'\n", &settings).is_ok());
+        assert!(prepare_with("proxies: []\ndns:\n  listen: '192.168.1.10:1053'\n", &settings).is_err());
+        assert!(prepare_with("proxies: []\ndns:\n  listen: '127.0.0.1:1053'\n", &settings).is_ok());
+        let allow_lan = GeneralSettings { allow_lan: true, ..settings };
+        assert!(prepare_with("proxies: []\nlisteners:\n- name: lan\n  type: mixed\n  listen: 0.0.0.0\n  port: 1080\n", &allow_lan).is_ok());
+    }
+    #[test]
+    fn macos_dns_override_is_checked_after_composition() {
+        let settings = GeneralSettings::default();
+        let mut dns = super::super::dns::DnsSettings::default();
+        dns.enable_override = true;
+        dns.listen = "0.0.0.0:1053".into();
+        let error = prepare_with_runtime("proxies: []\n", &settings, "macos", Some(dns.clone())).unwrap_err();
+        assert!(error.contains("DNS 监听"));
+
+        dns.listen = "127.0.0.1:1053".into();
+        let prepared = prepare_with_runtime("proxies: []\ndns:\n  listen: '0.0.0.0:1053'\n", &settings, "macos", Some(dns.clone())).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&prepared).unwrap();
+        assert_eq!(value["dns"]["listen"].as_str(), Some("127.0.0.1:1053"));
+
+        dns.listen = "0.0.0.0:1053".into();
+        let allow_lan = GeneralSettings { allow_lan: true, ..settings };
+        assert!(prepare_with_runtime("proxies: []\n", &allow_lan, "macos", Some(dns)).is_ok());
+    }
+    #[test]
+    fn windows_dns_composition_scopes_wildcard_listeners_to_loopback() {
+        let settings = GeneralSettings::default();
+        for (listen, expected) in [("0.0.0.0:1053", "127.0.0.1:1053"), ("[::]:1053", "[::1]:1053"), (":1053", "127.0.0.1:1053"), ("localhost:1053", "127.0.0.1:1053"), ("127.0.0.1:53", "127.0.0.1:53")] {
+            let raw = format!("proxies: []\ndns:\n  enable: true\n  listen: '{listen}'\n  nameserver: [1.1.1.1]\n");
+            let prepared = prepare_with_runtime(&raw, &settings, "windows", None).unwrap();
+            let value: serde_yaml::Value = serde_yaml::from_str(&prepared).unwrap();
+            assert_eq!(value["dns"]["listen"].as_str(), Some(expected));
+            assert_eq!(value["dns"]["nameserver"][0].as_str(), Some("1.1.1.1"));
+            let allow_lan = GeneralSettings { allow_lan: true, ..settings.clone() };
+            let prepared = prepare_with_runtime(&raw, &allow_lan, "windows", None).unwrap();
+            let value: serde_yaml::Value = serde_yaml::from_str(&prepared).unwrap();
+            assert_eq!(value["dns"]["listen"].as_str(), Some(listen));
+        }
+        let dns = super::super::dns::DnsSettings { enable_override: true, listen: "0.0.0.0:1053".into(), ..Default::default() };
+        let raw = "proxies: []\ndns:\n  listen: '192.168.1.10:5353'\n";
+        let prepared = prepare_with_runtime(raw, &settings, "windows", Some(dns.clone())).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&prepared).unwrap();
+        assert_eq!(value["dns"]["listen"].as_str(), Some("127.0.0.1:1053"));
+        assert!(prepare_with_runtime(raw, &settings, "windows", None).is_err());
+        let disabled = super::super::dns::DnsSettings { enable_override: false, ..dns };
+        assert!(prepare_with_runtime(raw, &settings, "windows", Some(disabled)).is_err());
+        for listen in ["", " "] {
+            assert!(prepare_with_runtime(&format!("proxies: []\ndns:\n  listen: '{listen}'\n"), &settings, "windows", None).is_ok());
+        }
+    }
+    #[test]
+    fn macos_rejects_unmanaged_transparent_and_controller_settings() {
+        let settings = GeneralSettings::default();
+        for field in ["redir-port: 7893", "tproxy-port: 7894", "secret: imported-token",
+            "external-controller-tls: '0.0.0.0:9443'", "external-controller-unix: mihomo.sock"] {
+            let raw = format!("proxies: []\n{field}\n");
+            assert!(prepare_with_runtime(&raw, &settings, "macos", None).is_err(), "unexpectedly accepted {field}");
+            assert!(prepare_with_runtime(&raw, &settings, "windows", None).is_ok(), "changed Windows profile behavior for {field}");
+        }
+        assert!(prepare_with_runtime("proxies: []\nredir-port: 0\nsecret: ''\n", &settings, "macos", None).is_ok());
     }
     #[test]
     fn applies_preferences_without_losing_tun_or_proxy_fields() {

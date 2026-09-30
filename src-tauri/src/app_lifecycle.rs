@@ -617,10 +617,10 @@ pub fn build_tray_menu(
 
     // 7. 网络急救与工具二级菜单
     let emergency_reset = MenuItem::with_id(app, "tool:emergency_reset", "🚨 一键网络急救复位 (还原DNS与代理)", true, None::<&str>)?;
-    let flush_dns = MenuItem::with_id(app, "tool:flush_dns", "🔄 刷新系统 DNS 缓存", true, None::<&str>)?;
+    let flush_dns = MenuItem::with_id(app, "tool:flush_dns", "🔄 刷新系统 DNS 缓存", cfg!(windows), None::<&str>)?;
     let close_all_conns = MenuItem::with_id(app, "tool:close_all_conns", "🔌 掐断所有当前连接 (断连重选)", true, None::<&str>)?;
-    let copy_env_pwsh = MenuItem::with_id(app, "tool:copy_env_pwsh", "📋 复制 PowerShell 代理命令", true, None::<&str>)?;
-    let copy_env_cmd = MenuItem::with_id(app, "tool:copy_env_cmd", "📋 复制 CMD 代理命令", true, None::<&str>)?;
+    let copy_env_pwsh = MenuItem::with_id(app, "tool:copy_env_pwsh", "📋 复制 PowerShell 代理命令", cfg!(windows), None::<&str>)?;
+    let copy_env_cmd = MenuItem::with_id(app, "tool:copy_env_cmd", "📋 复制 CMD 代理命令", cfg!(windows), None::<&str>)?;
     let restart_core = MenuItem::with_id(app, "tool:restart_core", "♻️ 重启网络核心服务", true, None::<&str>)?;
     let tools_sub = Submenu::with_items(
         app,

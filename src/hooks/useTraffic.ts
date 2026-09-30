@@ -11,5 +11,5 @@ export function useTraffic() {
     load(); window.addEventListener("netbox-settings-saved", load);
     return () => { alive = false; window.removeEventListener("netbox-settings-saved", load); };
   }, []);
-  return { reading: onlyProxy ? reading.proxy : reading.all, onlyProxy, error: reading.error };
+  return { reading: onlyProxy ? reading.proxy : reading.all, onlyProxy, error: reading.error, nativeTotals: reading.nativeTotals };
 }

@@ -58,11 +58,11 @@ mod platform {
 #[cfg(not(windows))]
 mod platform {
     pub fn is_admin() -> bool {
-        true
+        false
     }
 
     pub fn restart_as_admin() -> Result<(), String> {
-        Ok(())
+        Err("当前平台不支持以管理员身份重启；应用代理无需提升整个客户端权限".into())
     }
 }
 

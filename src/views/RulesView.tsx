@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo } from "react";
+import { useMobileBack } from "../utils/mobileBack";
 import { useLocalRulePlan } from "../hooks/useLocalRulePlan";
 import { useExclusions } from "../hooks/useExclusions";
 import { ExclusionsPanel } from "../components/ExclusionsPanel";
@@ -205,6 +206,7 @@ function checkRuleSetOrGeositeMatch(
 }
 
 export const RulesView: React.FC<{ coreMode: CoreModeState & { refresh: () => Promise<void>; change: (mode: CoreMode) => Promise<boolean> } }> = ({ coreMode }) => {
+  const mobile = document.documentElement.dataset.platform === "android";
   const exclusions = useExclusions();
   const [rules, setRules] = useState<RuleItem[]>([]);
   const [providers, setProviders] = useState<RuleProviderItem[]>([]);
@@ -231,6 +233,7 @@ export const RulesView: React.FC<{ coreMode: CoreModeState & { refresh: () => Pr
 
   // 自定义添加规则集弹窗状态
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+  useMobileBack(() => { if (!isAddModalOpen) return false; setIsAddModalOpen(false); return true; }, 30);
   const { plan: localPlan, saving: savingPlan, error: planError, reload: reloadLocalPlan, toggle: toggleLocalPlan } = useLocalRulePlan();
   const handlePlanToggle = async () => {
     if (await toggleLocalPlan()) await loadData();
@@ -765,7 +768,7 @@ export const RulesView: React.FC<{ coreMode: CoreModeState & { refresh: () => Pr
             </span>
           </h2>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-            当前内核正在生效的智能分流引擎，支持域名精确匹配、规则集与网段策略路由
+            {mobile && !coreMode.mode ? "连接 VPN 后可查看生效的规则；排除项和规则数据可预先配置。" : "查看域名、IP 与规则集的匹配顺序和出口。"}
           </p>
         </div>
 
@@ -787,7 +790,7 @@ export const RulesView: React.FC<{ coreMode: CoreModeState & { refresh: () => Pr
           </button>
 
           {/* 模式选择分段器 */}
-          <div className="bg-slate-100 dark:bg-slate-900/90 border border-slate-200 dark:border-slate-800/90 p-1 rounded-xl flex items-center shadow-inner transition-colors">
+          <div hidden={mobile} className="bg-slate-100 dark:bg-slate-900/90 border border-slate-200 dark:border-slate-800/90 p-1 rounded-xl flex items-center shadow-inner transition-colors">
             <button
               onClick={() => handleModeChange("rule")}
               disabled={coreMode.busy || !coreMode.mode}
@@ -900,7 +903,7 @@ export const RulesView: React.FC<{ coreMode: CoreModeState & { refresh: () => Pr
       )}
 
       {/* 规则统计看板 */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3.5">
+      <div hidden={mobile} className="grid grid-cols-2 sm:grid-cols-4 gap-3.5">
         <div className="bg-white dark:bg-slate-900/60 border border-slate-200/80 dark:border-slate-800/80 rounded-2xl p-4 flex items-center gap-3.5 shadow-sm transition-colors">
           <div className="w-10 h-10 rounded-xl bg-indigo-50 border border-indigo-200 text-indigo-600 dark:bg-indigo-500/10 dark:border-indigo-500/20 dark:text-indigo-400 flex items-center justify-center">
             <Layers className="w-5 h-5" />
@@ -1015,7 +1018,7 @@ export const RulesView: React.FC<{ coreMode: CoreModeState & { refresh: () => Pr
       )}
 
       {/* 分流命中测试模拟器 */}
-      <div className="bg-gradient-to-r from-indigo-50/70 via-white to-purple-50/40 dark:from-slate-900/90 dark:via-slate-900/60 dark:to-indigo-950/30 border border-indigo-200/80 hover:border-indigo-300 dark:border-indigo-500/20 dark:hover:border-indigo-500/35 transition rounded-2xl p-4 shadow-sm dark:shadow-lg dark:shadow-black/20">
+      <div hidden={mobile} className="bg-gradient-to-r from-indigo-50/70 via-white to-purple-50/40 dark:from-slate-900/90 dark:via-slate-900/60 dark:to-indigo-950/30 border border-indigo-200/80 hover:border-indigo-300 dark:border-indigo-500/20 dark:hover:border-indigo-500/35 transition rounded-2xl p-4 shadow-sm dark:shadow-lg dark:shadow-black/20">
         <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
           <div className="flex items-center gap-2">
             <div className="p-1 rounded-lg bg-indigo-100 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-400">

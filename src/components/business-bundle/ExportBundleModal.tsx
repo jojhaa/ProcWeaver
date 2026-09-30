@@ -1,4 +1,5 @@
 import React from "react";
+import { saveTextFile } from "../../services/fileExport";
 import { BundleLocalInstance } from "../../types/businessBundle";
 import { exportBundlePackage } from "../../services/bundleStorage";
 import { Upload, X, ShieldCheck, Download } from "lucide-react";
@@ -10,28 +11,24 @@ interface Props {
 }
 
 export const ExportBundleModal: React.FC<Props> = ({ isOpen, instance, onClose }) => {
+  const [exportError, setExportError] = React.useState("");
   if (!isOpen || !instance) return null;
 
   const def = instance.definition;
 
-  const handleDownload = () => {
+  const handleDownload = async () => {
     const exportedData = exportBundlePackage(instance);
     const jsonString = JSON.stringify(exportedData, null, 2);
-    const blob = new Blob([jsonString], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${def.packageName.replace(/[\/\\:*?"<>|]/g, "_")}.pwpack.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    onClose();
+    try {
+      setExportError("");
+      if (await saveTextFile(`${def.packageName.replace(/[\/\\:*?"<>|]/g, "_")}.pwpack.json`, jsonString, "application/json")) onClose();
+    } catch (error) { setExportError(String(error)); }
   };
 
   return (
     <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
       <div className="w-full max-w-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700/80 rounded-3xl p-6 shadow-2xl space-y-4 animate-in fade-in duration-150">
+        {exportError && <p role="alert" className="text-sm text-rose-600">{exportError}</p>}
         
         {/* 标题 */}
         <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">

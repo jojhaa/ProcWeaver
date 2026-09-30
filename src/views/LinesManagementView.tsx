@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { ProxyGroup, ProxyItem, IpHealthInfo, ProfileItem } from "../types";
 import { SmartGroupRule } from "../types/smartGroup";
-import { fetchProxies, switchProxy, testDelay, getPreferredSpeedTestUrl } from "../api/mihomo";
+import { fetchProxies, fetchMihomoConfig, switchProxy, testDelay, getPreferredSpeedTestUrl } from "../api/mihomo";
+import { mobileSelectionGroup, selectedLeaf, type MobileCoreMode } from "../utils/mobileNodeSelection";
 import { logInfo, logWarn, logError } from "../api/logs";
 import {
   getSmartGroups,
@@ -35,6 +36,7 @@ import { setGlobalTrayGroups } from "../hooks/useTrayManager";
 import { buildCategorizedTrayGroups, RawNodeForTray } from "../utils/trayGroups";
 import { SmartGroupModal } from "../components/SmartGroupModal";
 import { VirtualGrid, VirtualGridScroller } from "../components/VirtualGrid";
+import { MobileNodeCard } from "../components/MobileNodeCard";
 import { createBatchUpdates } from "../utils/batchUpdates";
 import { useDebouncedValue } from "../hooks/useDebouncedValue";
 import { useProfileSwitch } from "../hooks/useProfileSwitch";
@@ -72,13 +74,28 @@ function formatBytes(bytes?: number): string {
   return `${parseFloat(val.toFixed(1))} ${sizes[i]}`;
 }
 
-export const LinesManagementView: React.FC = React.memo(() => {
+export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = React.memo(({ coreMode = null }) => {
+  const mobile = document.documentElement.dataset.platform === "android";
+  const [catalogOffline, setCatalogOffline] = useState(false);
+  const [catalogMessage, setCatalogMessage] = useState("");
+  const [probeMessage, setProbeMessage] = useState("");
+  const readRevision = useRef(0);
+  const nodeSession = useRef(0);
+  const openSubscriptions = () => {
+    if (mobile) window.dispatchEvent(new CustomEvent("netbox-navigate-tab", { detail: "profiles" }));
+    else setSubDrawerOpen(true);
+  };
   const profileSwitch = useProfileSwitch();
   const localNodes = useLocalNodes();
   const localByAlias = useMemo(() => new Map(localNodes.view?.nodes.map(n => [n.alias, n]) || []), [localNodes.view]);
   const nodeLabel = (name: string) => localByAlias.get(name)?.name || name;
   const [sourceFilter, setSourceFilter] = useState("all");
   const [groups, setGroups] = useState<ProxyGroup[]>([]);
+  const [selectionGroup, setSelectionGroup] = useState("");
+  const switchingNode = useRef(false);
+  const [switchingNodeName, setSwitchingNodeName] = useState<string | null>(null);
+  const [mobileToolsOpen, setMobileToolsOpen] = useState(false);
+  const [mobileSelecting, setMobileSelecting] = useState(false);
   const [proxies, setProxies] = useState<Record<string, ProxyItem>>({});
   const [delayMap, setDelayMap] = useState<Record<string, number | null>>({});
   const [testingAll, setTestingAll] = useState(false);
@@ -109,7 +126,7 @@ export const LinesManagementView: React.FC = React.memo(() => {
       return true;
     }
   });
-  const [sortBy] = useState<"default" | "latency-asc" | "name-asc">("default");
+  const [sortBy, setSortBy] = useState<"default" | "latency-asc" | "name-asc">("default");
 
   // 自建智能策略组规则
   const [smartRules, setSmartRules] = useState<SmartGroupRule[]>([]);
@@ -122,6 +139,16 @@ export const LinesManagementView: React.FC = React.memo(() => {
   const selectedSet = useMemo(() => new Set(selectedNodes), [selectedNodes]);
   const [packModalType, setPackModalType] = useState<"url-test" | "relay" | null>(null);
   const [packName, setPackName] = useState("");
+  const [packError, setPackError] = useState("");
+  const [packSaving, setPackSaving] = useState(false);
+  const packPending = useRef(false);
+  const packDialog = useRef<HTMLDialogElement>(null);
+  const closePack = () => { if (!packPending.current) setPackModalType(null); };
+  useEffect(() => {
+    setPackError("");
+    if (packModalType) packDialog.current?.showModal();
+    else packDialog.current?.close();
+  }, [packModalType]);
 
   // 侧边订阅管理抽屉
   const [subDrawerOpen, setSubDrawerOpen] = useState(false);
@@ -179,20 +206,28 @@ export const LinesManagementView: React.FC = React.memo(() => {
 
   // 初始加载
   const loadData = async () => {
+    const revision = ++readRevision.current;
     const profileVersion = profileReadVersion.current;
     try {
       const pData = await fetchProxies();
+      if (revision !== readRevision.current) return;
+      setCatalogOffline(Boolean(pData.offline));
+      setCatalogMessage((pData.warnings || []).join("；"));
       setProxies(pData.proxies || {});
       setGroups(pData.groups || []);
 
       const sRules = await getSmartGroups();
+      if (revision !== readRevision.current) return;
       setSmartRules(sRules);
 
-      const diskCache = await getPersistedHealthCache();
+      const savedCache = await getPersistedHealthCache();
+      if (revision !== readRevision.current) return;
+      const diskCache = mobile ? Object.fromEntries(Object.entries(savedCache).filter(([name, info]) => Boolean(pData.proxies[name]?.catalogKey) && info.catalogKey === pData.proxies[name].catalogKey)) : savedCache;
       if (diskCache) setHealthCache(diskCache);
 
       const diskRegions = await getPersistedNodeRegions();
-      const mergedRegions = { ...diskRegions };
+      if (revision !== readRevision.current) return;
+      const mergedRegions = mobile ? {} as Record<string, string> : { ...diskRegions };
       if (diskCache) {
         Object.entries(diskCache).forEach(([name, info]) => {
           if (info.countryCode && !mergedRegions[name]) {
@@ -209,6 +244,7 @@ export const LinesManagementView: React.FC = React.memo(() => {
       const profs = await getProfiles();
       if (profileVersion === profileReadVersion.current) setProfiles(profs);
     } catch (err) {
+      if (revision === readRevision.current) setCatalogMessage(`读取节点失败：${String(err)}`);
       console.error("加载线路管理大盘数据失败:", err);
     }
   };
@@ -216,9 +252,12 @@ export const LinesManagementView: React.FC = React.memo(() => {
   useEffect(() => {
     loadData();
     const handleProfileChange = () => {
+      nodeSession.current++;
       pendingJobs.current.forEach(job => job.abort());
       pendingBatches.current.forEach(flush => flush());
       setTestingNodes({});
+      setDelayMap({});
+      setSelectionGroup("");
       void loadData();
     };
     const handleHealthUpdated = (e: any) => {
@@ -228,9 +267,13 @@ export const LinesManagementView: React.FC = React.memo(() => {
       }
     };
     window.addEventListener("procweaver-profile-changed", handleProfileChange);
+    window.addEventListener("netbox-core-status-changed", handleProfileChange);
     window.addEventListener("netbox-node-health-updated", handleHealthUpdated);
     return () => {
       window.removeEventListener("procweaver-profile-changed", handleProfileChange);
+      window.removeEventListener("netbox-core-status-changed", handleProfileChange);
+      readRevision.current++;
+      nodeSession.current++;
       window.removeEventListener("netbox-node-health-updated", handleHealthUpdated);
     };
   }, []);
@@ -297,9 +340,10 @@ export const LinesManagementView: React.FC = React.memo(() => {
 
   // 当前激活使用中的主节点名称
   const activeNodeName = useMemo(() => {
+    if (mobile) return selectedLeaf(groups, mobileSelectionGroup(groups, coreMode, selectionGroup));
     const mainGroup = groups.find((g) => g.name === "PROXY" || g.name === "GLOBAL") || groups[0];
     return mainGroup?.now || "";
-  }, [groups]);
+  }, [groups, mobile, coreMode, selectionGroup]);
 
   // 全量测速
   const handleTestAll = async () => {
@@ -342,8 +386,8 @@ export const LinesManagementView: React.FC = React.memo(() => {
         try {
           const delay = await testDelay(node, testEndpoint, 3000);
           if (job.signal.aborted) break;
-          batch.add({ node, testing: false, delay });
-          if (delay !== null && delay !== undefined) {
+          batch.add({ node, testing: false, delay: delay ?? 0 });
+          if (delay !== null && delay > 0) {
             successCount++;
             totalDelay += delay;
             if (delay < fastestDelay) {
@@ -355,7 +399,7 @@ export const LinesManagementView: React.FC = React.memo(() => {
           }
         } catch {
           if (job.signal.aborted) break;
-          batch.add({ node, testing: false, delay: null });
+          batch.add({ node, testing: false, delay: 0 });
           timeoutCount++;
         } finally {
           if (!job.signal.aborted) batch.add({ node, testing: false });
@@ -382,15 +426,18 @@ export const LinesManagementView: React.FC = React.memo(() => {
 
   // 单节点测速
   const handleTestNode = async (name: string, e?: React.MouseEvent) => {
+    if (catalogOffline) { setCatalogMessage("延迟测速需要先连接 VPN；IP 体检可以独立运行。"); return; }
     e?.stopPropagation();
     if (testingAll || testingNodes[name]) return;
+    const revision = nodeSession.current;
     setTestingNodes((prev) => ({ ...prev, [name]: true }));
     const testEndpoint = getPreferredSpeedTestUrl() || "https://cp.cloudflare.com/generate_204";
     logInfo("节点测速", `发起单节点延迟测速: [${name}] -> 目标: ${testEndpoint}`);
     try {
       const delay = await testDelay(name, testEndpoint, 3000);
-      setDelayMap((prev) => ({ ...prev, [name]: delay }));
-      if (delay !== null && delay !== undefined) {
+      if (revision !== nodeSession.current) return;
+      setDelayMap((prev) => ({ ...prev, [name]: delay ?? 0 }));
+      if (delay !== null && delay > 0) {
         const quality =
           delay <= 100
             ? "极速 · 极佳"
@@ -404,10 +451,11 @@ export const LinesManagementView: React.FC = React.memo(() => {
         logWarn("节点测速", `节点 [${name}] 测速超时或无法连通 (>3000ms)`);
       }
     } catch (err: any) {
-      setDelayMap((prev) => ({ ...prev, [name]: null }));
+      if (revision !== nodeSession.current) return;
+      setDelayMap((prev) => ({ ...prev, [name]: 0 }));
       logError("节点测速", `节点 [${name}] 测速异常: ${err?.message || String(err)}`);
     } finally {
-      setTestingNodes((prev) => ({ ...prev, [name]: false }));
+      if (revision === nodeSession.current) setTestingNodes((prev) => ({ ...prev, [name]: false }));
     }
   };
 
@@ -416,13 +464,17 @@ export const LinesManagementView: React.FC = React.memo(() => {
     e?.stopPropagation();
     if (probingAll || singleProbeBusy.current) return;
     singleProbeBusy.current = true;
+    setProbeMessage("");
+    const job = new AbortController(); pendingJobs.current.add(job);
     setProbingNodes((prev) => ({ ...prev, [name]: true }));
     logInfo("IP健康", `发起单节点深度体检: [${name}]`);
     try {
       let resultItem: IpHealthInfo | null = null;
-      await probeNodeHealthBatch([name], (_node, res) => {
-        if (res) resultItem = res;
-      });
+      await probeNodeHealthBatch([name], (_node, res, _completed, _total, error) => {
+        if (res) resultItem = { ...res, catalogKey: proxies[name]?.catalogKey };
+        else setProbeMessage(`${nodeLabel(name)}：${error || "未获取到有效出口 IP"}`);
+      }, job.signal);
+      if (job.signal.aborted) return;
       if (resultItem) {
         const next = { ...healthCache, [name]: resultItem };
         setHealthCache(next);
@@ -438,31 +490,35 @@ export const LinesManagementView: React.FC = React.memo(() => {
         savePersistedNodeRegions(nextRegions);
 
         const rInfo = resultItem as IpHealthInfo;
-        const riskScore = rInfo.fraudScore !== undefined ? `${rInfo.fraudScore}分` : "无评分";
+        const riskScore = rInfo.fraudScore != null ? `${rInfo.fraudScore}分` : "无评分";
         logInfo(
           "IP健康",
-          `节点 [${name}] 深度体检就绪: IP: ${rInfo.ip} (${rInfo.country || "未知"}${rInfo.city ? " · " + rInfo.city : ""}) | 运营商: ${rInfo.asOrganization || rInfo.asn || "未知"} | 风控分: ${riskScore} | 类型: ${rInfo.isResidential ? "原生住宅" : "数据中心"}`
+          `节点 [${name}] 深度体检就绪: IP: ${rInfo.ip} (${rInfo.country || "未知"}${rInfo.city ? " · " + rInfo.city : ""}) | 运营商: ${rInfo.asOrganization || rInfo.asn || "未知"} | 风控分: ${riskScore} | 类型: ${rInfo.isResidential == null ? "未知" : rInfo.isResidential ? "原生住宅" : "数据中心"}`
         );
       } else {
         logWarn("IP健康", `节点 [${name}] 深度体检未能解析到出口画像数据`);
       }
     } catch (err: any) {
+      setProbeMessage(`体检失败：${String(err)}`);
       console.error("单节点体检失败:", err);
       logError("IP健康", `节点 [${name}] 深度体检失败: ${err?.message || String(err)}`);
     } finally {
+      pendingJobs.current.delete(job);
       singleProbeBusy.current = false;
       setProbingNodes((prev) => ({ ...prev, [name]: false }));
     }
   };
 
   // 全量 IP 纯净体检与真实地区重排
-  const handleProbeAllHealth = async () => {
-    const targetNames = realNodes.map((n) => n.name);
+  const handleProbeAllHealth = async (requestedNames?: string[]) => {
+    const targetNames = realNodes.filter(n => !ignoredSet.has(n.name) && (!requestedNames || requestedNames.includes(n.name))).map(n => n.name);
     if (targetNames.length === 0 || probingAll || singleProbeBusy.current) return;
 
     setProbingAll(true);
+    setProbeMessage("");
     const job = new AbortController(); pendingJobs.current.add(job);
     setProbeProgress({ completed: 0, total: targetNames.length });
+    const failures: string[] = [];
 
     const probeConcurrency = getStoredHealthProbeConcurrency();
     logInfo(
@@ -493,17 +549,21 @@ export const LinesManagementView: React.FC = React.memo(() => {
     pendingBatches.current.add(batch.flush);
 
     try {
-      await probeNodeHealthBatch(targetNames, (node, result, completed, total) => {
+      await probeNodeHealthBatch(targetNames, (node, result, completed, total, error) => {
+        if (result) result = { ...result, catalogKey: proxies[node]?.catalogKey };
+        else if (failures.length < 3) failures.push(`${nodeLabel(node)}：${error || "未获取到有效 IP"}`);
         if (result) successCount++;
         batch.add({ node, result, completed, total });
       }, job.signal);
       const costMs = Math.round(performance.now() - startAllTime);
+      setProbeMessage(job.signal.aborted ? "体检已取消" : `体检完成：成功 ${successCount}，失败 ${targetNames.length - successCount}。${failures.length ? `失败示例：${failures.join("；")}。可单独重试。` : ""}`);
       logInfo(
         "IP健康",
         `全量节点深度体检${job.signal.aborted ? "已停止" : "完成"} [总耗时: ${costMs}ms]: 成功获取画像 ${successCount}/${targetNames.length} 个节点`
       );
     } catch (err: any) {
       console.error("全量 IP 健康体检出错:", err);
+      setProbeMessage(`体检未完成：${String(err)}`);
       logError("IP健康", `全量 IP 健康体检异常中断: ${err?.message || String(err)}`);
     } finally {
       batch.flush();
@@ -517,8 +577,36 @@ export const LinesManagementView: React.FC = React.memo(() => {
     }
   };
 
-  // 切换当前节点 (全面穿透：同步切换 PROXY、GLOBAL 以及包含该节点的所有主选择策略组，D01: 真实结果校验)
+  // Android 只切换当前模式下明确选择的策略组，保留应用独立出口。
   const handleSelectProxy = async (nodeName: string) => {
+    if (catalogOffline) { setCatalogMessage("节点已保存，请先连接 VPN 再切换当前出口。"); return; }
+    if (mobile) {
+      if (switchingNode.current) return;
+      switchingNode.current = true;
+      setSwitchingNodeName(nodeName);
+      try {
+        const [config, catalog] = await Promise.all([fetchMihomoConfig(), fetchProxies()]);
+        const group = mobileSelectionGroup(catalog.groups, config?.mode as MobileCoreMode, selectionGroup);
+        if (!group) {
+          setMobileToolsOpen(true);
+          throw new Error(config?.mode === "direct" ? "直连模式无需切换节点，请先切换为规则或全局模式。" : "请选择要切换的策略组，然后重试。");
+        }
+        if (!group.all?.includes(nodeName)) {
+          setMobileToolsOpen(true);
+          throw new Error(`策略组 ${group.name} 不包含此节点，请选择对应策略组。`);
+        }
+        if (!await switchProxy(group.name, nodeName)) throw new Error("核心未接受节点切换，请重试。");
+        setCatalogMessage("");
+        window.dispatchEvent(new CustomEvent("netbox-active-node-changed", { detail: { nodeName } }));
+        window.dispatchEvent(new Event("netbox-route-changed"));
+        await loadData();
+      } catch (error) { setCatalogMessage(String(error)); }
+      finally {
+        switchingNode.current = false;
+        setSwitchingNodeName(null);
+      }
+      return;
+    }
     try {
       const targetGroups = groups.filter(
         (g) =>
@@ -577,8 +665,8 @@ export const LinesManagementView: React.FC = React.memo(() => {
   };
 
   // 节点多选操作
-  const toggleSelectNode = (name: string, e: React.MouseEvent) => {
-    e.stopPropagation();
+  const toggleSelectNode = (name: string, e?: React.MouseEvent) => {
+    e?.stopPropagation();
     setSelectedNodes((prev) =>
       prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name]
     );
@@ -619,7 +707,15 @@ export const LinesManagementView: React.FC = React.memo(() => {
 
   // 打包为优选组或中继
   const handleConfirmPack = async () => {
-    if (!packName.trim() || selectedNodes.length < 2 || !packModalType) return;
+    if (packPending.current || !packModalType) return;
+    setPackError("");
+    if (!packName.trim()) { setPackError("请输入新线路名称。"); return; }
+    if (selectedNodes.length < 2) { setPackError("请至少选择两个节点。"); return; }
+    if (packModalType === "relay" && selectedNodes.length !== 2) { setPackError("链式中继需要正好两个节点。"); return; }
+    if (["DIRECT", "REJECT", "GLOBAL", "RULES", "PROXY"].includes(packName.trim()) || groups.some(g => g.name === packName.trim()) || realNodeNames.includes(packName.trim()) || smartRules.some(r => r.name === packName.trim())) {
+      setPackError("此名称已被节点、策略组或系统占用，请更换名称。"); return;
+    }
+    packPending.current = true; setPackSaving(true);
     try {
       const newRule: SmartGroupRule = {
         id: `sg-${Date.now()}`,
@@ -639,11 +735,14 @@ export const LinesManagementView: React.FC = React.memo(() => {
       await syncRules(updated);
       setSmartRules(updated);
       setSelectedNodes([]);
+      setMobileSelecting(false);
       setPackModalType(null);
       setPackName("");
       loadData();
     } catch (err) {
-      console.error("打包创建线路失败:", err);
+      setPackError(`创建线路失败：${String(err)}`);
+    } finally {
+      packPending.current = false; setPackSaving(false);
     }
   };
 
@@ -737,7 +836,10 @@ export const LinesManagementView: React.FC = React.memo(() => {
         if (ignoredSet.has(n.name)) {
           return false;
         }
-        if (search && !`${local?.name || n.name} ${n.type}`.toLowerCase().includes(search.toLowerCase())) {
+        const region = persistedNodeRegions[n.name];
+        const health = healthCache[n.name];
+        const country = health?.countryCode ? formatCountryRegionTitle(health.countryCode, health.country) : "";
+        if (search && !`${local?.name || n.name} ${n.type} ${region || ""} ${health?.country || ""} ${health?.countryCode || ""} ${country}`.toLowerCase().includes(search.toLowerCase())) {
           return false;
         }
         const delay = delayMap[n.name] ?? n.history?.[n.history.length - 1]?.delay ?? null;
@@ -754,7 +856,7 @@ export const LinesManagementView: React.FC = React.memo(() => {
         if (sortBy === "name-asc") return a.name.localeCompare(b.name);
         return 0;
       });
-  }, [realNodes, search, hideTimeout, sortBy, delayMap, ignoredSet, sourceFilter, localByAlias]);
+  }, [realNodes, search, hideTimeout, sortBy, delayMap, ignoredSet, sourceFilter, localByAlias, persistedNodeRegions, healthCache]);
 
   // 按地区自动归类：优先使用基于真实 IP 体检的持久化结果，未体检的归入待确认真实出口
   const { regionGroups, unprobedCount } = useMemo(() => {
@@ -799,7 +901,7 @@ export const LinesManagementView: React.FC = React.memo(() => {
 
   // 自动将二级真实国家/地区节点及实时延迟同步至系统托盘二级菜单
   useEffect(() => {
-    if (realNodes.length > 0) {
+    if (!mobile && realNodes.length > 0) {
       const rawNodes: RawNodeForTray[] = realNodes.map((n) => {
         const persisted = persistedNodeRegions[n.name];
         const health = healthCache[n.name];
@@ -821,6 +923,7 @@ export const LinesManagementView: React.FC = React.memo(() => {
 
   // 监听系统托盘“👉 查看全部该地区节点...”菜单事件，自动定位并过滤该地区
   useEffect(() => {
+    if (mobile) return;
     let unlisten: (() => void) | undefined;
     import("@tauri-apps/api/event").then(({ listen }) => {
       listen<string>("procweaver-filter-region", (event) => {
@@ -837,33 +940,40 @@ export const LinesManagementView: React.FC = React.memo(() => {
   }, []);
 
   return (
-    <div className="flex-1 flex flex-col h-full overflow-hidden bg-slate-50 dark:bg-slate-950 transition-colors duration-200 relative">
+    <div className={`${mobile ? "mobile-nodes-page " : ""}flex-1 flex flex-col h-full overflow-hidden bg-slate-50 dark:bg-slate-950 transition-colors duration-200 relative`}>
+      {(catalogMessage || (!mobile && catalogOffline) || (probeMessage && (!mobile || (!probingAll && !anySingleProbe))) || (!mobile && (probingAll || anySingleProbe))) && <div role="status" className="mobile-notice mx-3 my-2 shrink-0">
+        {!mobile && catalogOffline && <p>节点已从本地订阅读取。连接 VPN 后可切换出口和测速；IP 体检可独立运行。</p>}
+        {catalogMessage && <p>{catalogMessage} <button onClick={() => void loadData()}>重新读取</button></p>}
+        {probeMessage && (!mobile || (!probingAll && !anySingleProbe)) && <p>{probeMessage}</p>}
+        {!mobile && (probingAll || anySingleProbe) && <button onClick={() => { pendingJobs.current.forEach(job => job.abort()); setProbeMessage("正在取消体检…"); }}>取消检测</button>}
+      </div>}
       {/* 顶栏控制台 */}
-      <div className="px-6 py-3.5 border-b border-slate-200/90 dark:border-slate-800/80 bg-white/70 dark:bg-slate-900/40 backdrop-blur-md flex flex-wrap items-center justify-between gap-3 shrink-0">
-        <div className="flex items-center space-x-2.5 flex-1 min-w-[280px] max-w-md">
-          {/* 搜索框 */}
-          <div className="relative flex-1">
-            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-            <input
-              type="text"
-              placeholder="搜索节点名称、地区、协议..."
-              value={searchKeyword}
-              onChange={(e) => setSearchKeyword(e.target.value)}
-              className="w-full pl-9 pr-3 py-1.5 text-xs bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700/80 rounded-xl focus:outline-hidden focus:border-indigo-500 transition"
-            />
-            {searchKeyword && (
-              <button
-                type="button"
-                onClick={() => setSearchKeyword("")}
-                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
-            )}
-          </div>
+      {mobile ? (
+        <div className="mobile-node-toolbar px-3 py-2 border-b border-slate-200/90 dark:border-slate-800/80 bg-white/80 dark:bg-slate-900/60 backdrop-blur-md flex flex-col gap-2 shrink-0">
+          {/* 第一行：搜索 + 排除超时 + 排序 */}
+          <div className="flex items-center gap-2 w-full">
+            <div className="relative flex-1 min-w-0">
+              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                aria-label="搜索节点"
+                placeholder="搜索节点、地区、协议..."
+                value={searchKeyword}
+                onChange={(e) => setSearchKeyword(e.target.value)}
+                className="w-full pl-8 pr-7 py-1.5 text-xs bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700/80 rounded-xl focus:outline-hidden focus:border-indigo-500 transition"
+              />
+              {searchKeyword && (
+                <button
+                  type="button"
+                  onClick={() => setSearchKeyword("")}
+                  aria-label="清空搜索"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-1"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
 
-          {/* 排序筛选 */}
-          <div className="flex items-center space-x-1.5 shrink-0">
             <button
               type="button"
               onClick={() => {
@@ -873,7 +983,7 @@ export const LinesManagementView: React.FC = React.memo(() => {
                   localStorage.setItem("netbox_hide_timeout_nodes", String(next));
                 } catch {}
               }}
-              className={`px-2.5 py-1.5 text-xs rounded-xl border font-medium transition cursor-pointer ${
+              className={`px-2.5 py-1.5 text-xs rounded-xl border font-medium transition cursor-pointer shrink-0 ${
                 hideTimeout
                   ? "bg-indigo-50 text-indigo-600 border-indigo-200 dark:bg-indigo-600/15 dark:text-indigo-400 dark:border-indigo-500/30"
                   : "bg-slate-100 text-slate-600 border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700"
@@ -882,123 +992,355 @@ export const LinesManagementView: React.FC = React.memo(() => {
             >
               排除超时
             </button>
+
+            <select
+              aria-label="节点排序"
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value as any)}
+              className="px-2 py-1.5 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 shrink-0 font-medium cursor-pointer"
+            >
+              <option value="default">默认</option>
+              <option value="latency-asc">延迟优先</option>
+              <option value="name-asc">名称排序</option>
+            </select>
+          </div>
+
+          {/* 数量与操作在窄屏下自动分行，避免状态被按钮覆盖。 */}
+          <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 text-xs pt-1 border-t border-slate-100 dark:border-slate-800/60 text-slate-500 dark:text-slate-400">
+            <div className="flex items-center gap-1.5 min-w-[130px] flex-1 truncate">
+              <span className="font-semibold text-slate-800 dark:text-slate-200">
+                {filteredNodes.length < realNodes.length ? `${filteredNodes.length}/${realNodes.length}` : `${filteredNodes.length}`} 个节点
+              </span>
+              <span>·</span>
+              <span className="truncate text-[11px]" title={activeNodeName ? nodeLabel(activeNodeName) : "未连接"}>
+                {catalogOffline ? "离线模式" : activeNodeName ? `出口: ${nodeLabel(activeNodeName)}` : "未连接"}
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0 ml-auto">
+              {unprobedCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => void handleProbeAllHealth(filteredNodes.filter(n => !persistedNodeRegions[n.name] && !healthCache[n.name]?.countryCode).map(n => n.name))}
+                  disabled={probingAll || anySingleProbe}
+                  className="text-[11px] text-purple-600 dark:text-purple-400 font-semibold flex items-center gap-0.5"
+                  title="一键体检待确认真实出口的节点"
+                >
+                  <Shield size={12} className={probingAll ? "animate-spin" : ""} />
+                  <span>{probingAll ? "体检中" : `${unprobedCount} 待检`}</span>
+                </button>
+              )}
+              <button
+                type="button"
+                aria-pressed={mobileSelecting}
+                onClick={() => { setMobileSelecting(prev => !prev); setSelectedNodes([]); }}
+                className={`text-[11px] px-2 py-0.5 rounded-lg border font-medium ${mobileSelecting ? "bg-indigo-50 border-indigo-300 text-indigo-700 dark:bg-indigo-950/40 dark:border-indigo-700 dark:text-indigo-300" : "border-slate-200 dark:border-slate-700"}`}
+              >
+                {mobileSelecting ? "完成" : "多选"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setMobileToolsOpen(prev => !prev)}
+                className={`text-[11px] px-2 py-0.5 rounded-lg border font-medium transition cursor-pointer ${
+                  mobileToolsOpen
+                    ? "bg-indigo-50 border-indigo-200 text-indigo-600 dark:bg-indigo-950/40 dark:border-indigo-800 dark:text-indigo-400"
+                    : "bg-slate-100 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300"
+                }`}
+              >
+                {mobileToolsOpen ? "收起工具" : "高级工具"}
+              </button>
+              <button
+                type="button"
+                onClick={openSubscriptions}
+                className="text-[11px] text-indigo-600 dark:text-indigo-400 font-semibold flex items-center gap-0.5"
+              >
+                <Radio size={12} />
+                <span>订阅</span>
+              </button>
+            </div>
+          </div>
+
+          {(probingAll || anySingleProbe) && (
+            <div role="status" className="flex items-center gap-2 text-[11px] text-purple-700 dark:text-purple-300">
+              <Shield size={13} className="animate-spin shrink-0" />
+              <span className="truncate flex-1">IP 体检中{probeProgress ? ` ${probeProgress.completed}/${probeProgress.total}` : "…"}</span>
+              <button type="button" onClick={() => { pendingJobs.current.forEach(job => job.abort()); setProbeMessage("正在取消体检…"); }} className="font-semibold">取消</button>
+            </div>
+          )}
+
+          {coreMode === "rule" && groups.some(g => /^(selector|select)$/i.test(g.type)) && !mobileSelectionGroup(groups, coreMode, selectionGroup) && (
+            <label className="flex items-center gap-2 text-xs text-amber-700 dark:text-amber-300">
+              <span className="shrink-0">切换策略组</span>
+              <select aria-label="切换策略组" value={selectionGroup} onChange={event => setSelectionGroup(event.target.value)} className="min-w-0 flex-1 rounded-xl border border-amber-300 dark:border-amber-700 bg-white dark:bg-slate-900 px-2 py-1">
+                <option value="">请选择</option>
+                {groups.filter(g => g.name !== "GLOBAL" && /^(selector|select)$/i.test(g.type)).map(g => <option key={g.name} value={g.name}>{g.name}</option>)}
+              </select>
+            </label>
+          )}
+
+          {/* 高级工具面板（展开时展示） */}
+          {mobileToolsOpen && (
+            <div className="pt-2 pb-1 border-t border-slate-200/80 dark:border-slate-800/80 flex flex-wrap items-center gap-2">
+              {coreMode === "rule" && (
+                <label className="flex items-center gap-1.5 w-full min-w-0 text-xs text-slate-600 dark:text-slate-300">
+                  <span className="shrink-0">切换策略组:</span>
+                  <select
+                    aria-label="切换策略组"
+                    value={mobileSelectionGroup(groups, coreMode, selectionGroup)?.name ?? ""}
+                    onChange={event => setSelectionGroup(event.target.value)}
+                    className="min-w-0 flex-1 px-2 py-1 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800"
+                  >
+                    <option value="" disabled>请选择策略组</option>
+                    {groups.filter(g => g.name !== "GLOBAL" && /^(selector|select)$/i.test(g.type)).map(g => (
+                      <option key={g.name} value={g.name}>{g.name}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              <select
+                aria-label="节点来源"
+                value={sourceFilter}
+                onChange={e => setSourceFilter(e.target.value)}
+                className="px-2.5 py-1 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800"
+              >
+                <option value="all">全部来源</option>
+                <option value="subscription">订阅节点</option>
+                <option value="local">本地节点</option>
+              </select>
+              <button
+                type="button"
+                disabled={localNodes.busy || !localNodes.view}
+                onClick={localNodes.openNew}
+                className="flex items-center gap-1 px-2.5 py-1 rounded-xl border border-indigo-200 dark:border-indigo-700 text-indigo-600 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950/30 text-xs disabled:opacity-50"
+              >
+                <Plus size={13} />
+                <span>新增节点</span>
+              </button>
+              <button
+                type="button"
+                disabled={localNodes.busy || !localNodes.view}
+                onClick={localNodes.openImport}
+                className="px-2.5 py-1 rounded-xl border border-slate-200 dark:border-slate-700 text-xs"
+              >
+                导入节点
+              </button>
+              <button
+                type="button"
+                onClick={handleTestAll}
+                disabled={testingAll || realNodes.length === 0 || catalogOffline}
+                className="flex items-center space-x-1 px-2.5 py-1 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 text-xs font-semibold disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3 h-3 ${testingAll ? "animate-spin text-indigo-500" : ""}`} />
+                <span>{testingAll ? "测速中…" : "全量测速"}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleProbeAllHealth()}
+                disabled={probingAll || anySingleProbe || realNodes.length === 0}
+                className="flex items-center space-x-1 px-2.5 py-1 rounded-xl bg-purple-50 text-purple-700 dark:bg-purple-600/15 dark:text-purple-300 border border-purple-200 dark:border-purple-800/60 text-xs font-semibold disabled:opacity-50"
+              >
+                <Shield className={`w-3 h-3 ${probingAll ? "animate-spin text-purple-600 dark:text-purple-400" : "text-purple-500"}`} />
+                <span>{probingAll ? `体检 ${probeProgress?.completed || 0}/${probeProgress?.total || realNodes.length}` : "全量 IP 体检"}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  window.dispatchEvent(new CustomEvent("netbox-navigate-tab", { detail: "logs" }));
+                }}
+                className="flex items-center space-x-1 px-2.5 py-1 rounded-xl bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300 border border-slate-200 dark:border-slate-700 text-xs"
+              >
+                <ScrollText className="w-3 h-3 text-indigo-500" />
+                <span>日志</span>
+              </button>
+              <button
+                type="button"
+                onClick={(event) => {
+                  smartTrigger.current = event.currentTarget;
+                  setEditingRule(null);
+                  setSmartModalOpen(true);
+                }}
+                className="flex items-center space-x-1 px-2.5 py-1 rounded-xl bg-indigo-600 text-white text-xs font-semibold"
+              >
+                <Plus className="w-3 h-3" />
+                <span>新建自建线路</span>
+              </button>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="px-6 py-3.5 border-b border-slate-200/90 dark:border-slate-800/80 bg-white/70 dark:bg-slate-900/40 backdrop-blur-md flex flex-wrap items-center justify-between gap-3 shrink-0">
+          <div className="flex items-center space-x-2.5 flex-1 min-w-[280px] max-w-md">
+            {/* 搜索框 */}
+            <div className="relative flex-1">
+              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                aria-label="搜索节点"
+                placeholder="搜索节点名称、地区、协议..."
+                value={searchKeyword}
+                onChange={(e) => setSearchKeyword(e.target.value)}
+                className="w-full pl-9 pr-3 py-1.5 text-xs bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700/80 rounded-xl focus:outline-hidden focus:border-indigo-500 transition"
+              />
+              {searchKeyword && (
+                <button
+                  type="button"
+                  onClick={() => setSearchKeyword("")}
+                  aria-label="清空搜索"
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+
+            {/* 排序筛选 */}
+            <div className="flex items-center space-x-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  const next = !hideTimeout;
+                  setHideTimeout(next);
+                  try {
+                    localStorage.setItem("netbox_hide_timeout_nodes", String(next));
+                  } catch {}
+                }}
+                className={`px-2.5 py-1.5 text-xs rounded-xl border font-medium transition cursor-pointer ${
+                  hideTimeout
+                    ? "bg-indigo-50 text-indigo-600 border-indigo-200 dark:bg-indigo-600/15 dark:text-indigo-400 dark:border-indigo-500/30"
+                    : "bg-slate-100 text-slate-600 border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700"
+                }`}
+                title="过滤测速超时的无效节点"
+              >
+                排除超时
+              </button>
+
+              <select
+                aria-label="节点排序"
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as any)}
+                className="px-2.5 py-1.5 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-medium cursor-pointer"
+              >
+                <option value="default">默认排序</option>
+                <option value="latency-asc">延迟优先</option>
+                <option value="name-asc">名称排序</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="contents">
+            <div className="flex flex-wrap items-center gap-2">
+              <select aria-label="节点来源" value={sourceFilter} onChange={e => setSourceFilter(e.target.value)} className="px-2.5 py-1.5 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800">
+                <option value="all">全部来源</option><option value="subscription">订阅节点</option><option value="local">本地节点</option>
+              </select>
+              <button type="button" disabled={localNodes.busy || !localNodes.view} onClick={localNodes.openNew} className="flex items-center gap-1 px-3 py-1.5 rounded-xl border border-indigo-200 dark:border-indigo-700 text-indigo-600 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950/30 text-xs disabled:opacity-50"><Plus size={14} />新增节点</button>
+              <button type="button" disabled={localNodes.busy || !localNodes.view} onClick={localNodes.openImport} className="px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs">导入节点</button>
+              <button
+                type="button"
+                onClick={handleTestAll}
+                disabled={testingAll || realNodes.length === 0 || catalogOffline}
+                className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 text-xs font-semibold transition shadow-2xs disabled:opacity-50 cursor-pointer"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${testingAll ? "animate-spin text-indigo-500" : ""}`} />
+                <span>{testingAll ? "全量测速中..." : "全量测速"}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void handleProbeAllHealth()}
+                disabled={probingAll || anySingleProbe || realNodes.length === 0}
+                className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-purple-50 hover:bg-purple-100 text-purple-700 dark:bg-purple-600/15 dark:hover:bg-purple-600/25 dark:text-purple-300 border border-purple-200 dark:border-purple-800/60 text-xs font-semibold transition shadow-2xs disabled:opacity-50 cursor-pointer"
+                title="检测全部未忽略节点，不受当前搜索和来源筛选影响"
+              >
+                <Shield className={`w-3.5 h-3.5 ${probingAll ? "animate-spin text-purple-600 dark:text-purple-400" : "text-purple-500"}`} />
+                <span>
+                  {probingAll
+                    ? `体检中 ${probeProgress?.completed || 0}/${probeProgress?.total || realNodes.length}`
+                    : "全量 IP 体检"}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  window.dispatchEvent(
+                    new CustomEvent("netbox-navigate-tab", { detail: "logs" })
+                  );
+                }}
+                className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 text-xs font-semibold transition shadow-2xs cursor-pointer"
+                title="查看测速、IP 体检与网络运行日志"
+              >
+                <ScrollText className="w-3.5 h-3.5 text-indigo-500" />
+                <span>测速/IP日志</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  openSubscriptions();
+                  if (!mobile) void runSubscriptionAction(async () => { setProfiles(await getProfiles()); });
+                }}
+                className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-600 dark:bg-indigo-600/15 dark:hover:bg-indigo-600/25 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-500/30 text-xs font-semibold transition shadow-2xs cursor-pointer"
+              >
+                <Radio className="w-3.5 h-3.5" />
+                <span>订阅管理</span>
+                {profiles.length > 0 && (
+                  <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-indigo-200/80 dark:bg-indigo-500/40 font-mono">
+                    {profiles.length}
+                  </span>
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={(event) => {
+                  smartTrigger.current = event.currentTarget;
+                  setEditingRule(null);
+                  setSmartModalOpen(true);
+                }}
+                className="flex items-center space-x-1 px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-md shadow-indigo-600/20 transition cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>新建自建线路</span>
+              </button>
+            </div>
           </div>
         </div>
-
-        {/* 右侧动作区 */}
-        <div className="flex flex-wrap items-center gap-2">
-          <select aria-label="节点来源" value={sourceFilter} onChange={e => setSourceFilter(e.target.value)} className="px-2.5 py-1.5 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800">
-            <option value="all">全部来源</option><option value="subscription">订阅节点</option><option value="local">本地节点</option>
-          </select>
-          <button type="button" disabled={localNodes.busy || !localNodes.view} onClick={localNodes.openNew} className="flex items-center gap-1 px-3 py-1.5 rounded-xl border border-indigo-200 dark:border-indigo-700 text-indigo-600 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950/30 text-xs disabled:opacity-50"><Plus size={14} />新增节点</button>
-          <button type="button" disabled={localNodes.busy || !localNodes.view} onClick={localNodes.openImport} className="px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs">导入节点</button>
-          {/* 一键全量测速 */}
-          <button
-            type="button"
-            onClick={handleTestAll}
-            disabled={testingAll || realNodes.length === 0}
-            className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 text-xs font-semibold transition shadow-2xs disabled:opacity-50 cursor-pointer"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${testingAll ? "animate-spin text-indigo-500" : ""}`} />
-            <span>{testingAll ? "全量测速中..." : "全量测速"}</span>
-          </button>
-
-          {/* 一键全量 IP 健康体检 */}
-          <button
-            type="button"
-            onClick={handleProbeAllHealth}
-            disabled={probingAll || anySingleProbe || realNodes.length === 0}
-            className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-purple-50 hover:bg-purple-100 text-purple-700 dark:bg-purple-600/15 dark:hover:bg-purple-600/25 dark:text-purple-300 border border-purple-200 dark:border-purple-800/60 text-xs font-semibold transition shadow-2xs disabled:opacity-50 cursor-pointer"
-            title="通过真实出口检测各个节点的实际落地国家、原生性与欺诈风险并持久化归类"
-          >
-            <Shield className={`w-3.5 h-3.5 ${probingAll ? "animate-spin text-purple-600 dark:text-purple-400" : "text-purple-500"}`} />
-            <span>
-              {probingAll
-                ? `体检中 ${probeProgress?.completed || 0}/${probeProgress?.total || realNodes.length}`
-                : "全量 IP 体检"}
-            </span>
-          </button>
-
-          {/* 查看测速与体检日志快捷入口 */}
-          <button
-            type="button"
-            onClick={() => {
-              window.dispatchEvent(
-                new CustomEvent("netbox-navigate-tab", { detail: "logs" })
-              );
-            }}
-            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 text-xs font-semibold transition shadow-2xs cursor-pointer"
-            title="查看测速、IP 体检与网络运行日志"
-          >
-            <ScrollText className="w-3.5 h-3.5 text-indigo-500" />
-            <span>测速/IP日志</span>
-          </button>
-
-          {/* 订阅管理抽屉唤起 */}
-          <button
-            type="button"
-            onClick={() => {
-              setSubDrawerOpen(true);
-              void runSubscriptionAction(async () => { setProfiles(await getProfiles()); });
-            }}
-            className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-600 dark:bg-indigo-600/15 dark:hover:bg-indigo-600/25 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-500/30 text-xs font-semibold transition shadow-2xs cursor-pointer"
-          >
-            <Radio className="w-3.5 h-3.5" />
-            <span>订阅管理</span>
-            {profiles.length > 0 && (
-              <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-indigo-200/80 dark:bg-indigo-500/40 font-mono">
-                {profiles.length}
-              </span>
-            )}
-          </button>
-
-          {/* 新建智能线路 */}
-          <button
-            type="button"
-            onClick={(event) => {
-              smartTrigger.current = event.currentTarget;
-              setEditingRule(null);
-              setSmartModalOpen(true);
-            }}
-            className="flex items-center space-x-1 px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-md shadow-indigo-600/20 transition cursor-pointer"
-          >
-            <Plus className="w-3.5 h-3.5" />
-            <span>新建自建线路</span>
-          </button>
-        </div>
-      </div>
+      )}
 
       {/* 主工作区滚动面板 */}
-      <VirtualGridScroller className="flex-1 min-h-0 overflow-y-auto p-6 space-y-6" resetKey={`${search}:${hideTimeout}`}>
+      <VirtualGridScroller className={`${mobile ? "mobile-node-scroller " : ""}flex-1 min-h-0 overflow-y-auto p-6 space-y-6`} resetKey={`${search}:${hideTimeout}:${sourceFilter}`}>
         {/* 节点订阅账号状态看板 (由伪节点提炼为纯净看板) */}
-        {(subMeta.remainingTraffic || subMeta.expireDate || subMeta.resetDays) && (
-          <div className="p-3.5 rounded-2xl bg-gradient-to-r from-indigo-500/10 via-purple-500/10 to-sky-500/10 border border-indigo-200/80 dark:border-indigo-500/30 flex flex-wrap items-center justify-between gap-3 shadow-2xs">
-            <div className="flex items-center space-x-2.5">
+        {!mobile && (subMeta.remainingTraffic || subMeta.expireDate || subMeta.resetDays) && (
+          <div className={mobile
+            ? "p-2 rounded-xl bg-indigo-50/70 dark:bg-indigo-950/30 border border-indigo-200/60 dark:border-indigo-800/40 flex items-center justify-between gap-2 text-[11px]"
+            : "p-3.5 rounded-2xl bg-gradient-to-r from-indigo-500/10 via-purple-500/10 to-sky-500/10 border border-indigo-200/80 dark:border-indigo-500/30 flex flex-wrap items-center justify-between gap-3 shadow-2xs"
+          }>
+            <div hidden={mobile} className="flex items-center space-x-2.5">
               <div className="p-1.5 rounded-xl bg-indigo-500/20 text-indigo-600 dark:text-indigo-400">
                 <Radio className="w-4 h-4" />
               </div>
               <div>
                 <h4 className="text-xs font-bold text-slate-900 dark:text-white">节点订阅状态看板</h4>
-                <p className="text-[10px] text-slate-500 dark:text-slate-400">已智能排除信息占位伪节点，归纳为订阅摘要</p>
+                <p className="text-[10px] text-slate-500 dark:text-slate-400">订阅提供的流量与有效期信息</p>
               </div>
             </div>
 
-            <div className="flex items-center space-x-3 text-xs font-mono">
+            <div className={`flex items-center ${mobile ? "justify-between w-full" : "space-x-3"} text-xs font-mono`}>
               {subMeta.remainingTraffic && (
-                <div className="flex items-center space-x-1.5 px-3 py-1 rounded-xl bg-white/80 dark:bg-slate-900/80 border border-indigo-200 dark:border-indigo-800">
-                  <span className="text-[10px] text-slate-400 font-sans">剩余流量:</span>
+                <div className={`flex items-center space-x-1.5 ${mobile ? "px-2 py-0.5" : "px-3 py-1"} rounded-lg bg-white/80 dark:bg-slate-900/80 border border-indigo-200 dark:border-indigo-800`}>
+                  <span className="text-[10px] text-slate-400 font-sans">余量:</span>
                   <span className="font-bold text-indigo-600 dark:text-indigo-400">{subMeta.remainingTraffic}</span>
                 </div>
               )}
               {subMeta.expireDate && (
-                <div className="flex items-center space-x-1.5 px-3 py-1 rounded-xl bg-white/80 dark:bg-slate-900/80 border border-purple-200 dark:border-purple-800">
-                  <span className="text-[10px] text-slate-400 font-sans">套餐到期:</span>
+                <div className={`flex items-center space-x-1.5 ${mobile ? "px-2 py-0.5" : "px-3 py-1"} rounded-lg bg-white/80 dark:bg-slate-900/80 border border-purple-200 dark:border-purple-800`}>
+                  <span className="text-[10px] text-slate-400 font-sans">到期:</span>
                   <span className="font-bold text-purple-600 dark:text-purple-400">{subMeta.expireDate}</span>
                 </div>
               )}
               {subMeta.resetDays && (
-                <div className="flex items-center space-x-1.5 px-3 py-1 rounded-xl bg-white/80 dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800">
-                  <span className="text-[10px] text-slate-400 font-sans">下次重置:</span>
+                <div className={`flex items-center space-x-1.5 ${mobile ? "px-2 py-0.5" : "px-3 py-1"} rounded-lg bg-white/80 dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800`}>
+                  <span className="text-[10px] text-slate-400 font-sans">重置:</span>
                   <span className="font-bold text-slate-700 dark:text-slate-300">{subMeta.resetDays}</span>
                 </div>
               )}
@@ -1007,12 +1349,12 @@ export const LinesManagementView: React.FC = React.memo(() => {
         )}
 
         {/* 板块一：自建核心线路区 */}
-        <div>
-          <div className="flex items-center justify-between mb-3">
+        {(!mobile || smartRules.length > 0) && <div>
+          <div className={`${mobile ? "mobile-node-list-heading " : ""}flex items-center justify-between mb-3`}>
             <div className="flex items-center space-x-2">
               <Zap className="w-4 h-4 text-indigo-500" />
               <h3 className="text-xs font-bold text-slate-800 dark:text-slate-200 tracking-wide uppercase">
-                自建核心线路 (智能优选 / 双跳中继)
+                {mobile ? "自建线路" : "自建核心线路 (智能优选 / 双跳中继)"}
               </h3>
               <span className="text-[11px] text-slate-400 font-mono">({smartRules.length})</span>
             </div>
@@ -1120,22 +1462,24 @@ export const LinesManagementView: React.FC = React.memo(() => {
               })}
             </div>
           )}
-        </div>
+        </div>}
 
         {/* 板块二：基础节点库 */}
         <div>
-          <div className="flex items-center justify-between mb-3">
-            <div className="flex items-center space-x-2">
-              <Globe className="w-4 h-4 text-indigo-500" />
-              <h3 className="text-xs font-bold text-slate-800 dark:text-slate-200 tracking-wide uppercase">
-                基础节点池大盘 (按真实出口 IP 归属持久化)
-              </h3>
-              <span className="text-[11px] text-slate-400 font-mono">({filteredNodes.length} 可用)</span>
+          {!mobile && (
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center space-x-2">
+                <Globe className="w-4 h-4 text-indigo-500" />
+                <h3 className="text-xs font-bold text-slate-800 dark:text-slate-200 tracking-wide uppercase">
+                  基础节点池大盘 (按真实出口 IP 归属持久化)
+                </h3>
+                <span className="text-[11px] text-slate-400 font-mono">({filteredNodes.length} 可用)</span>
+              </div>
             </div>
-          </div>
+          )}
 
           {/* 首次无 IP 体检体验或存在未确认节点提示横幅 */}
-          {unprobedCount > 0 && (
+          {!mobile && unprobedCount > 0 && (
             <div className="mb-3.5 p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-900 dark:text-amber-200 shadow-xs flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-start space-x-2.5 max-w-[80%]">
                 <div className="p-1.5 rounded-xl bg-amber-500/20 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5">
@@ -1147,14 +1491,14 @@ export const LinesManagementView: React.FC = React.memo(() => {
                     <span className="text-[10px] px-1.5 py-0.2 rounded-md bg-amber-500/20 font-mono">出口待核验</span>
                   </div>
                   <p className="text-[11px] leading-relaxed text-amber-800 dark:text-amber-300">
-                    因部分中继节点名与实际出口国家不符，建议点击右侧【全量 IP 体检】，系统将按真实国家重新划分大盘并自动持久化锁定。
+                    节点名称可能与实际出口地区不同。完成 IP 体检后，按检测到的地区分类。
                   </p>
                 </div>
               </div>
 
               <button
                 type="button"
-                onClick={handleProbeAllHealth}
+                onClick={() => void handleProbeAllHealth()}
                 disabled={probingAll || anySingleProbe}
                 className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold transition shadow-xs cursor-pointer shrink-0"
               >
@@ -1167,20 +1511,20 @@ export const LinesManagementView: React.FC = React.memo(() => {
           {regionGroups.length === 0 ? (
             <div className="p-8 rounded-2xl border border-dashed border-slate-300 dark:border-slate-800 text-center space-y-3">
               <Radio className="w-8 h-8 text-slate-300 mx-auto" />
-              <p className="text-xs text-slate-500">未找到匹配的节点，请尝试清空筛选词或前往【订阅管理】导入节点订阅。</p>
+              <p className="text-xs text-slate-500">{realNodes.length > 0 ? "没有符合当前搜索或筛选条件的节点。" : "还没有节点，请前往订阅管理添加订阅。"}</p>
               <button
                 type="button"
-                onClick={() => setSubDrawerOpen(true)}
+                onClick={realNodes.length > 0 ? () => { setSearchKeyword(""); setHideTimeout(false); setSourceFilter("all"); } : openSubscriptions}
                 className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow transition"
               >
-                立即添加订阅
+                {realNodes.length > 0 ? "清除筛选" : "添加订阅"}
               </button>
             </div>
           ) : (
             <div className="space-y-5">
-              {regionGroups.map(([regionTitle, nodes]) => (
+              {(mobile ? [["全部节点", filteredNodes] as [string, ProxyItem[]]] : regionGroups).map(([regionTitle, nodes]) => (
                 <div key={regionTitle} className="space-y-2">
-                  <div className="flex items-center justify-between text-xs font-semibold text-slate-700 dark:text-slate-300 pb-1 border-b border-slate-200/80 dark:border-slate-800/60">
+                  {!mobile && <div className="flex items-center justify-between text-xs font-semibold text-slate-700 dark:text-slate-300 pb-1 border-b border-slate-200/80 dark:border-slate-800/60">
                     <div className="flex items-center space-x-2">
                       <span>{regionTitle}</span>
                       <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-slate-200/80 dark:bg-slate-800 text-slate-600 dark:text-slate-400 font-mono">
@@ -1200,9 +1544,9 @@ export const LinesManagementView: React.FC = React.memo(() => {
                         <span>忽略本组</span>
                       </button>
                     )}
-                  </div>
+                  </div>}
 
-                  <VirtualGrid items={nodes} itemKey={node => node.name} label={`${regionTitle}节点`} renderItem={(node) => {
+                  <VirtualGrid items={nodes} itemKey={node => node.name} label={`${regionTitle}节点`} columns={mobile ? 2 : undefined} rowHeight={mobile ? 138 : undefined} renderItem={(node) => {
                       const isSelected = selectedSet.has(node.name);
                       const isActive = activeNodeName === node.name;
                       const delay = delayMap[node.name] ?? node.history?.[node.history.length - 1]?.delay ?? null;
@@ -1210,7 +1554,20 @@ export const LinesManagementView: React.FC = React.memo(() => {
                       const isProbing = probingNodes[node.name];
                       const health = healthCache[node.name];
                       const mult = parseMultiplier(node.name);
-                      const realCountry = persistedNodeRegions[node.name];
+                      const realCountry = persistedNodeRegions[node.name] || (health?.countryCode ? formatCountryRegionTitle(health.countryCode, health.country) : undefined);
+
+                      if (mobile) return <MobileNodeCard name={nodeLabel(node.name)} protocol={node.type} active={isActive && !catalogOffline} selected={isSelected}
+                        selectionMode={mobileSelecting}
+                        switching={switchingNodeName === node.name}
+                        delay={isTesting ? "测速中" : delay === null ? "未测速" : delay <= 0 ? "超时" : `${delay}ms`}
+                        delayTone={delay === null ? "text-slate-500" : delay <= 0 || delay >= 500 ? "text-rose-500" : delay < 200 ? "text-emerald-600" : "text-amber-600"}
+                        testing={!!isTesting} offline={catalogOffline} region={realCountry} ip={health?.ip} risk={health?.fraudScore}
+                        multiplier={mult === null ? "1.0x" : formatMultiplier(mult)} probing={!!isProbing} probeDisabled={!!isProbing || probingAll || anySingleProbe}
+                        local={localByAlias.has(node.name)} localBusy={localNodes.busy} onConnect={() => void handleSelectProxy(node.name)}
+                        onTest={() => void handleTestNode(node.name)} onProbe={() => void handleProbeHealth(node.name)}
+                        onSelect={() => { setMobileSelecting(true); toggleSelectNode(node.name); }} onIgnore={() => handleIgnoreNode(node.name)}
+                        onEdit={() => { const local = localByAlias.get(node.name); if (local) void localNodes.edit(local.id); }}
+                        onDelete={() => { const local = localByAlias.get(node.name); if (local) localNodes.remove(local); }} />;
 
                       return (
                         <div
@@ -1283,7 +1640,7 @@ export const LinesManagementView: React.FC = React.memo(() => {
                                   <span>未体检</span>
                                 </span>
                               )}
-                              {health && health.fraudScore !== undefined && (
+                              {health && health.fraudScore != null && (
                                 <span
                                   className={`text-[10px] px-1 py-0.2 rounded-md font-mono ${
                                     health.fraudScore <= 25
@@ -1413,8 +1770,8 @@ export const LinesManagementView: React.FC = React.memo(() => {
       </VirtualGridScroller>
 
       {/* 底部悬浮操作栏：当勾选多节点时出现 */}
-      {selectedNodes.length >= 2 && (
-        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-40 bg-slate-900/95 text-white dark:bg-slate-800/95 border border-slate-700 rounded-2xl px-5 py-3 shadow-2xl backdrop-blur-md flex items-center space-x-4 animate-in fade-in slide-in-from-bottom-4 duration-200">
+      {selectedNodes.length >= (mobile ? 1 : 2) && (
+        <div className={`${mobile ? "mobile-node-selection " : ""}absolute bottom-6 left-1/2 -translate-x-1/2 z-40 bg-slate-900/95 text-white dark:bg-slate-800/95 border border-slate-700 rounded-2xl px-5 py-3 shadow-2xl backdrop-blur-md flex items-center space-x-4 animate-in fade-in slide-in-from-bottom-4 duration-200`}>
           <div className="flex items-center space-x-2 text-xs font-semibold">
             <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse" />
             <span>已选中 <strong className="text-indigo-400 font-mono">{selectedNodes.length}</strong> 个节点</span>
@@ -1425,6 +1782,7 @@ export const LinesManagementView: React.FC = React.memo(() => {
           {/* 打包为优选组 */}
           <button
             type="button"
+            disabled={selectedNodes.length < 2}
             onClick={() => {
               setPackModalType("url-test");
               setPackName("自动优选线路");
@@ -1432,12 +1790,13 @@ export const LinesManagementView: React.FC = React.memo(() => {
             className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold shadow transition"
           >
             <Zap className="w-3.5 h-3.5" />
-            <span>打包为自动优选线路</span>
+            <span>{mobile ? "自动优选" : "打包为自动优选线路"}</span>
           </button>
 
           {/* 打包为中继 */}
           <button
             type="button"
+            disabled={selectedNodes.length !== 2}
             onClick={() => {
               setPackModalType("relay");
               setPackName("链式双跳中继");
@@ -1445,12 +1804,12 @@ export const LinesManagementView: React.FC = React.memo(() => {
             className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-xs font-semibold shadow transition"
           >
             <Link2 className="w-3.5 h-3.5" />
-            <span>打包为链式中继</span>
+            <span>{mobile ? "链式中继" : "打包为链式中继"}</span>
           </button>
 
           <button
             type="button"
-            onClick={() => setSelectedNodes([])}
+            onClick={() => { setSelectedNodes([]); setMobileSelecting(false); }}
             className="text-xs text-slate-400 hover:text-white transition"
           >
             取消选择
@@ -1459,8 +1818,8 @@ export const LinesManagementView: React.FC = React.memo(() => {
       )}
 
       {/* 快速打包起名弹窗 */}
+      <dialog ref={packDialog} aria-label="打包创建线路" aria-busy={packSaving} onCancel={event => { event.preventDefault(); closePack(); }} className="m-auto w-[calc(100%-32px)] max-w-sm max-h-[85dvh] p-0 bg-transparent rounded-2xl backdrop:bg-slate-900/60">
       {packModalType && (
-        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="w-full max-w-sm bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-5 space-y-4 shadow-2xl">
             <h4 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
               {packModalType === "relay" ? <Link2 className="w-4 h-4 text-purple-500" /> : <Zap className="w-4 h-4 text-indigo-500" />}
@@ -1470,6 +1829,8 @@ export const LinesManagementView: React.FC = React.memo(() => {
               <label className="text-xs text-slate-500">为新线路命名：</label>
               <input
                 type="text"
+                aria-label="新线路名称"
+                disabled={packSaving}
                 value={packName}
                 onChange={(e) => setPackName(e.target.value)}
                 placeholder="例如：香港超快优选"
@@ -1480,11 +1841,16 @@ export const LinesManagementView: React.FC = React.memo(() => {
                   ? `将以【${selectedNodes[0]}】为入口前置，以【${selectedNodes[1]}】为落地出口。`
                   : `系统将在所选的 ${selectedNodes.length} 个节点中自动秒选延迟最低的节点。`}
               </p>
+              {packModalType === "relay" && selectedNodes.length === 2 && (
+                <button type="button" disabled={packSaving} onClick={() => setSelectedNodes(([first, second]) => [second, first])} className="text-xs font-semibold text-indigo-600 dark:text-indigo-400">交换入口与出口</button>
+              )}
             </div>
+            {packError && <p role="alert" className="text-xs text-rose-600 dark:text-rose-400 break-words">{packError}</p>}
             <div className="flex justify-end space-x-2 pt-2">
               <button
                 type="button"
-                onClick={() => setPackModalType(null)}
+                onClick={closePack}
+                disabled={packSaving}
                 className="px-3.5 py-1.5 rounded-xl text-xs text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
                 取消
@@ -1492,14 +1858,15 @@ export const LinesManagementView: React.FC = React.memo(() => {
               <button
                 type="button"
                 onClick={handleConfirmPack}
+                disabled={packSaving}
                 className="px-4 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold"
               >
-                确认创建
+                {packSaving ? "正在创建…" : "确认创建"}
               </button>
             </div>
           </div>
-        </div>
       )}
+      </dialog>
 
       {/* 侧边订阅管理抽屉 (Slide-over Drawer) */}
         <dialog
@@ -1532,7 +1899,7 @@ export const LinesManagementView: React.FC = React.memo(() => {
 
             {/* 抽屉主体：订阅卡片列表 */}
             <div className="flex-1 overflow-y-auto p-5 space-y-3">
-              <p className="text-xs text-slate-500 dark:text-slate-400">切换会应用该订阅的节点与规则；业务包出口不可用时会保留原订阅并提示重新绑定。</p>
+              <p className="text-xs text-slate-500 dark:text-slate-400">{mobile ? "切换当前订阅，节点列表会立即更新。" : "切换会应用该订阅的节点与规则；业务包出口不可用时会保留原订阅并提示重新绑定。"}</p>
               {subError && <p role="alert" className="text-xs text-red-700 dark:text-red-300 break-words">{subError}</p>}
               {subNotice && <p role="status" className="text-xs text-emerald-700 dark:text-emerald-300 break-words">{subNotice}</p>}
               {profiles.length === 0 ? (

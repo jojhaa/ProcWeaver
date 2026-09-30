@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import { useMobileBack } from "../utils/mobileBack";
 import { version as appVersion } from "../../package.json";
 import {
   Wrench,
@@ -46,8 +47,11 @@ import {
   downloadCoreRulesUpdate,
 } from "../api/maintenance";
 
+import { usePlatform } from "../context/PlatformContext";
 export const MaintenanceView: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<"app" | "core" | "geo">("app");
+  const platform = usePlatform();
+  const mobile = platform.os === "android";
+  const [activeTab, setActiveTab] = useState<"app" | "core" | "geo">(mobile ? "geo" : "app");
 
   // ================= 客户端更新状态 =================
   const [appUpdate, setAppUpdate] = useState<AppUpdateInfo | null>(null);
@@ -87,6 +91,7 @@ export const MaintenanceView: React.FC = () => {
   const [editingRes, setEditingRes] = useState<GeoResource | null>(null);
   const [editUrl, setEditUrl] = useState("");
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null);
+  useMobileBack(() => { if (!editingRes) return false; setEditingRes(null); return true; }, 30);
 
   // 1. 加载客户端版本与更新检测
   const handleCheckAppUpdate = async () => {
@@ -352,7 +357,7 @@ export const MaintenanceView: React.FC = () => {
   };
 
   useEffect(() => {
-    handleCheckAppUpdate();
+    if (!mobile) handleCheckAppUpdate();
     loadCoreInfo();
     loadGeoAndRules();
     handleCheckCoreRules();
@@ -368,20 +373,20 @@ export const MaintenanceView: React.FC = () => {
           </div>
           <div>
             <h2 className="text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
-              <span>版本与组件维护中心</span>
+              <span>{mobile ? "规则与 GEO 更新" : "版本与组件维护中心"}</span>
               <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300 font-mono font-medium">
-                无损便携保护
+                {mobile ? "Android" : "无损便携保护"}
               </span>
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              管理客户端外壳升级、Mihomo 内核引擎热替换及离线 Geo 规则库同步
+              {mobile ? `ProcWeaver ${appVersion} · 内置 Mihomo ${coreDetail?.coreVersionTag || "读取中"}，客户端与内核通过 APK 一同更新。` : "管理客户端外壳升级、Mihomo 内核引擎热替换及离线 Geo 规则库同步"}
             </p>
           </div>
         </div>
 
         {/* 子选项卡切换 */}
-        <nav className="bg-slate-200/80 dark:bg-slate-900/90 border border-slate-300/80 dark:border-slate-800 p-1 rounded-xl flex items-center shadow-inner">
-          <button
+        <nav hidden={mobile} className="bg-slate-200/80 dark:bg-slate-900/90 border border-slate-300/80 dark:border-slate-800 p-1 rounded-xl flex items-center shadow-inner">
+          {!mobile && <><button
             onClick={() => setActiveTab("app")}
             className={`px-3.5 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 cursor-pointer ${
               activeTab === "app"
@@ -402,7 +407,7 @@ export const MaintenanceView: React.FC = () => {
           >
             <Cpu className="w-3.5 h-3.5" />
             内核维护
-          </button>
+          </button></>}
           <button
             onClick={() => setActiveTab("geo")}
             className={`px-3.5 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 cursor-pointer ${
@@ -420,7 +425,7 @@ export const MaintenanceView: React.FC = () => {
       {/* ========================================================================= */}
       {/* 板块 1: 客户端桌面版本更新 (ProcWeaver Desktop)                            */}
       {/* ========================================================================= */}
-      {activeTab === "app" && (
+      {!mobile && activeTab === "app" && (
         <div className="space-y-6">
           {/* 版本状态卡片 */}
           <div className="bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 rounded-2xl p-6 shadow-sm">
@@ -501,7 +506,7 @@ export const MaintenanceView: React.FC = () => {
                     <div className="flex items-center gap-2">
                       <FileCode className="w-4 h-4 text-indigo-500" />
                       <span className="font-medium text-slate-800 dark:text-slate-200">
-                        {appUpdate.assetName || "Windows 便携安装归档"}
+                        {appUpdate.assetName || "尚无当前平台的安装包"}
                       </span>
                       <span className="text-slate-400">({appUpdate.assetSizeFormatted})</span>
                     </div>
@@ -512,7 +517,7 @@ export const MaintenanceView: React.FC = () => {
                         <button
                           type="button"
                           onClick={handleDownloadApp}
-                          disabled={downloadingApp}
+                          disabled={downloadingApp || !appUpdate.downloadUrl}
                           className="px-4 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-md shadow-indigo-600/20 transition flex items-center gap-1.5 cursor-pointer"
                         >
                           <Download className={`w-3.5 h-3.5 ${downloadingApp ? "animate-bounce" : ""}`} />
@@ -520,7 +525,7 @@ export const MaintenanceView: React.FC = () => {
                         </button>
                       )}
 
-                      {downloadedPath && !installedSuccess && (
+                      {downloadedPath && !installedSuccess && platform.os === "windows" && (
                         <button
                           type="button"
                           onClick={handleInstallApp}
@@ -546,6 +551,7 @@ export const MaintenanceView: React.FC = () => {
                   </div>
 
                   {/* 下载进度或安装状态说明 */}
+                  {platform.os === "macos" && <p className="text-xs text-slate-500">macOS 使用对应架构的 DMG 更新，退出应用后替换安装。{downloadedPath && `已下载至：${downloadedPath}`}</p>}
                   {downloadProgress && (
                     <p className="text-[11px] text-indigo-600 dark:text-indigo-400 font-mono">
                       {downloadProgress}
@@ -596,7 +602,7 @@ export const MaintenanceView: React.FC = () => {
       {/* ========================================================================= */}
       {/* 板块 2: 底层代理内核维护 (Mihomo Core)                                     */}
       {/* ========================================================================= */}
-      {activeTab === "core" && (
+      {!mobile && activeTab === "core" && (
         <div className="space-y-6">
           <div className="bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 rounded-2xl p-6 shadow-sm space-y-5">
             {/* 顶栏：内核状态与刷新 */}
@@ -756,7 +762,7 @@ export const MaintenanceView: React.FC = () => {
                     </span>
                   </div>
                   <p className="text-[11px] text-slate-500 mt-0.5 font-mono">
-                    推荐资产: {mihomoRelease.assetName || "mihomo-windows-amd64.zip"}
+                    推荐资产: {mihomoRelease.assetName || "未找到匹配当前平台的核心"}
                   </p>
                 </div>
                 <a
@@ -788,9 +794,9 @@ export const MaintenanceView: React.FC = () => {
                 </div>
                 <div>
                   <h3 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
-                    <span>Mihomo 核心分流规则集 (Core-Rules)</span>
+                    <span>{mobile ? "分流规则数据" : "Mihomo 核心分流规则集 (Core-Rules)"}</span>
                     <span className="text-[10px] px-2 py-0.5 rounded-full bg-purple-100 text-purple-700 dark:bg-purple-500/20 dark:text-purple-300 font-mono font-medium">
-                      {coreRulesInfo?.currentVersion || "v2026.09.21"}
+                      {coreRulesInfo?.currentVersion || "尚未读取"}
                     </span>
                     {coreRulesInfo?.hasUpdate && (
                       <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300 font-mono font-bold animate-pulse">
@@ -799,7 +805,7 @@ export const MaintenanceView: React.FC = () => {
                     )}
                   </h3>
                   <p className="text-[11px] text-slate-500 mt-0.5">
-                    源自 {rulesRepo?.releaseName || "ProcWeaver 官方规则仓库"} <code className="font-mono text-purple-600 dark:text-purple-400">Core-Rules/</code>，负责驱动底层 30 项分流规则集 (ruleset)
+                    {mobile ? "更新域名与 IP 分流数据，供已启用的规则使用。" : <>源自 {rulesRepo?.releaseName || "ProcWeaver 官方规则仓库"} <code className="font-mono text-purple-600 dark:text-purple-400">Core-Rules/</code>，供域名与 IP 规则使用</>}
                   </p>
                 </div>
               </div>
@@ -817,11 +823,11 @@ export const MaintenanceView: React.FC = () => {
                 <button
                   type="button"
                   onClick={handleUpdateCoreRules}
-                  disabled={updatingCoreRules}
+                  disabled={updatingCoreRules || !coreRulesInfo}
                   className="px-3.5 py-1.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold shadow-md shadow-purple-600/20 transition flex items-center gap-1.5 cursor-pointer"
                 >
                   <Download className={`w-3.5 h-3.5 ${updatingCoreRules ? "animate-bounce" : ""}`} />
-                  <span>{updatingCoreRules ? "正在解压热更新..." : "一键更新核心规则"}</span>
+                  <span>{updatingCoreRules ? "正在更新…" : "更新规则数据"}</span>
                 </button>
                 <a
                   href={rulesRepo?.repoUrl ? `${rulesRepo.repoUrl}/tree/main/Core-Rules` : "https://github.com/jojhaa/ProcWeaver-Rules/tree/main/Core-Rules"}
@@ -840,21 +846,21 @@ export const MaintenanceView: React.FC = () => {
               <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-950/40 border border-slate-200/80 dark:border-slate-800/80 space-y-1">
                 <span className="text-slate-500 text-[11px]">已装载规则集文件</span>
                 <p className="font-bold text-slate-900 dark:text-slate-100 font-mono">
-                  {coreRulesInfo?.totalRulesCount ?? 30} 个 (.mrs / .yaml)
+                  {coreRulesInfo ? `${coreRulesInfo.totalRulesCount} 个` : "尚未读取"}
                 </p>
               </div>
 
               <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-950/40 border border-slate-200/80 dark:border-slate-800/80 space-y-1">
                 <span className="text-slate-500 text-[11px]">最新仓库版本</span>
                 <p className="font-bold text-slate-900 dark:text-slate-100 font-mono">
-                  {coreRulesInfo?.latestVersion || coreRulesInfo?.currentVersion || "v2026.09.21"}
+                  {coreRulesInfo?.latestVersion || coreRulesInfo?.currentVersion || "尚未读取"}
                 </p>
               </div>
 
               <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-950/40 border border-slate-200/80 dark:border-slate-800/80 space-y-1">
                 <span className="text-slate-500 text-[11px]">生效模式</span>
                 <p className="font-bold text-emerald-600 dark:text-emerald-400 font-mono flex items-center gap-1">
-                  <span>零断网热重载</span>
+                  <span>更新后重载配置</span>
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
                 </p>
               </div>
@@ -879,7 +885,7 @@ export const MaintenanceView: React.FC = () => {
             )}
 
             {/* 本地物理路径 */}
-            <div className="text-[11px] text-slate-500 dark:text-slate-400 flex items-center justify-between gap-2 pt-1 border-t border-slate-100 dark:border-slate-800/40 font-mono">
+            <div hidden={mobile} className="text-[11px] text-slate-500 dark:text-slate-400 flex items-center justify-between gap-2 pt-1 border-t border-slate-100 dark:border-slate-800/40 font-mono">
               <span className="truncate">存储目录: {coreRulesInfo?.localRulesDir || "core_data/ruleset/local-plan"}</span>
               <span className="text-slate-400 dark:text-slate-500 text-[10px] shrink-0">原子写入与错误回滚保护</span>
             </div>
@@ -1009,7 +1015,8 @@ export const MaintenanceView: React.FC = () => {
           </div>
 
           {/* Geo 选项 */}
-          <div className="bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 rounded-2xl p-5 space-y-4 shadow-sm">
+          {mobile && <p className="text-xs text-slate-500">Android 由系统安排后台检查；省电和网络状态可能延后执行。手动更新立即检查，重新连接 VPN 后使用新数据库。</p>}
+          {<div className="bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 rounded-2xl p-5 space-y-4 shadow-sm">
             <div className="text-sm font-semibold text-slate-900 dark:text-white">Geo 自动化同步选项</div>
 
             <div className="space-y-4 divide-y divide-slate-100 dark:divide-slate-800/60 text-xs">
@@ -1054,7 +1061,7 @@ export const MaintenanceView: React.FC = () => {
                 </div>
               </div>
             </div>
-          </div>
+          </div>}
         </div>
       )}
 

@@ -11,6 +11,8 @@ export interface ConnectionMetadata {
   dnsMode?: string;
   process?: string;
   processPath?: string;
+  inboundName?: string;
+  processContext?: { source: "windivert_context"; kind: "path" | "name" | "any" | "unknown"; value: string; owner?: string };
 }
 
 export interface ConnectionItem {

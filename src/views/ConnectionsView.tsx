@@ -1,3 +1,5 @@
+import { androidAppsApi } from "../api/android";
+import { useMobileBack } from "../utils/mobileBack";
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
   Activity,
@@ -33,6 +35,15 @@ interface ConnectionsViewProps {
 }
 
 export const ConnectionsView: React.FC<ConnectionsViewProps> = React.memo(({ controllerPort: _controllerPort }) => {
+  const mobile = document.documentElement.dataset.platform === "android";
+  const [appLabels, setAppLabels] = useState<Record<string, string>>({});
+  useEffect(() => {
+    let active = true;
+    if (mobile) void androidAppsApi.applications().then(apps => {
+      if (active) setAppLabels(Object.fromEntries(apps.map(app => [app.packageName, app.label])));
+    }).catch(() => {});
+    return () => { active = false; };
+  }, [mobile]);
   // 视图模式：活跃连接 vs 历史请求流水
   const [viewMode, setViewMode] = useState<"active" | "closed">("active");
 
@@ -53,6 +64,11 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = React.memo(({ con
   const [showCloseAllConfirm, setShowCloseAllConfirm] = useState(false);
   const [closingIds, setClosingIds] = useState<Set<string>>(new Set());
 
+  useMobileBack(() => {
+    if (showCloseAllConfirm) { setShowCloseAllConfirm(false); return true; }
+    if (selectedConnection) { setSelectedConnection(null); return true; }
+    return false;
+  }, 30);
   const visible = useMonitorVisible();
   const settledQuery = useDebouncedValue(searchQuery);
   const [monitorError, setMonitorError] = useState("");
@@ -249,7 +265,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = React.memo(({ con
         const host = (c.metadata.host || "").toLowerCase();
         const destIp = (c.metadata.destinationIP || "").toLowerCase();
         const destPort = String(c.metadata.destinationPort || "");
-        const process = (c.metadata.process || "").toLowerCase();
+        const process = `${c.metadata.process || ""} ${appLabels[c.metadata.process || ""] || ""}`.toLowerCase();
         const rule = (c.rule || "").toLowerCase();
         const rulePayload = (c.rulePayload || "").toLowerCase();
         const chains = (c.chains || []).join(" ").toLowerCase();
@@ -428,7 +444,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = React.memo(({ con
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="搜索主机域名、IP、端口、进程名 (如 chrome.exe)、规则..."
+              placeholder={mobile ? "搜索域名、IP、应用包名或规则…" : "搜索主机域名、IP、端口、进程名 (如 chrome.exe)、规则..."}
               className="w-full pl-9 pr-8 py-1.5 text-xs bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:text-slate-200"
             />
             {searchQuery && (
@@ -497,7 +513,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = React.memo(({ con
           <VirtualList items={displayList} itemKey={conn => conn.id} rowHeight={100} narrowRowHeight={156}
             label="连接追踪" renderRow={(conn) => {
               const isClosing = closingIds.has(conn.id);
-              const processName = conn.metadata.process || conn.metadata.processPath?.split("\\").pop() || "";
+              const processName = mobile ? (appLabels[conn.metadata.process || ""] || conn.metadata.process || "未识别应用") : conn.metadata.process || conn.metadata.processPath?.split("\\").pop() || "";
               const hostTitle = conn.metadata.host || conn.metadata.destinationIP || "未知主机";
               const chainsStr = (conn.chains || []).join(" ➔ ") || "DIRECT";
 
@@ -685,11 +701,11 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = React.memo(({ con
               </div>
               {selectedConnection.metadata.process && (
                 <div className="flex justify-between py-1 border-b border-slate-100 dark:border-slate-800/60">
-                  <span className="text-slate-500 font-sans">触发进程:</span>
+                  <span className="text-slate-500 font-sans">{mobile ? "应用包名:" : "触发进程:"}</span>
                   <span className="text-slate-800 dark:text-slate-200">{selectedConnection.metadata.process}</span>
                 </div>
               )}
-              {selectedConnection.metadata.processPath && (
+              {!mobile && selectedConnection.metadata.processPath && (
                 <div className="py-1 border-b border-slate-100 dark:border-slate-800/60">
                   <span className="text-slate-500 font-sans block mb-1">进程完整路径:</span>
                   <span className="text-[11px] text-slate-600 dark:text-slate-400 break-all">

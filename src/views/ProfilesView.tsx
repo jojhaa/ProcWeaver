@@ -1,3 +1,4 @@
+import { useMobileBack } from "../utils/mobileBack";
 import React, { useState, useEffect, useRef } from "react";
 import { ProfileItem } from "../types";
 import {
@@ -28,8 +29,12 @@ import {
   X,
 } from "lucide-react";
 import QRCode from "qrcode";
+import { saveTextFile } from "../services/fileExport";
 import { useProfileSwitch } from "../hooks/useProfileSwitch";
 import { ProfileSwitchDialog } from "../components/ProfileSwitchDialog";
+import { getPlatform } from "../services/platform";
+import { useProfileImport } from "../hooks/useProfileImport";
+import { ProfileImportPanel } from "../components/ProfileImportPanel";
 
 // 格式化字节为易读格式 (GB / MB / KB)
 function formatBytes(bytes?: number): string {
@@ -52,6 +57,8 @@ function formatExpireDate(expire?: number): string {
 }
 
 export const ProfilesView: React.FC = () => {
+  const mobile = getPlatform().os === "android";
+  const importer = useProfileImport(mobile, () => { void loadData(); });
   const profileSwitch = useProfileSwitch();
   const [profiles, setProfiles] = useState<ProfileItem[]>([]);
   const [loading, setLoading] = useState(false);
@@ -66,6 +73,10 @@ export const ProfilesView: React.FC = () => {
   const [showAddModal, setShowAddModal] = useState(false);
   const [newName, setNewName] = useState("");
   const [newUrl, setNewUrl] = useState("");
+  const [addError, setAddError] = useState("");
+  const [metaError, setMetaError] = useState("");
+  const formPending = useRef(false);
+  useEffect(() => { if (showAddModal) setAddError(""); }, [showAddModal]);
 
   // 2. 编辑元数据模态框 (名称, URL, 自定义自动更新时间)
   const [editMetaTarget, setEditMetaTarget] = useState<ProfileItem | null>(null);
@@ -89,6 +100,16 @@ export const ProfilesView: React.FC = () => {
   const [exportLoading, setExportLoading] = useState<string | null>(null);
 
   const menuRef = useRef<HTMLDivElement>(null);
+  useMobileBack(() => {
+    if (!mobile) return false;
+    if (shareTarget) setShareTarget(null);
+    else if (editContentTarget) { if (yamlSaving) return true; setEditContentTarget(null); }
+    else if (editMetaTarget) { if (actionLoading) return true; setEditMetaTarget(null); }
+    else if (showAddModal) { if (actionLoading) return true; setShowAddModal(false); }
+    else if (activeMenuId) setActiveMenuId(null);
+    else return false;
+    return true;
+  }, 30);
 
   const showNotification = (msg: string) => {
     setSuccessMsg(msg);
@@ -128,10 +149,11 @@ export const ProfilesView: React.FC = () => {
   // 添加订阅
   const handleAdd = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newName || !newUrl) return;
+    if (formPending.current || !newName.trim() || !newUrl.trim()) return;
+    formPending.current = true; setAddError("");
     setActionLoading("add");
     try {
-      await addProfile(newName, newUrl);
+      await addProfile(newName.trim(), newUrl.trim());
       setShowAddModal(false);
       setNewName("");
       setNewUrl("");
@@ -140,8 +162,9 @@ export const ProfilesView: React.FC = () => {
       window.dispatchEvent(new CustomEvent("procweaver-profile-changed"));
       window.dispatchEvent(new CustomEvent("netbox-profile-changed"));
     } catch (err: unknown) {
-      setError(typeof err === "string" ? err : err instanceof Error ? err.message : "添加订阅失败");
+      setAddError(typeof err === "string" ? err : err instanceof Error ? err.message : "添加订阅失败");
     } finally {
+      formPending.current = false;
       setActionLoading(null);
     }
   };
@@ -200,18 +223,20 @@ export const ProfilesView: React.FC = () => {
     setEditMetaName(item.name);
     setEditMetaUrl(item.url || "");
     setEditMetaInterval(item.autoUpdateInterval || 0);
+    setMetaError("");
   };
 
   // 提交元数据编辑
   const handleSaveEditMeta = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!editMetaTarget) return;
+    if (!editMetaTarget || formPending.current || !editMetaName.trim()) return;
+    formPending.current = true; setActionLoading("metadata"); setMetaError("");
     try {
       await editProfileMetadata(
         editMetaTarget.id,
-        editMetaName,
-        editMetaUrl,
-        Number(editMetaInterval) || 0
+        editMetaName.trim(),
+        editMetaTarget.url ? editMetaUrl.trim() : "",
+        editMetaTarget.url ? Number(editMetaInterval) || 0 : 0
       );
       setEditMetaTarget(null);
       showNotification("订阅信息更新成功");
@@ -219,7 +244,9 @@ export const ProfilesView: React.FC = () => {
       window.dispatchEvent(new CustomEvent("procweaver-profile-changed"));
       window.dispatchEvent(new CustomEvent("netbox-profile-changed"));
     } catch (err: unknown) {
-      setError(typeof err === "string" ? err : err instanceof Error ? err.message : "修改订阅失败");
+      setMetaError(typeof err === "string" ? err : err instanceof Error ? err.message : "修改订阅失败");
+    } finally {
+      formPending.current = false; setActionLoading(null);
     }
   };
 
@@ -297,17 +324,9 @@ export const ProfilesView: React.FC = () => {
     setExportLoading(item.id);
     try {
       const content = await getProfileContent(item.id);
-      // 浏览器/Webview 触发安全下载保存
-      const blob = new Blob([content], { type: "application/x-yaml;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${item.name.replace(/[\\/:*?"<>|]/g, "_") || "profile"}.yaml`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      showNotification(`已成功导出 "${item.name}.yaml"`);
+      if (await saveTextFile(`${item.name.replace(/[\\/:*?"<>|]/g, "_") || "profile"}.yaml`, content, "application/x-yaml")) {
+        showNotification(`已成功导出 "${item.name}.yaml"`);
+      }
     } catch (err: unknown) {
       setError(typeof err === "string" ? err : err instanceof Error ? err.message : "导出配置失败");
     } finally {
@@ -337,6 +356,7 @@ export const ProfilesView: React.FC = () => {
       </div>
 
       {/* 提示消息 */}
+      <ProfileImportPanel mobile={mobile} state={importer} />
       {successMsg && (
         <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-600 dark:text-emerald-400 text-xs flex items-center gap-2">
           <CheckCircle className="w-4 h-4 shrink-0" />
@@ -527,7 +547,7 @@ export const ProfilesView: React.FC = () => {
             <div>
               <p className="text-base text-slate-800 dark:text-slate-200 font-bold">尚未添加任何订阅配置</p>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 max-w-sm mx-auto">
-                首次使用请点击下方按钮添加您的节点订阅链接，导入后系统将自动加载节点并激活代理网络。
+                {mobile ? "添加订阅后即可查看节点；连接 VPN 需要另行点击连接并完成系统授权。" : "首次使用请点击下方按钮添加您的节点订阅链接，导入后系统将自动加载节点并激活代理网络。"}
               </p>
             </div>
             <button
@@ -543,10 +563,11 @@ export const ProfilesView: React.FC = () => {
 
       {/* 1. 添加订阅模态框 */}
       {showAddModal && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div role="dialog" aria-modal="true" aria-label="添加订阅配置" className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 w-full max-w-md shadow-2xl space-y-4">
             <h3 className="text-base font-bold text-slate-900 dark:text-white">添加订阅配置</h3>
             <form onSubmit={handleAdd} className="space-y-4 text-xs">
+              <fieldset disabled={actionLoading === "add"} className="space-y-4 min-w-0">
               <div>
                 <label className="block text-slate-600 dark:text-slate-400 mb-1 font-medium">配置名称</label>
                 <input
@@ -571,6 +592,7 @@ export const ProfilesView: React.FC = () => {
                 />
               </div>
 
+              {addError && <p role="alert" className="text-xs text-rose-600 dark:text-rose-400 break-words max-h-32 overflow-auto">{addError}</p>}
               <div className="flex items-center justify-end space-x-3 pt-2">
                 <button
                   type="button"
@@ -588,6 +610,7 @@ export const ProfilesView: React.FC = () => {
                   <span>{actionLoading === "add" ? "下载并保存..." : "立即保存"}</span>
                 </button>
               </div>
+              </fieldset>
             </form>
           </div>
         </div>
@@ -595,15 +618,16 @@ export const ProfilesView: React.FC = () => {
 
       {/* 2. 编辑订阅信息与自动更新时间模态框 */}
       {editMetaTarget && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div role="dialog" aria-modal="true" aria-label="编辑订阅配置" className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 w-full max-w-md shadow-2xl space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="text-base font-bold text-slate-900 dark:text-white">编辑订阅配置</h3>
-              <button onClick={() => setEditMetaTarget(null)} className="text-slate-400 hover:text-slate-600">
+              <button aria-label="关闭编辑" disabled={actionLoading === "metadata"} onClick={() => setEditMetaTarget(null)} className="text-slate-400 hover:text-slate-600">
                 <X className="w-4 h-4" />
               </button>
             </div>
             <form onSubmit={handleSaveEditMeta} className="space-y-4 text-xs">
+              <fieldset disabled={actionLoading === "metadata"} className="space-y-4 min-w-0">
               <div>
                 <label className="block text-slate-600 dark:text-slate-400 mb-1 font-medium">配置名称</label>
                 <input
@@ -615,6 +639,7 @@ export const ProfilesView: React.FC = () => {
                 />
               </div>
 
+              {editMetaTarget.url ? <>
               <div>
                 <label className="block text-slate-600 dark:text-slate-400 mb-1 font-medium">订阅链接</label>
                 <input
@@ -647,6 +672,8 @@ export const ProfilesView: React.FC = () => {
                   <option value={48}>每 48 小时 (每两天)</option>
                 </select>
               </div>
+              </> : <p className="text-slate-500">本地配置可直接修改名称，无需订阅链接。</p>}
+              {metaError && <p role="alert" className="text-xs text-rose-600 dark:text-rose-400 break-words max-h-32 overflow-auto">{metaError}</p>}
 
               <div className="flex items-center justify-end space-x-3 pt-2">
                 <button
@@ -660,9 +687,10 @@ export const ProfilesView: React.FC = () => {
                   type="submit"
                   className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-lg shadow-indigo-600/30"
                 >
-                  保存修改
+                  {actionLoading === "metadata" ? "正在保存…" : "保存修改"}
                 </button>
               </div>
+              </fieldset>
             </form>
           </div>
         </div>

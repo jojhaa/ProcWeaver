@@ -9,14 +9,15 @@ const zero: TrafficReading = { upload: 0, download: 0, upSpeed: 0, downSpeed: 0 
 export function createMonitorStore(fetch: (details: boolean) => Promise<MonitorSnapshot>, interval: number | (() => number) = 1000) {
   const listeners = new Set<() => void>();
   const details = new Set<() => void>();
-  let traffic = { all: zero, proxy: zero, error: "" };
+  let traffic = { all: zero, proxy: zero, error: "", nativeTotals: false };
   let sample: ConnectionSample | null = null;
   const count = createTrafficCounter();
   let timer: ReturnType<typeof setTimeout> | undefined;
   let inFlight = false;
   let generation = 0;
   let detailGeneration = 0;
-  const active = () => listeners.size + details.size > 0;
+  let paused = false;
+  const active = () => !paused && listeners.size + details.size > 0;
   const publish = (subscribers: Set<() => void>) => subscribers.forEach(cb => cb());
   async function poll() {
     if (inFlight || !active()) return;
@@ -28,16 +29,19 @@ export function createMonitorStore(fetch: (details: boolean) => Promise<MonitorS
       const data = await fetch(details.size > 0);
       if (revision !== generation || !active()) return;
       const now = Date.now();
-      traffic = { ...count(data, now), error: "" };
+      const next = { ...count(data, now), error: "", nativeTotals: Number.isFinite(data.proxyUploadTotal) && Number.isFinite(data.proxyDownloadTotal) };
+      const sameReading = (a: TrafficReading, b: TrafficReading) => a.upload === b.upload && a.download === b.download && a.upSpeed === b.upSpeed && a.downSpeed === b.downSpeed;
+      const changed = traffic.error !== next.error || traffic.nativeTotals !== next.nativeTotals || !sameReading(traffic.all, next.all) || !sameReading(traffic.proxy, next.proxy);
+      if (changed) traffic = next;
       if (data.details && details.size && detailRevision === detailGeneration) {
         sample = { ...data.details, epoch: data.epoch, timestamp: now };
         publish(details);
       }
-      publish(listeners);
+      if (changed) publish(listeners);
     } catch {
       delay = 3000;
       if (revision === generation && active()) {
-        traffic = { all: { ...traffic.all, upSpeed: 0, downSpeed: 0 }, proxy: { ...traffic.proxy, upSpeed: 0, downSpeed: 0 }, error: "核心未就绪或统计暂不可用" };
+        traffic = { ...traffic, all: { ...traffic.all, upSpeed: 0, downSpeed: 0 }, proxy: { ...traffic.proxy, upSpeed: 0, downSpeed: 0 }, error: "核心未就绪或统计暂不可用" };
         publish(listeners);
       }
     } finally {
@@ -56,6 +60,12 @@ export function createMonitorStore(fetch: (details: boolean) => Promise<MonitorS
     };
   }
   return {
+    setPaused(value: boolean) {
+      if (paused === value) return;
+      paused = value; generation++; detailGeneration++; sample = null;
+      clearTimeout(timer);
+      if (!paused && !inFlight) void poll();
+    },
     getTraffic: () => traffic,
     getConnections: () => sample,
     subscribeTraffic: (cb: () => void) => subscribe(listeners, cb),

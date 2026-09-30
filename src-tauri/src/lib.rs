@@ -1,7 +1,12 @@
 pub mod commands;
 pub mod storage;
+pub mod platform;
 pub mod local_nodes;
 mod bundle_repository;
+#[cfg(not(target_os = "android"))]
+mod app_lifecycle;
+#[cfg(target_os = "android")]
+#[path = "platform/android/lifecycle.rs"]
 mod app_lifecycle;
 #[cfg(windows)]
 mod windows_identity;
@@ -29,20 +34,43 @@ pub fn run() {
         started_at: None,
     });
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(not(target_os = "android"))]
+    let builder = builder
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             app_lifecycle::show(app);
             commands::bundle_launch::dispatch(app, args);
-        }))
+        }));
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(platform::android::init());
+    builder
         .plugin(tauri_plugin_opener::init())
         .manage(core_state)
+        // Tauri creates configured webviews before the application setup callback.
+        // Their first IPC (including UI restore) must already have valid data paths.
+        .plugin(tauri::plugin::Builder::<_, ()>::new("storage-init")
+            .setup(|app, _| {
+                storage::initialize(app)?;
+                commands::local_rules::initialize()?;
+                Ok(())
+            })
+            .build())
         .setup(|app| {
+            #[cfg(not(target_os = "android"))]
+            {
             if let Some(window) = app.get_webview_window("main") {
                 window.set_icon(tauri::include_image!("icons/128x128.png"))?;
             }
-            storage::initialize(app)?;
             commands::bundle_launch::dispatch(app.handle(), std::env::args().collect());
-            commands::sysproxy::recover_stale_proxy().map_err(std::io::Error::other)?;
+            let proxy_recovery_ready = match commands::sysproxy::recover_stale_proxy() {
+                Ok(()) => true,
+                Err(error) => {
+                    #[cfg(target_os = "macos")]
+                    { eprintln!("macOS 系统代理恢复待处理：{error}"); false }
+                    #[cfg(not(target_os = "macos"))]
+                    { return Err(std::io::Error::other(error).into()); }
+                }
+            };
             let dns_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 commands::dns_adapter::auto_recover_dns_on_startup().await;
@@ -50,16 +78,19 @@ pub fn run() {
                 let _ = dns_app.emit("procweaver-dns-guard-changed", ());
             });
             commands::process_watcher::init_watcher_on_startup();
-            commands::local_rules::initialize()?;
             tauri::async_runtime::spawn(commands::geo::run_scheduler());
             tauri::async_runtime::spawn(commands::profile::run_profile_scheduler());
-            tauri::async_runtime::spawn(routing_overrides::tracker::run());
+            let monitor_app = app.handle().clone();
+            tauri::async_runtime::spawn(routing_overrides::tracker::run(move |change| {
+                use tauri::Emitter;
+                let _ = monitor_app.emit("procweaver-processes-changed", change);
+            }));
             tauri::async_runtime::spawn(capture::run());
             tauri::async_runtime::spawn(capture::smart_arbiter::run_arbiter());
             app_lifecycle::setup(app)?;
             let preferences = commands::settings::get_general_settings();
-            if preferences.as_ref().map_or(true, |s| !s.silent_start) { app_lifecycle::show(app.handle()); }
-            if preferences.as_ref().is_ok_and(|s| s.auto_run) {
+            if !proxy_recovery_ready || preferences.as_ref().map_or(true, |s| !s.silent_start) { app_lifecycle::show(app.handle()); }
+            if proxy_recovery_ready && preferences.as_ref().is_ok_and(|s| s.auto_run) {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     if let Err(error) = commands::process::start_core(None, handle.state()).await {
@@ -77,9 +108,11 @@ pub fn run() {
                     }
                 }
             });
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
+            #[cfg(not(target_os = "android"))]
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" && !shutdown::ready() {
                     api.prevent_close();
@@ -114,6 +147,18 @@ pub fn run() {
             commands::ip_health::check_ip_health,
             commands::ip_health::wait_for_exit_connection,
             commands::process::get_cpu_info,
+            platform::get_platform_capabilities,
+            platform::get_android_applications,
+            platform::android_mobile_action,
+            commands::mobile_settings::get_lan_outbounds,
+            commands::config_transfer::export_config_snapshot,
+            commands::config_transfer::preview_config_snapshot,
+            commands::config_transfer::restore_config_snapshot,
+            commands::config_transfer::pending_restore_ui,
+            commands::config_sync::sync_config_remote,
+            platform::get_core_log_token,
+            platform::save_android_document,
+            platform::get_macos_tun_readiness,
             commands::process::get_core_status,
             commands::process::start_core,
             commands::process::stop_core,
@@ -122,6 +167,7 @@ pub fn run() {
             commands::sysproxy::get_system_proxy_status,
             commands::profile::list_profiles,
             commands::profile::add_profile,
+            commands::profile::import_profile_content,
             commands::profile::update_profile,
             commands::profile::select_profile,
             commands::profile_switch::preview_profile_switch,
@@ -157,6 +203,8 @@ pub fn run() {
             commands::settings::get_active_traffic_driver,
             commands::dns::get_dns_settings,
             commands::dns::save_dns_settings,
+            #[cfg(windows)]
+            commands::dns_listener::get_dns_listener_status,
             commands::health_probe::begin_health_probe,
             commands::health_probe::probe_node_health,
             commands::health_probe::end_health_probe,
@@ -213,6 +261,7 @@ pub fn run() {
         .build(context)
         .expect("error while running tauri application")
         .run(|app_handle, event| {
+            #[cfg(not(target_os = "android"))]
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
                 if !shutdown::ready() {
                     api.prevent_exit();

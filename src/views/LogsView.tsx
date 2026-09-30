@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
+import { useMobileBack } from "../utils/mobileBack";
 import {
   ScrollText,
   Search,
@@ -33,6 +34,7 @@ import {
 import { getGeneralSettings, saveGeneralSettings } from "../api/settings";
 
 import { VirtualList } from "../components/VirtualList";
+import { saveTextFile } from "../services/fileExport";
 import { useDebouncedValue } from "../hooks/useDebouncedValue";
 import { useMonitorVisible } from "../hooks/useMonitorVisible";
 import { MonitorPerformanceControl } from "../components/MonitorPerformanceControl";
@@ -61,6 +63,7 @@ export const LogsView: React.FC<LogsViewProps> = React.memo(({ controllerPort = 
   const settledQuery = useDebouncedValue(searchQuery);
   const [bufferStats, setBufferStats] = useState(getLogBufferStats);
   const [selectedLog, setSelectedLog] = useState<LogEntry | null>(null);
+  useMobileBack(() => { if (!selectedLog) return false; setSelectedLog(null); return true; }, 30);
 
   // DOM 与滚动引用
   const wsRef = useRef<WebSocket | null>(null);
@@ -105,7 +108,7 @@ export const LogsView: React.FC<LogsViewProps> = React.memo(({ controllerPort = 
 
   // 3. WebSocket 实时日志流连接
   useEffect(() => {
-    if (!logCaptureEnabled) {
+    if (!logCaptureEnabled || (document.documentElement.dataset.platform === "android" && !visible)) {
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
@@ -116,12 +119,14 @@ export const LogsView: React.FC<LogsViewProps> = React.memo(({ controllerPort = 
 
     let isMounted = true;
 
-    const connectWs = () => {
+    const connectWs = async () => {
       if (!isMounted) return;
       setWsStatus("connecting");
 
       try {
-        const url = getLogsWsUrl(controllerPort, "debug");
+        const secret = document.documentElement.dataset.platform === "android" ? await (await import("@tauri-apps/api/core")).invoke<string>("get_core_log_token") : undefined;
+        if (!isMounted) return;
+        const url = getLogsWsUrl(controllerPort, "debug", secret);
         const ws = new WebSocket(url);
         wsRef.current = ws;
 
@@ -174,7 +179,7 @@ export const LogsView: React.FC<LogsViewProps> = React.memo(({ controllerPort = 
         wsRef.current = null;
       }
     };
-  }, [logCaptureEnabled, controllerPort]);
+  }, [logCaptureEnabled, controllerPort, visible]);
 
   // 暂停仅冻结显示；恢复时一次读取有界缓存，不重建日志连接。
   useEffect(() => {
@@ -192,23 +197,16 @@ export const LogsView: React.FC<LogsViewProps> = React.memo(({ controllerPort = 
   };
 
   // 6. 导出为 .log 文件
-  const handleExportLogs = () => {
+  const handleExportLogs = async () => {
     if (logs.length === 0) return;
     const content = logs
       .map((l) => `[${l.time}] [${l.level.toUpperCase()}] ${l.payload}`)
       .join("\n");
 
-    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
     const d = new Date();
     const dateStr = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}-${String(d.getHours()).padStart(2, "0")}${String(d.getMinutes()).padStart(2, "0")}${String(d.getSeconds()).padStart(2, "0")}`;
-    a.href = url;
-    a.download = `netbox-logs-${dateStr}.log`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    try { await saveTextFile(`procweaver-logs-${dateStr}.log`, content); }
+    catch (error) { appendAppLog("error", String(error)); }
   };
 
   // 复制单行日志

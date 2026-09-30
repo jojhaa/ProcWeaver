@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from "react";
 import { getWindowMonitorVisible } from "../api";
 
-let visible = !document.hidden;
+let visible = !isAppHidden();
 const listeners = new Set<() => void>();
 let timer: ReturnType<typeof setTimeout> | undefined;
 let inFlight = false;
@@ -14,7 +14,7 @@ async function refresh() {
   inFlight = true;
   const revision = generation;
   try {
-    const next = await getWindowMonitorVisible() && !document.hidden;
+    const next = document.documentElement.dataset.platform === "android" ? !isAppHidden() : await getWindowMonitorVisible() && !isAppHidden();
     if (revision === generation && listeners.size && visible !== next) {
       visible = next;
       listeners.forEach(cb => cb());
@@ -22,7 +22,7 @@ async function refresh() {
   } catch { /* 查询失败保持原状态，不误停前台显示。 */ }
   finally {
     inFlight = false;
-    if (listeners.size) timer = setTimeout(refresh, 2000);
+    if (listeners.size && document.documentElement.dataset.platform !== "android") timer = setTimeout(refresh, 2000);
   }
 }
 function subscribe(cb: () => void) {
@@ -47,3 +47,4 @@ function subscribe(cb: () => void) {
 export function useMonitorVisible() {
   return useSyncExternalStore(subscribe, getSnapshot);
 }
+import { isAppHidden } from "../utils/appVisibility";

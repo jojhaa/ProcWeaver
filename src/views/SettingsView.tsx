@@ -13,12 +13,20 @@ import {
   Laptop,
   Palette,
   Zap,
+  Shield,
 } from "lucide-react";
 import { useTheme, Theme } from "../context/ThemeContext";
 import { getGeneralSettings, saveGeneralSettings } from "../api/settings";
 import { DnsSettingsView } from "./DnsSettingsView";
+import { usePlatform } from "../context/PlatformContext";
+import { getMacTunReadiness } from "../services/platform";
+import type { MacTunReadiness } from "../types/platform";
+import { useConfigTransfer } from "../hooks/useConfigTransfer";
+import { ConfigTransferPanel } from "../components/ConfigTransferPanel";
 
 export const SettingsView: React.FC = () => {
+  const transfer = useConfigTransfer();
+  const platform = usePlatform();
   const { theme, resolvedTheme, setTheme } = useTheme();
 
   // 常规设置、DNS 覆写与应用设置状态
@@ -32,7 +40,7 @@ export const SettingsView: React.FC = () => {
   const [ipv6, setIpv6] = useState(false);
   const [findProcessMode, setFindProcessMode] = useState("auto");
   const [autoCloseConnections, setAutoCloseConnections] = useState(true);
-  const [trafficMode, setTrafficMode] = useState<string>("windivert");
+  const [trafficMode, setTrafficMode] = useState<string>("app_proxy");
   const [autoStart, setAutoStart] = useState(false);
   const [minimizeOnClose, setMinimizeOnClose] = useState(false);
   const [silentStart, setSilentStart] = useState(false);
@@ -48,10 +56,20 @@ export const SettingsView: React.FC = () => {
   const [appendSystemDns, setAppendSystemDns] = useState(false);
   const [logCapture, setLogCapture] = useState(true);
   const [tabAnimation, setTabAnimation] = useState(true);
-  const [trayMenuStyle, setTrayMenuStyle] = useState<"modern" | "classic">("modern");
+  const [trayMenuStyle, setTrayMenuStyle] = useState<"modern" | "classic">(platform.os === "macos" ? "classic" : "modern");
   const [saved, setSaved] = useState(false);
   const [saving, setSaving] = useState(false);
   const [settingsError, setSettingsError] = useState("");
+  const [macTunReadiness, setMacTunReadiness] = useState<MacTunReadiness | null>(null);
+  const [macTunError, setMacTunError] = useState("");
+
+  useEffect(() => {
+    if (platform.os !== "macos") return;
+    let active = true;
+    getMacTunReadiness().then(value => { if (active) setMacTunReadiness(value); })
+      .catch(error => { if (active) setMacTunError(String(error)); });
+    return () => { active = false; };
+  }, [platform.os]);
 
   useEffect(() => {
     getGeneralSettings().then((s) => {
@@ -64,8 +82,9 @@ export const SettingsView: React.FC = () => {
       if (s.appendSystemDns !== undefined) setAppendSystemDns(s.appendSystemDns);
       if (s.logCapture !== undefined) setLogCapture(s.logCapture);
       if (s.tabAnimation !== undefined) setTabAnimation(s.tabAnimation);
-      if (s.trayMenuStyle) setTrayMenuStyle(s.trayMenuStyle);
-      setTrafficMode(s.trafficMode || (s.tunMode ? "tun" : "windivert"));
+      if (platform.os === "macos") setTrayMenuStyle("classic");
+      else if (s.trayMenuStyle) setTrayMenuStyle(s.trayMenuStyle);
+      setTrafficMode(s.trafficMode || (s.tunMode ? "tun" : "app_proxy"));
       setAutoStart(s.autoStart);
       setUnifiedDelay(s.unifiedDelay ?? true); setTcpConcurrent(s.tcpConcurrent ?? false); setGeoLowMemory(s.geoLowMemory ?? true);
       setMinimizeOnClose(s.minimizeOnClose ?? false); setSilentStart(s.silentStart ?? false);
@@ -82,6 +101,7 @@ export const SettingsView: React.FC = () => {
     setSaving(true); setSaved(false); setSettingsError("");
     try {
       await saveGeneralSettings({
+        ...await getGeneralSettings(),
         mixedPort,
         controllerPort,
         enableControllerPort,
@@ -132,7 +152,7 @@ export const SettingsView: React.FC = () => {
             </span>
             <p className="text-[11px] text-slate-500 dark:text-slate-400">
               {subTab === "general"
-                ? "配置本地代理端口、TUN 模式及核心运行性能"
+                ? platform.tun ? "配置本地代理端口、TUN 模式及核心运行性能" : "配置 macOS 应用代理端口与核心运行参数；TUN 尚未启用"
                 : subTab === "app"
                 ? "管理托盘关闭、静默启动及流量统计范围"
                 : "自定义配置本地防污染 DNS 服务器与解析策略"}
@@ -317,6 +337,31 @@ export const SettingsView: React.FC = () => {
             </div>
           </div>
 
+          {platform.os === "macos" && (
+            <div className="bg-white/80 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 space-y-3 shadow-sm">
+              <div className="flex items-center space-x-2 text-sm font-semibold text-slate-900 dark:text-white">
+                <Shield className="w-4 h-4 text-indigo-500 dark:text-indigo-400" />
+                <span>macOS TUN 准备状态</span>
+              </div>
+              <p role="status" className="text-xs text-slate-600 dark:text-slate-300">
+                {macTunError || macTunReadiness?.message || "正在读取本机状态…"}
+              </p>
+              {macTunReadiness && (
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+                  {[
+                    ["原生核心", macTunReadiness.corePresent],
+                    ["管理员授权", macTunReadiness.authorizationReady],
+                    ["网络恢复", macTunReadiness.networkRecoveryReady],
+                  ].map(([label, ready]) => (
+                    <div key={String(label)} className="rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-2 text-slate-700 dark:text-slate-300">
+                      {label}：{ready ? "已就绪" : "待完成"}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* 内核网络运行参数 */}
           <div className="bg-white/80 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 space-y-4 shadow-sm transition-colors">
             <div className="flex items-center space-x-2 text-sm font-semibold text-slate-900 dark:text-white">
@@ -337,7 +382,7 @@ export const SettingsView: React.FC = () => {
                 },
                 {
                   title: "追加系统 DNS",
-                  description: "自动提取 Windows 本地网卡或路由器 DHCP 下发的 DNS，追加至解析服务器列表末尾以兼容内网解析。",
+                  description: "使用当前系统 DNS 作为补充，具体生效范围取决于核心与当前网络配置。",
                   value: appendSystemDns,
                   update: setAppendSystemDns,
                 },
@@ -647,6 +692,7 @@ export const SettingsView: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => { setTrayMenuStyle("modern"); setSaved(false); }}
+                  disabled={platform.os === "macos"}
                   className={`flex flex-col p-3 rounded-xl border text-left transition cursor-pointer ${
                     trayMenuStyle === "modern"
                       ? "border-indigo-600 bg-indigo-50/50 dark:bg-indigo-950/30 text-indigo-900 dark:text-indigo-200 ring-1 ring-indigo-600"
@@ -658,7 +704,7 @@ export const SettingsView: React.FC = () => {
                     {trayMenuStyle === "modern" && <Check className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400" />}
                   </div>
                   <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                    亚克力半透明磨砂、平滑抽屉滑动、精细对齐、即刻秒弹与深浅色自适应
+                    {platform.os === "macos" ? "macOS 首版使用系统原生菜单" : "半透明效果与深浅色自适应"}
                   </span>
                 </button>
 
@@ -676,7 +722,7 @@ export const SettingsView: React.FC = () => {
                     {trayMenuStyle === "classic" && <Check className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400" />}
                   </div>
                   <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                    Windows 原生 Win32 纯文本排版，零额外渲染消耗
+                    当前操作系统的原生托盘菜单
                   </span>
                 </button>
               </div>
@@ -722,6 +768,7 @@ export const SettingsView: React.FC = () => {
 
 
 
+      {subTab === "app" && <ConfigTransferPanel mobile={false} state={transfer} />}
     </div>
   );
 };

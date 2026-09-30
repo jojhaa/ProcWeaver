@@ -3,6 +3,8 @@ import { ExternalLink, RefreshCw, Settings2 } from "lucide-react";
 import type { BundleLocalInstance } from "../../types/businessBundle";
 import type { BundleRepository, RepositoryPackage, RepositorySnapshot } from "../../types/bundleRepository";
 import { RepositoryManager } from "./RepositoryManager";
+import { usePlatform } from "../../context/PlatformContext";
+import { bundleProcesses } from "../../utils/bundlePlatform";
 
 interface Props {
   state: RepositorySnapshot; defaultId: string; instances: BundleLocalInstance[];
@@ -11,6 +13,7 @@ interface Props {
 }
 const button = "inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs disabled:opacity-50";
 export function RepositoryCenter(props: Props) {
+  const platform = usePlatform();
   const { state } = props;
   const [selected, setSelected] = useState("all"), [manager, setManager] = useState(false), [query, setQuery] = useState("");
   const enabled = state.repositories.filter(r => r.enabled);
@@ -28,7 +31,7 @@ export function RepositoryCenter(props: Props) {
       {!!status?.warnings.length && <details className="mt-2 text-amber-700 dark:text-amber-300"><summary className="cursor-pointer">{status.warnings.length} 项未载入，查看原因</summary><ul className="list-disc pl-5 mt-1 space-y-1">{status.warnings.map((warning, i) => <li key={i}>{warning}</li>)}</ul></details>}
     </div>; })}</div>
     {!packages.length ? <div className="p-10 text-center rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm text-slate-500">{loading ? "正在读取规则包…" : !enabled.length ? "暂无启用的仓库，请在管理仓库中添加或启用来源。" : query ? "没有匹配的规则包。" : visible.some(r => state.statuses[r.id]?.error) ? "暂时没有可用结果，请查看上方仓库错误并重试。" : "所选仓库暂未提供规则包。"}</div> : <div className="grid grid-cols-1 md:grid-cols-2 gap-3">{packages.map(item => {
-      const bundle = item.definition;
+      const bundle = { ...item.definition, processes: bundleProcesses(item.definition, platform.os === "android" ? "android" : platform.os === "macos" ? "macos" : "windows") };
       const installed = props.instances.some(i => i.definition.packageId === bundle.packageId && i.repositoryOrigin?.repositoryKey === item.origin.repositoryKey);
       return <article key={item.key} className="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-xs space-y-3"><div className="flex gap-3"><span className="text-2xl">{bundle.icon}</span><div className="min-w-0 flex-1"><h3 className="text-sm font-bold text-slate-900 dark:text-white break-words">{bundle.packageName}<span className="ml-2 text-[10px] font-mono text-slate-500">{bundle.packageVersion}</span></h3><p className="text-[11px] text-slate-500 mt-1 break-words">{bundle.description}</p><p className="text-[11px] text-indigo-600 dark:text-indigo-300 mt-2 break-words">来源：{item.origin.repositoryName}</p></div></div><div className="flex flex-wrap gap-1">{bundle.processes.slice(0, 8).map((p, i) => <span key={i} className="px-1.5 py-0.5 text-[10px] font-mono rounded bg-slate-100 dark:bg-slate-800 text-slate-500 break-all">{p.exe}</span>)}{bundle.processes.length > 8 && <span className="text-[10px] text-slate-500">等 {bundle.processes.length} 个进程</span>}</div><div className="flex justify-end"><button type="button" onClick={() => props.onInstall(item)} className="px-3 py-1.5 rounded-xl text-xs font-bold bg-indigo-600 hover:bg-indigo-500 text-white">{installed ? "再装载一个实例" : "装载到本机"}</button></div></article>;
     })}</div>}

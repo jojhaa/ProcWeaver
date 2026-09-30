@@ -1,11 +1,15 @@
 import { isTauri } from "./index";
+import { getPlatform } from "../services/platform";
 
 export type DnsEnhancedMode = "fake-ip" | "redir-host" | "normal" | "hosts";
+export type DnsListenerMode = "auto" | "fixed" | "off";
+export interface DnsListenerStatus { running: boolean; listen: string | null; resolverEnabled: boolean }
 
 export interface DnsSettings {
   enableOverride: boolean;        // 覆写 DNS 总开关
   status: boolean;                // 内核 DNS 服务状态（关闭则使用系统 DNS）
   listen: string;                 // 监听端口，例如 "0.0.0.0:1053"
+  listenerMode?: DnsListenerMode | null;
   enhancedMode: DnsEnhancedMode;  // DNS 运行模式
   fakeIpRange: string;            // Fake-IP 虚拟私有网段
   fakeIpFilter: string[];         // 白名单过滤域名
@@ -66,13 +70,23 @@ export const DEFAULT_DNS_SETTINGS: DnsSettings = {
   fallbackFilterDomain: [],
 };
 
+export function defaultDnsSettingsFor(os: string): DnsSettings {
+  return { ...DEFAULT_DNS_SETTINGS, listenerMode: os === "windows" ? "auto" : null, listen: os === "macos" ? "127.0.0.1:1053" : DEFAULT_DNS_SETTINGS.listen };
+}
+
+export async function getDnsListenerStatus(): Promise<DnsListenerStatus> {
+  if (!isTauri()) return { running: false, listen: null, resolverEnabled: false };
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<DnsListenerStatus>("get_dns_listener_status");
+}
+
 export async function getDnsSettings(): Promise<DnsSettings> {
   if (!isTauri()) {
     try {
       const cached = localStorage.getItem("netbox_dns_settings");
       if (cached) return JSON.parse(cached);
     } catch {}
-    return DEFAULT_DNS_SETTINGS;
+    return defaultDnsSettingsFor(getPlatform().os);
   }
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke<DnsSettings>("get_dns_settings");

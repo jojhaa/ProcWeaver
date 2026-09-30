@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-static UPDATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-static CONFIG: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static UPDATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static CONFIG: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static CHANGED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 static REVISION: AtomicU64 = AtomicU64::new(0);
 const MAX_BYTES: usize = 128 * 1024 * 1024;
@@ -199,7 +199,7 @@ pub async fn save_geo_config(mut config: GeoConfig) -> Result<bool, String> {
     Ok(true)
 }
 
-fn validate_settings(config: &GeoConfig) -> Result<(), String> {
+pub(crate) fn validate_settings(config: &GeoConfig) -> Result<(), String> {
     if !(1..=8760).contains(&config.update_interval_hours) { return Err("Geo 更新间隔须为 1–8760 小时".into()); }
     let defaults = get_default_resources();
     let mut ids = std::collections::HashSet::new();
@@ -389,9 +389,20 @@ async fn sync_one(id: &str, custom_url: Option<String>, revision: Option<u64>) -
     let bytes = if let Some(revision) = revision {
         tokio::select! { result = download(&res.url) => result?, _ = wait_for_change(revision) => return Err("Geo 设置已变化，取消本轮自动更新".into()) }
     } else { download(&res.url).await? };
-    let exe = super::profile::validation_core()?;
     let owned_id = id.to_string();
-    let bytes = tokio::task::spawn_blocking(move || { validate_database(&exe, &owned_id, &bytes)?; Ok::<_, String>(bytes) })
+    let bytes = tokio::task::spawn_blocking(move || {
+        #[cfg(not(target_os = "android"))]
+        validate_database(&super::profile::validation_core()?, &owned_id, &bytes)?;
+        #[cfg(target_os = "android")]
+        {
+            let path = get_core_data_dir().join(".geo-candidate");
+            crate::storage::replace_atomic(&path, &bytes)?;
+            let result = crate::platform::android::call::<serde_json::Value>("validateGeo", serde_json::json!({"kind":owned_id,"path":path}));
+            let _ = fs::remove_file(path);
+            result?;
+        }
+        Ok::<_, String>(bytes)
+    })
         .await.map_err(|_| "Geo 校验任务失败")??;
     let _config = CONFIG.lock().await;
     check_revision(revision)?;
@@ -449,6 +460,14 @@ pub(crate) async fn run_scheduler() {
         }
         tokio::select! { _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}, _ = CHANGED.notified() => {} }
     }
+}
+
+pub(crate) async fn run_due_update() -> Result<(), String> {
+    let Ok(_update) = UPDATE.try_lock() else { return Ok(()); };
+    if due(&read_config()?, now_seconds()) {
+        sync_all_locked(Some(REVISION.load(Ordering::SeqCst))).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

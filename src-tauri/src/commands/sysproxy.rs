@@ -20,7 +20,8 @@ static LAST_OBSERVED: Mutex<Option<SystemProxyStatus>> = Mutex::new(None);
 
 pub fn system_proxy_snapshot() -> SystemProxyStatus {
     #[cfg(windows)] let result = windows::status();
-    #[cfg(not(windows))] let result: Result<SystemProxyStatus, String> = Ok(SystemProxyStatus {
+    #[cfg(target_os = "macos")] let result = crate::platform::macos::sysproxy::status();
+    #[cfg(not(any(windows, target_os = "macos")))] let result: Result<SystemProxyStatus, String> = Ok(SystemProxyStatus {
         state: "disabled".into(), bypass_changed: false, message: String::new(), last_change: None,
     });
     let mut status = result.unwrap_or_else(|error| SystemProxyStatus {
@@ -38,7 +39,7 @@ pub(crate) fn observe_change(reason: Option<&str>) -> SystemProxyStatus {
     if let Ok(mut previous) = LAST_OBSERVED.lock() {
         let changed = previous.as_ref().is_none_or(|p| p.state != status.state || p.bypass_changed != status.bypass_changed);
         if changed || reason.is_some() {
-            let reason = reason.unwrap_or(if previous.is_none() { "首次读取 Windows 实际代理状态" }
+            let reason = reason.unwrap_or(if previous.is_none() { "首次读取系统实际代理状态" }
                 else if status.state == "unknown" { "读取失败，保留现有分流，未执行关闭" }
                 else { "检测到系统代理设置变化，来源未知（可能来自外部程序或系统设置）" });
             let event = ProxyChange {
@@ -473,6 +474,7 @@ mod windows {
 
 pub fn recover_stale_proxy() -> Result<(), String> {
     #[cfg(windows)] { windows::recover()?; }
+    #[cfg(target_os = "macos")] { crate::platform::macos::sysproxy::recover()?; }
     Ok(())
 }
 pub fn set_system_proxy_raw(enable: bool, port: Option<u16>) -> Result<bool, String> {
@@ -480,11 +482,13 @@ pub fn set_system_proxy_raw(enable: bool, port: Option<u16>) -> Result<bool, Str
 }
 pub(crate) fn has_owned_proxy() -> bool {
     #[cfg(windows)] { windows::has_recovery() }
-    #[cfg(not(windows))] { false }
+    #[cfg(target_os = "macos")] { crate::platform::macos::sysproxy::has_recovery() }
+    #[cfg(not(any(windows, target_os = "macos")))] { false }
 }
 pub(crate) fn set_system_proxy_with_reason(enable: bool, port: Option<u16>, reason: &str) -> Result<bool, String> {
     #[cfg(windows)] let result = windows::set(enable, port);
-    #[cfg(not(windows))] let result = { let _ = port; Ok(enable) };
+    #[cfg(target_os = "macos")] let result = crate::platform::macos::sysproxy::set(enable, port);
+    #[cfg(not(any(windows, target_os = "macos")))] let result = { let _ = port; if enable { Err("当前系统不支持代理设置".into()) } else { Ok(false) } };
     if result.is_ok() { observe_change(Some(reason)); }
     else { observe_change(Some("系统代理操作失败，已重新读取实际状态")); }
     result
@@ -510,6 +514,7 @@ pub fn get_system_proxy_status() -> Result<bool, String> {
 
 pub fn reset_system_proxy_emergency() -> Result<(), String> {
     #[cfg(windows)] { windows::reset_emergency()?; }
+    #[cfg(target_os = "macos")] { crate::platform::macos::sysproxy::set(false, None)?; }
     observe_change(Some("紧急恢复：释放本程序接管的系统代理"));
     Ok(())
 }
