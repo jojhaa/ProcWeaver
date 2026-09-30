@@ -2,7 +2,7 @@
 
 当前版本：**V2.0.5** · [Windows x64 便携版](https://github.com/jojhaa/ProcWeaver/releases/tag/v2.0.5)
 
-面向 Windows 平台的高性能进程与业务级智能分流客户端。  
+面向 **Windows / Android / macOS** 跨平台的高性能进程、应用与业务级智能分流客户端。  
 基于 **Tauri 2 · Rust · React · TypeScript · Mihomo** 深度构建。
 
 ---
@@ -65,6 +65,10 @@ ProcWeaver 是一款专注于多业务场景网络精细化调度的桌面客户
 - **系统级原生能力**：采用 Rust 与 Tauri 2 技术栈重构桌面架构，启动迅速，内存占用极小，保障多任务开发环境下的系统流畅度。
 - **成熟稳定内核**：依托经过工业级验证的高性能 Mihomo 代理核心，保障网络协议兼容性与高并发稳定性。
 
+### 📱 跨平台融合设计
+- **移动端深耕（Android）**：针对移动端打造单列响应式视图与应用分流面板；依托 Kotlin `VpnService` 与 JNI 嵌入核心，支持按 App 粒度精准指派出口，优化前后台生命周期以降低电量消耗。
+- **桌面双系统拓展（macOS）**：完成面向 Apple Silicon (ARM64) 与 Intel (x86_64) 的跨平台编译抽象，内置基于 Darwin 环境的应用代理启动管理、系统代理自动恢复与保护进程交接。
+
 ---
 
 ## 预设业务规则包
@@ -91,10 +95,15 @@ ProcWeaver 是一款专注于多业务场景网络精细化调度的桌面客户
 
 ---
 
-## 软件获取与兼容性
+## 多平台支持矩阵与兼容性
 
-- **支持操作系统**：Windows 10（64位，版本 1809 及以上） / Windows 11
-- **软件发布页面**：Windows x64 便携版压缩包（Portable.zip）及分发附件请访问：
+| 平台 | 当前状态 | 核心架构与分流支持 | 发布物与验证情况 |
+| :--- | :--- | :--- | :--- |
+| **Windows** | **正式支持** | 支持 Windows 10 (1809+) / 11 x64；支持深度进程树追踪、同程序多实例分流隔离、WinDivert 驱动接管（实验）、TUN 虚拟网卡及专属 DNS 护航。 | 官方持续提供 [GitHub Releases 便携版 (Portable.zip)](https://github.com/jojhaa/ProcWeaver/releases)；全功能真机完整验证。 |
+| **Android** | **大部分功能完成** | 基于 Android `VpnService` 虚拟接口接管；集成内嵌式 Mihomo 核心与 gVisor 用户态协议栈；支持按 App 包名与 UID 粒度绑定独立出口，提供移动端自适应单列视图与低耗电调度。 | 核心逻辑与真机测试（Android 12+）均已跑通，大部分功能已完成；通用 Release APK 处于打包筹备中。 |
+| **macOS** | **部分代码完成**（暂无测试机） | 支持 Apple Silicon (ARM64) 与 Intel (x86_64)；已实现应用层代理启动参数注入、系统网络代理（HTTP/HTTPS/SOCKS）自动读写与恢复、崩溃守护进程交接等前后端逻辑。 | 因目前**暂无物理测试机器与 Apple 开发者证书**，仅完成跨平台编译与静态类型检查，尚未进行实机联调；TUN 驱动接管等深度功能待后续实机推进。 |
+
+- 📥 **官方发布页面**：Windows 便携版压缩包（Portable.zip）及更新附件请访问：  
   👉 **[ProcWeaver 官方发布页面 (Releases)](https://github.com/jojhaa/ProcWeaver/releases)**
 
 ---
