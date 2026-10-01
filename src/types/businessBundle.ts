@@ -59,6 +59,9 @@ export interface BundleLocalInstance {
   enabled: boolean; // 停用状态下彻底不干涉网络 (跟随系统默认)
   slotBindings: Record<string, string | null>; // 插槽绑定 (如 { main: "🌸 日本 04", dns: "FOLLOW_MAIN" })
   slotTargets?: Partial<Record<BundleSlotId, RoutingTarget>>; // 仅本机保存，不进入导出白名单
+  backend?: "core" | "external"; // 旧实例缺省使用核心；认证仅保存在原生后台
+  externalEndpointId?: string | null; // null / 缺省跟随独立代理默认出口
+  externalFallback?: "direct" | "default";
   watcherMode: BundleWatcherMode;
   isModified: boolean;
   createdAt: number;

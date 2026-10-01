@@ -95,6 +95,10 @@ export const PRESET_BUNDLES_CATALOG: BusinessBundleDefinition[] = [
 
 // 获取全部已装载的本地规则包实例 (开箱严格仅装载官方 2 个预设：OpenAI 与 Google 反重力)
 export function getBundleInstances(): BundleLocalInstance[] {
+  const independent = typeof document !== "undefined" && document.documentElement.dataset.edition === "process";
+  const prepare = (instances: BundleLocalInstance[]): BundleLocalInstance[] => independent
+    ? instances.map(i => i.backend === "external" ? i : { ...i, backend: "external", enabled: false, slotBindings: { main: null, dns: "FOLLOW_MAIN" }, slotTargets: undefined, externalEndpointId: null })
+    : instances;
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
@@ -106,10 +110,13 @@ export function getBundleInstances(): BundleLocalInstance[] {
             !["inst-cursor", "inst-browser"].includes(item.instanceId)
         );
         if (cleaned.length !== parsed.length) {
-          saveBundleInstances(cleaned);
-          return cleaned;
+          const ready = prepare(cleaned);
+          saveBundleInstances(ready);
+          return ready;
         }
-        return parsed;
+        const ready = prepare(parsed);
+        if (independent && ready.some((item, index) => item !== parsed[index])) saveBundleInstances(ready);
+        return ready;
       }
     }
   } catch (err) {
@@ -140,8 +147,9 @@ export function getBundleInstances(): BundleLocalInstance[] {
     },
   ];
 
-  saveBundleInstances(initialInstances);
-  return initialInstances;
+  const ready = prepare(initialInstances);
+  saveBundleInstances(ready);
+  return ready;
 }
 
 // 保存本地实例到持久化存储

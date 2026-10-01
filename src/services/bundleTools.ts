@@ -32,7 +32,7 @@ async function beforeLaunch(id: string, hotSwap = false) {
   const item = current.instances.find(i => i.instanceId === id);
   if (!item) throw new Error("业务包已移除，请重新装载后再操作");
   const status = getBundleStatus(item, current);
-  if (hotSwap && (!item.enabled || !item.slotBindings.main || item.watcherMode !== "hot_swap" || status.phase !== "applied" || !entryIsCurrent(state.entries[id]))) {
+  if (hotSwap && (!item.enabled || !(item.backend === "external" || item.slotBindings.main) || item.watcherMode !== "hot_swap" || status.phase !== "applied" || !entryIsCurrent(state.entries[id]))) {
     throw new Error("业务包或热替换状态已改变，未重启应用；请检查核心与本包设置后重试");
   }
   if (item.enabled && !["applied", "saved", "paused"].includes(status.phase)) throw new Error(status.message);
@@ -86,7 +86,7 @@ const pendingIds = new Set<string>();
 function hotSwapEligible(id: string) {
   const current = bundleController.getSnapshot();
   const item = current.instances.find(i => i.instanceId === id);
-  return Boolean(item?.enabled && item.slotBindings.main && item.watcherMode === "hot_swap"
+  return Boolean(item?.enabled && (item.backend === "external" || item.slotBindings.main) && item.watcherMode === "hot_swap"
     && getBundleStatus(item, current).phase === "applied" && entryIsCurrent(state.entries[id]));
 }
 async function prepareHotSwap(refreshedIds: ReadonlySet<string>) {
@@ -94,7 +94,7 @@ async function prepareHotSwap(refreshedIds: ReadonlySet<string>) {
   const current = bundleController.getSnapshot();
   for (const [id, record] of hotSwapPrompts) {
     const item = current.instances.find(i => i.instanceId === id);
-    if (!item?.enabled || !item.slotBindings.main || item.watcherMode !== "hot_swap") hotSwapPrompts.delete(id);
+    if (!item?.enabled || !(item.backend === "external" || item.slotBindings.main) || item.watcherMode !== "hot_swap") hotSwapPrompts.delete(id);
     else if (["idle", "connected"].includes(state.entries[id]?.state)) record.key = "";
   }
   if (state.open || state.busy) return;
@@ -143,7 +143,8 @@ async function prepareHotSwap(refreshedIds: ReadonlySet<string>) {
 }
 function activeEntryIds(): Set<string> {
   const current = bundleController.getSnapshot();
-  return new Set(current.view?.config.bundlesEnabled === false ? [] : current.instances.filter(i => i.enabled && i.slotBindings.main && i.watcherMode !== "disabled").map(i => i.instanceId));
+  return new Set(current.instances.filter(i => i.enabled && i.watcherMode !== "disabled" && (i.backend === "external"
+    ? current.external?.enabled : current.view?.config.bundlesEnabled !== false && i.slotBindings.main)).map(i => i.instanceId));
 }
 function mergeEntries(ids: ReadonlySet<string>, results: BundleEntryState[]) {
   const active = activeEntryIds();

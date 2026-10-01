@@ -147,7 +147,8 @@ pub fn core_names_for(os: &str, arch: &str, mode: &str, avx2: bool) -> Result<Ve
             "v3" if !avx2 => return Err("当前 CPU 不支持 AVX2，请选择兼容核心".into()),
             "v3" => vec!["mihomo-v3.exe"],
             "compatible" => vec!["mihomo-compatible.exe"],
-            "standard" => vec!["mihomo.exe"],
+            // 旧 standard 配置复用兼容核心；旧文件名仅用于已有安装的回退。
+            "standard" => vec!["mihomo-compatible.exe", "mihomo.exe"],
             "auto" if avx2 => vec!["mihomo-v3.exe", "mihomo-compatible.exe", "mihomo.exe"],
             "auto" => vec!["mihomo-compatible.exe", "mihomo.exe"],
             _ => return Err("未知核心类型".into()),
@@ -217,6 +218,45 @@ mod tests {
         assert_eq!(core_names_for("windows", "x86_64", "auto", false).unwrap()[0], "mihomo-compatible.exe");
         assert!(capabilities_for("windows", "x86_64").tun);
         assert!(capabilities_for("windows", "x86_64").smart_hybrid);
+    }
+    #[test]
+    fn windows_legacy_standard_prefers_compatible_and_keeps_old_install_fallback() {
+        for avx2 in [false, true] {
+            assert_eq!(core_names_for("windows", "x86_64", "standard", avx2).unwrap(),
+                vec!["mihomo-compatible.exe", "mihomo.exe"]);
+        }
+        assert_eq!(core_names_for("windows", "x86_64", "auto", false).unwrap(),
+            vec!["mihomo-compatible.exe", "mihomo.exe"]);
+        assert_eq!(core_names_for("windows", "x86_64", "auto", true).unwrap(),
+            vec!["mihomo-v3.exe", "mihomo-compatible.exe", "mihomo.exe"]);
+        assert!(core_names_for("windows", "x86_64", "v3", false).is_err());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_standard_resolves_two_core_package_and_legacy_install() {
+        let root = std::env::temp_dir().join(format!("procweaver-two-core-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let binaries = root.join("binaries");
+        let data = root.join("data");
+        std::fs::create_dir_all(&binaries).unwrap();
+        let compatible = binaries.join("mihomo-compatible.exe");
+        let legacy = binaries.join("mihomo.exe");
+        std::fs::write(&compatible, b"compatible fixture").unwrap();
+        std::fs::write(binaries.join("mihomo-v3.exe"), b"v3 fixture").unwrap();
+        assert!(!legacy.exists());
+        for mode in ["standard", "compatible"] {
+            let (path, label) = resolve_core(&root, &data, mode).unwrap();
+            assert_eq!(path, compatible);
+            assert!(label.contains("compatible"));
+        }
+        // 旧目录即使残留 mihomo.exe，也优先使用新版兼容核心。
+        std::fs::write(&legacy, b"legacy fixture").unwrap();
+        assert_eq!(resolve_core(&root, &data, "standard").unwrap().0, compatible);
+        std::fs::remove_file(&compatible).unwrap();
+        assert_eq!(resolve_core(&root, &data, "standard").unwrap().0, legacy);
+        std::fs::remove_file(&legacy).unwrap();
+        assert!(resolve_core(&root, &data, "standard").is_err());
+        std::fs::remove_dir_all(&root).unwrap();
     }
     #[test]
     fn macos_tun_and_windows_only_hybrid_are_rejected_before_settings_change() {

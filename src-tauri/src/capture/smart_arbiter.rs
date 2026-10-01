@@ -84,6 +84,7 @@ pub async fn run_arbiter() {
     if !crate::platform::supports_smart_hybrid() { return; }
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        if !crate::function_mode::core_features_enabled() { TUN_ESCALATED.store(false, Ordering::SeqCst); continue; }
 
         let settings = match crate::commands::settings::get_general_settings() {
             Ok(s) => s,

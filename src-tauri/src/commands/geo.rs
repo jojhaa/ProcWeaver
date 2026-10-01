@@ -224,6 +224,7 @@ fn due(config: &GeoConfig, now: u64) -> bool {
         .map_or(true, |last| now >= last.saturating_add(u64::from(config.update_interval_hours) * 3600))
 }
 fn check_revision(revision: Option<u64>) -> Result<(), String> {
+    if revision.is_some() && !crate::function_mode::core_features_enabled() { return Err("进程代理功能已开启，取消自动 Geo 更新".into()); }
     if revision.is_some_and(|r| r != REVISION.load(Ordering::SeqCst)) { return Err("Geo 设置已变化，取消本轮自动更新".into()); }
     Ok(())
 }
@@ -232,7 +233,7 @@ async fn wait_for_change(revision: u64) {
         let notified = CHANGED.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if revision != REVISION.load(Ordering::SeqCst) { return; }
+        if revision != REVISION.load(Ordering::SeqCst) || !crate::function_mode::core_features_enabled() { return; }
         notified.await;
     }
 }
@@ -451,6 +452,7 @@ pub async fn sync_all_geo_resources() -> Result<GeoConfig, String> {
 
 pub(crate) async fn run_scheduler() {
     loop {
+        if !crate::function_mode::core_features_enabled() { tokio::time::sleep(std::time::Duration::from_secs(60)).await; continue; }
         // 启动时检查遗漏周期；读取持久化时间，避免重启后立即重复下载。
         if let Ok(_update) = UPDATE.try_lock() {
             if read_config().is_ok_and(|c| due(&c, now_seconds())) {
@@ -461,6 +463,7 @@ pub(crate) async fn run_scheduler() {
         tokio::select! { _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}, _ = CHANGED.notified() => {} }
     }
 }
+pub(crate) fn function_mode_changed() { REVISION.fetch_add(1, Ordering::SeqCst); CHANGED.notify_waiters(); }
 
 pub(crate) async fn run_due_update() -> Result<(), String> {
     let Ok(_update) = UPDATE.try_lock() else { return Ok(()); };

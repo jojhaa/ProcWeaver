@@ -42,6 +42,8 @@ import {
   ScrollText,
   Wrench,
   Menu,
+  CheckCircle2,
+  Check,
 } from "lucide-react";
 
 // 页面级 ErrorBoundary，防止任何单个组件渲染错误导致应用崩溃白屏
@@ -91,10 +93,35 @@ class ErrorBoundary extends React.Component<
 
 import { TrayContextMenuView } from "./views/TrayContextMenuView";
 import { usePlatform } from "./context/PlatformContext";
+import { useFunctionMode } from "./hooks/useFunctionMode";
+import { FunctionModeSelector, FunctionModeConfirmation } from "./components/function-mode/FunctionModeControls";
+import { ProcessProxyView } from "./views/ProcessProxyView";
 
 function DesktopTrayRuntime(props: Parameters<typeof useTrayManager>[0]) { useTrayManager(props); return null; }
 
 export function App() {
+  const platform = usePlatform();
+  const tray = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("window") === "tray-menu";
+  if (platform.os !== "windows" || tray || !isTauri()) return <FullApp />;
+  return <ErrorBoundary><FunctionModeApp /></ErrorBoundary>;
+}
+
+function FunctionModeApp() {
+  const { state, actions } = useFunctionMode();
+  if (!state.view) return <div className="h-screen bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-100 flex flex-col">
+    <div className="flex justify-end p-2"><WindowControls /></div>
+    <div className="m-auto p-6 text-center space-y-4"><p role={state.error ? "alert" : "status"}>{state.error || "正在读取功能模式…"}</p>
+      {!state.loading && <button className="rounded-lg bg-indigo-600 text-white px-4 py-2" onClick={() => void actions.load()}>重新读取</button>}
+    </div>
+  </div>;
+  const control = <FunctionModeSelector mode={state.view.mode} disabled={state.pending} onChange={actions.request} />;
+  return <>
+    {state.view.mode === "full" ? <FullApp functionModeControl={control} /> : <ProcessProxyView maintenance={<MaintenanceView />} modeControl={control} capability={state.view} onFull={() => actions.request("full")} />}
+    <FunctionModeConfirmation state={state} onCancel={actions.cancel} onConfirm={() => void actions.confirm()} />
+  </>;
+}
+
+function FullApp({ functionModeControl }: { functionModeControl?: React.ReactNode }) {
   const platform = usePlatform();
   const mobile = platform.os === "android";
   const [navigationOpen, setNavigationOpen] = useState(false);
@@ -548,7 +575,7 @@ export function App() {
           data-tauri-drag-region
           onMouseDown={mobile ? undefined : handleWindowDrag}
           onDoubleClick={mobile ? undefined : () => windowToggleMaximize()}
-          className="h-14 border-b border-slate-200 dark:border-slate-800/80 pl-8 pr-3 flex items-center justify-between bg-white/70 dark:bg-slate-900/40 backdrop-blur-md shrink-0 transition-colors duration-200 select-none cursor-default"
+          className="h-14 border-b border-slate-200 dark:border-slate-800/80 pl-8 pr-3 flex items-center justify-between bg-white/70 dark:bg-slate-900/40 backdrop-blur-md shrink-0 transition-colors duration-200 select-none cursor-default relative z-50"
         >
           <div className="flex items-center space-x-2 min-w-0">
             {mobile && (
@@ -591,6 +618,9 @@ export function App() {
               </div>
             )}
 
+            {/* 顶栏功能模式切换 */}
+            {!mobile && functionModeControl}
+
             {/* 顶栏快速主题切换 */}
             <ThemeToggle compact={false} />
 
@@ -605,7 +635,7 @@ export function App() {
         </header>
 
         {/* 内容主体：对高级视窗采用吸顶 Tab 架构，对常规单页保留居中流动排版 */}
-        <div className="flex-1 overflow-hidden relative">
+        <div className="flex-1 overflow-hidden relative z-0">
           <div key={activeTab} className={tabAnimation ? "h-full animate-in fade-in duration-150" : "h-full"}>
             <ErrorBoundary>
               {activeTab === "proxies" && <ChannelDispatcherView />}
@@ -685,6 +715,34 @@ export function App() {
                       </button>
                     </div>
                   )}
+
+                  {/* 核心待机状态就绪面板 */}
+                  {!coreStatus.running && (profileCount === null || profileCount > 0 || (localNodeSummaries && localNodeSummaries.length > 0)) && (
+                    <div className="p-4 rounded-2xl bg-gradient-to-r from-emerald-500/10 via-slate-50 to-indigo-50/20 dark:from-emerald-950/20 dark:via-slate-900/40 dark:to-indigo-950/20 border border-emerald-500/20 dark:border-emerald-500/20 flex flex-wrap items-center justify-between gap-3 text-xs shadow-2xs">
+                      <div className="flex items-center space-x-3">
+                        <div className="w-8 h-8 rounded-xl bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 flex items-center justify-center shrink-0">
+                          <CheckCircle2 className="w-4 h-4" />
+                        </div>
+                        <div>
+                          <h4 className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-2">
+                            <span>系统已就绪 · 待命中</span>
+                            <span className="text-[10px] px-2 py-0.2 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-mono font-semibold">
+                              准备就绪
+                            </span>
+                          </h4>
+                          <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                            已就绪 {profileCount || 0} 个订阅源 · 离线分流规则库与环境隔离已配置完毕。随时可启动代理核心。
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-3 text-[11px] text-slate-500 dark:text-slate-400">
+                        <span className="flex items-center gap-1.5"><Check className="w-3.5 h-3.5 text-emerald-500" />节点就绪</span>
+                        <span className="flex items-center gap-1.5"><Check className="w-3.5 h-3.5 text-emerald-500" />规则库就绪</span>
+                        <span className="flex items-center gap-1.5"><Check className="w-3.5 h-3.5 text-emerald-500" />便携隔离就绪</span>
+                      </div>
+                    </div>
+                  )}
+
                   <CoreControlBar
                     extraAction={
                       <ExclusionsDialog

@@ -184,5 +184,8 @@ temp/
 Thumbs.db
 Desktop.ini
 # Android signing material is supplied outside source control.
+/dist-process/
+/process-data/
+/process-portable
 *.jks
 *.keystore

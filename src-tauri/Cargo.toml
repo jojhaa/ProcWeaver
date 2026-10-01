@@ -1,10 +1,15 @@
 [package]
 name = "proc-weaver"
-version = "2.0.5"
+version = "2.0.6"
 license = "AGPL-3.0-only"
 description = "Modern Proxy Client powered by Mihomo and Tauri"
 authors = ["ProcWeaver Team"]
 edition = "2021"
+default-run = "ProcWeaver"
+
+[features]
+default = []
+process-edition = []
 
 [lib]
 name = "proc_weaver_lib"
@@ -13,6 +18,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [[bin]]
 name = "ProcWeaver"
 path = "src/main.rs"
+
+[[bin]]
+name = "ProcWeaverProcess"
+path = "src/process_main.rs"
+required-features = ["process-edition"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -24,6 +34,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "=0.9.34"
 tokio = { version = "1", features = ["full"] }
+hyper = { version = "=1.11.1", features = ["server", "client", "http1"] }
+hyper-util = { version = "=0.1.20", features = ["tokio"] }
+http-body-util = "=0.1.5"
+base64 = "=0.22.1"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
@@ -39,5 +53,5 @@ libc = "=0.2.189"
 [target.'cfg(windows)'.dependencies]
 flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
 winreg = "0.52"
-windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Controls_Dialogs", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Controls_Dialogs", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_Security_Cryptography", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 windows = { version = "=0.61.3", features = ["Win32_System_Wmi", "Win32_System_Com", "Win32_System_Variant", "Win32_Security", "Win32_UI_Shell", "Win32_Storage_FileSystem", "Win32_Storage_Packaging_Appx"] }

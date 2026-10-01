@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 static WATCHER_ACTIVE: AtomicBool = AtomicBool::new(false);
+static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
+static WATCHER_TRANSITION: Mutex<()> = Mutex::new(());
 static CURRENT_MODE: Mutex<WatcherMode> = Mutex::new(WatcherMode::AutoRelaunch);
 static HANDLED_PIDS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static COMMANDS: std::sync::LazyLock<Mutex<HashMap<String, String>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -188,7 +190,8 @@ fn run_hidden(program: &str, args: &[&str]) -> Result<String, String> {
 }
 
 /// 扫描系统中是否有裸跑（无代理参数）启动的应用进程
-fn scan_and_handle_bare_processes() {
+fn scan_and_handle_bare_processes(generation: u64) {
+    if !watcher_current(generation) { return; }
     #[cfg(windows)]
     {
         let mode = match CURRENT_MODE.lock() {
@@ -231,6 +234,7 @@ fn scan_and_handle_bare_processes() {
             .map(|b| std::path::Path::new(&b.main_exe).file_name().unwrap_or_default().to_string_lossy().to_lowercase()).collect()).unwrap_or_default();
 
         for item in items {
+            if !watcher_current(generation) { return; }
             let pid = item.pid;
             let proc_name = item.name.as_str();
             if bundle_names.iter().any(|name| name.eq_ignore_ascii_case(proc_name)) { continue; }
@@ -342,6 +346,7 @@ fn scan_and_handle_bare_processes() {
                 // 模式 A（自动热替换接管）
                 // 1. 结束裸跑主进程
                 if crate::routing_overrides::native::inspect(pid, 0, String::new()).identity != item.identity { continue; }
+                if !watcher_current(generation) { return; }
                 if run_hidden("taskkill", &["/F", "/PID", &pid.to_string()]).is_err() { continue; }
 
                 // 2. 稍作延时等待文件句柄释放
@@ -387,32 +392,44 @@ fn scan_and_handle_bare_processes() {
 }
 
 /// 启动后台守护任务循环
+fn watcher_current(generation: u64) -> bool {
+    WATCHER_ACTIVE.load(Ordering::SeqCst)
+        && WATCHER_GENERATION.load(Ordering::SeqCst) == generation
+        && crate::function_mode::core_features_enabled()
+}
+
 pub fn start_watcher_loop() {
+    let _transition = WATCHER_TRANSITION.lock().unwrap_or_else(|p| p.into_inner());
     if !cfg!(windows) { return; }
+    if !crate::function_mode::core_features_enabled() { return; }
     if WATCHER_ACTIVE.swap(true, Ordering::SeqCst) {
         return; // 已经运行中
     }
+    let generation = WATCHER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
 
     tauri::async_runtime::spawn(async move {
-        while WATCHER_ACTIVE.load(Ordering::SeqCst) {
+        while watcher_current(generation) {
             tokio::time::sleep(Duration::from_millis(2000)).await;
-            if !WATCHER_ACTIVE.load(Ordering::SeqCst) {
+            if !watcher_current(generation) {
                 break;
             }
 
             // 在阻塞线程执行轻量批量扫描
-            tokio::task::spawn_blocking(scan_and_handle_bare_processes).await.ok();
+            tokio::task::spawn_blocking(move || scan_and_handle_bare_processes(generation)).await.ok();
         }
     });
 }
 
 pub fn stop_watcher_loop() {
+    let _transition = WATCHER_TRANSITION.lock().unwrap_or_else(|p| p.into_inner());
     WATCHER_ACTIVE.store(false, Ordering::SeqCst);
+    WATCHER_GENERATION.fetch_add(1, Ordering::SeqCst);
 }
 
 /// 初始化开机/启动自愈状态
 pub fn init_watcher_on_startup() {
     if !cfg!(windows) { return; }
+    if !crate::function_mode::core_features_enabled() { return; }
     let cfg = load_watcher_config();
     if let Ok(mut g) = CURRENT_MODE.lock() {
         *g = cfg.mode;
@@ -431,6 +448,7 @@ pub fn get_watcher_mode() -> Result<WatcherMode, String> {
 
 #[tauri::command]
 pub fn set_watcher_mode(mode: WatcherMode) -> Result<WatcherMode, String> {
+    crate::function_mode::require_full()?;
     if !cfg!(windows) && mode != WatcherMode::Disabled { return Err("macOS 请从业务包启动应用，暂不支持自动重启接管".into()); }
     if let Ok(mut g) = CURRENT_MODE.lock() {
         *g = mode;

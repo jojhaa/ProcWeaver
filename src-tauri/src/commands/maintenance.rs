@@ -170,7 +170,7 @@ pub async fn check_app_update(
         for asset in assets {
             let name = asset.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let lower = name.to_lowercase();
-            if cfg!(windows) && lower.ends_with(".zip") && !lower.contains("macos") && !lower.contains("darwin") && (lower.contains("portable") || lower.contains("procweaver")) {
+            if cfg!(windows) && !lower.starts_with("procweaverprocess") && lower.ends_with(".zip") && !lower.contains("macos") && !lower.contains("darwin") && (lower.contains("portable") || lower.contains("procweaver")) {
                 asset_name = Some(name.to_string());
                 download_url = asset.get("browser_download_url").and_then(|v| v.as_str()).map(|s| s.to_string());
                 asset_size_bytes = asset.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -188,7 +188,7 @@ pub async fn check_app_update(
                 } else if cfg!(target_os = "android") {
                     lower.ends_with(".apk") && !lower.contains("debug") && !lower.contains("unsigned") && (lower.contains("arm64") || lower.contains("aarch64") || lower.contains("universal"))
                 } else { lower.ends_with(".exe") || lower.ends_with(".msi") || lower.ends_with(".zip") && !lower.contains("macos") && !lower.contains("darwin") };
-                if supported {
+                if supported && !lower.starts_with("procweaverprocess") {
                     asset_name = Some(name.to_string());
                     download_url = asset.get("browser_download_url").and_then(|v| v.as_str()).map(|s| s.to_string());
                     asset_size_bytes = asset.get("size").and_then(|v| v.as_u64()).unwrap_or(0);

@@ -2,6 +2,16 @@ pub mod commands;
 pub mod storage;
 pub mod platform;
 pub mod local_nodes;
+pub mod external_proxy;
+pub mod function_mode;
+pub mod process_capture;
+pub mod edition;
+#[cfg(feature = "process-edition")]
+pub mod process_app;
+#[cfg(feature = "process-edition")]
+mod process_update;
+#[cfg(feature = "process-edition")]
+mod process_conflict;
 mod bundle_repository;
 #[cfg(not(target_os = "android"))]
 mod app_lifecycle;
@@ -14,11 +24,15 @@ mod shutdown;
 pub mod routing_overrides;
 pub mod capture;
 
+#[cfg(not(feature = "process-edition"))]
 use std::sync::Mutex;
+#[cfg(not(feature = "process-edition"))]
 use commands::process::{CoreState, CoreStateMutex};
+#[cfg(not(feature = "process-edition"))]
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+#[cfg(not(feature = "process-edition"))]
 pub fn run() {
     let context = tauri::generate_context!();
     #[cfg(windows)]
@@ -51,6 +65,8 @@ pub fn run() {
         .plugin(tauri::plugin::Builder::<_, ()>::new("storage-init")
             .setup(|app, _| {
                 storage::initialize(app)?;
+                function_mode::initialize();
+                process_capture::initialize();
                 commands::local_rules::initialize()?;
                 Ok(())
             })
@@ -78,6 +94,7 @@ pub fn run() {
                 let _ = dns_app.emit("procweaver-dns-guard-changed", ());
             });
             commands::process_watcher::init_watcher_on_startup();
+            tauri::async_runtime::spawn(external_proxy::restore());
             tauri::async_runtime::spawn(commands::geo::run_scheduler());
             tauri::async_runtime::spawn(commands::profile::run_profile_scheduler());
             let monitor_app = app.handle().clone();
@@ -90,7 +107,7 @@ pub fn run() {
             app_lifecycle::setup(app)?;
             let preferences = commands::settings::get_general_settings();
             if !proxy_recovery_ready || preferences.as_ref().map_or(true, |s| !s.silent_start) { app_lifecycle::show(app.handle()); }
-            if proxy_recovery_ready && preferences.as_ref().is_ok_and(|s| s.auto_run) {
+            if function_mode::core_features_enabled() && proxy_recovery_ready && preferences.as_ref().is_ok_and(|s| s.auto_run) {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     if let Err(error) = commands::process::start_core(None, handle.state()).await {
@@ -103,6 +120,7 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    if !function_mode::core_features_enabled() { continue; }
                     if let Err(e) = commands::process::monitor_core(handle.state()).await {
                         eprintln!("内核监控失败：{e}");
                     }
@@ -122,6 +140,16 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            function_mode::get_function_mode,
+            process_capture::get_process_capture,
+            process_capture::set_process_capture,
+            function_mode::set_function_mode,
+            function_mode::get_process_preferences,
+            function_mode::save_process_preferences,
+            external_proxy::get_external_proxy,
+            external_proxy::save_external_proxy_settings,
+            external_proxy::apply_external_bundles,
+            external_proxy::test_external_proxy,
             local_nodes::get_local_nodes,
             local_nodes::get_local_node,
             local_nodes::save_local_nodes,

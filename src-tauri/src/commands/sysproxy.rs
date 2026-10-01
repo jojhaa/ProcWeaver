@@ -496,6 +496,7 @@ pub(crate) fn set_system_proxy_with_reason(enable: bool, port: Option<u16>, reas
 
 /// 生命周期事务内部使用，不重复获取 LIFECYCLE。
 pub(crate) async fn set_system_proxy_locked(enable: bool, port: Option<u16>) -> Result<bool, String> {
+    if enable { crate::function_mode::require_full()?; }
     if enable && !super::process::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) { return Err("核心尚未运行，不能启用系统代理".into()); }
     crate::routing_overrides::change_system_proxy(enable, || set_system_proxy_with_reason(enable, port, if enable { "用户启用系统代理" } else { "用户关闭系统代理，恢复接管前设置" })).await
 }

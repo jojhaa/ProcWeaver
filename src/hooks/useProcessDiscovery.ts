@@ -6,6 +6,9 @@ import { createDomainCollector, observationScope, type DomainCandidate } from ".
 import type { BundleProcessBinding, BundleProcessMember } from "../types/businessBundle";
 import type { BundlePlatform } from "../types/platform";
 import type { ProcessEntry } from "../types/routingOverrides";
+import { externalProxyApi } from "../api/externalProxy";
+import { functionModeApi } from "../api/functionMode";
+import { externalDiscoveryConnections } from "../services/processDiscovery";
 
 export interface DiscoveryInput { members: BundleProcessMember[]; bindings: BundleProcessBinding[]; platform: BundlePlatform; bundleId?: string }
 export function useProcessDiscovery(input: DiscoveryInput) {
@@ -31,7 +34,12 @@ export function useProcessDiscovery(input: DiscoveryInput) {
   useEffect(() => {
     alive.current = true;
     void refresh();
-    const readMode = () => { void getGeneralSettings().then(s => { if (alive.current) setMode(s.trafficMode === "windivert_v1" ? "WinDivert" : s.tunMode || s.trafficMode === "tun" ? "TUN" : "纯应用层"); })
+    const readMode = () => {
+      if (document.documentElement.dataset.edition === "process") {
+        void functionModeApi.capture().then(s => { if (alive.current) setMode(s.mode === "windivert" ? "WinDivert · 独立代理" : "纯应用层 · 独立代理"); }).catch(() => { if (alive.current) setMode("独立代理"); });
+        return;
+      }
+      void getGeneralSettings().then(s => { if (alive.current) setMode(s.trafficMode === "windivert_v1" ? "WinDivert" : s.tunMode || s.trafficMode === "tun" ? "TUN" : "纯应用层"); })
       .catch(() => { if (alive.current) setMode("模式读取失败，按连接证据检测"); }); };
     readMode();
     window.addEventListener("netbox-settings-saved", readMode);
@@ -52,9 +60,24 @@ export function useProcessDiscovery(input: DiscoveryInput) {
       setDomains(collector.add(sample.connections, scope, sample.timestamp, includeBundle, sample.epoch));
       setLimited(collector.saturated);
     };
-    const removeConnections = monitorStore.subscribeConnections(consume);
-    const reportError = () => { if (!cancelled) setError(treeError || monitorStore.getTraffic().error); };
-    const removeStatus = monitorStore.subscribeTraffic(reportError);
+    const independent = document.documentElement.dataset.edition === "process";
+    const removeConnections = independent ? () => {} : monitorStore.subscribeConnections(consume);
+    const reportError = () => { if (!cancelled) setError(treeError || (independent ? "" : monitorStore.getTraffic().error)); };
+    const removeStatus = independent ? () => {} : monitorStore.subscribeTraffic(reportError);
+    let sampling = false;
+    const pollExternal = async () => {
+      if (sampling || cancelled) return; sampling = true;
+      try {
+        const view = await externalProxyApi.read();
+        if (!cancelled && valid) {
+          setDomains(collector.add(externalDiscoveryConnections(view.records, start), scope, Date.now(), includeBundle));
+          setLimited(collector.saturated);
+        }
+      } catch (e) { if (!cancelled) setError(`读取独立代理连接失败：${String(e)}`); }
+      finally { sampling = false; }
+    };
+    const externalTimer = independent ? window.setInterval(() => void pollExternal(), 2000) : undefined;
+    if (independent) void pollExternal();
     const timer = window.setInterval(() => {
       if (!refreshing) {
         refreshing = true;
@@ -67,7 +90,7 @@ export function useProcessDiscovery(input: DiscoveryInput) {
           .finally(() => { refreshing = false; });
       }
     }, 5000);
-    return () => { cancelled = true; clearInterval(timer); removeConnections(); removeStatus(); };
+    return () => { cancelled = true; clearInterval(timer); clearInterval(externalTimer); removeConnections(); removeStatus(); };
     // Inputs are a frozen dialog selection; explicit stop/start opens a new observation window.
   }, [running, includeBundle]);
   return { state: { entries, loading, error, mode, domains, running, limited, includeBundle }, actions: {

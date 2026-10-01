@@ -20,7 +20,7 @@ pub struct GeneralSettings {
     pub tcp_concurrent: bool,
     #[serde(default = "default_geo_low_memory")]
     pub geo_low_memory: bool,
-    #[serde(default)]
+    #[serde(default = "default_minimize_on_close")]
     pub minimize_on_close: bool,
     #[serde(default)]
     pub silent_start: bool,
@@ -55,6 +55,7 @@ pub struct GeneralSettings {
 }
 fn default_enable_controller_port() -> bool { true }
 fn default_true() -> bool { true }
+fn default_minimize_on_close() -> bool { crate::edition::PROCESS }
 fn default_tray_menu_style() -> String { if cfg!(target_os = "macos") { "classic".into() } else { "modern".into() } }
 fn default_find_process_mode() -> String { "auto".into() }
 fn default_auto_close_connections() -> bool { true }
@@ -78,7 +79,7 @@ impl Default for GeneralSettings {
             unified_delay: true,
             tcp_concurrent: false,
             geo_low_memory: true,
-            minimize_on_close: false,
+            minimize_on_close: default_minimize_on_close(),
             silent_start: false,
             auto_run: true,
             only_proxy_traffic: true,
@@ -118,6 +119,7 @@ pub async fn save_general_settings(settings: GeneralSettings, state: tauri::Stat
 
 async fn save_and_restart(settings: GeneralSettings, state: &super::process::CoreStateMutex) -> Result<GeneralSettings, String> {
     let _lifecycle = super::process::LIFECYCLE.lock().await;
+    crate::function_mode::require_full()?;
     let previous = get_general_settings()?;
     #[cfg(windows)]
     if settings.traffic_mode == crate::capture::windivert::plan::MODE && previous.traffic_mode != settings.traffic_mode {
@@ -157,7 +159,7 @@ async fn save_and_restart(settings: GeneralSettings, state: &super::process::Cor
     Ok(settings)
 }
 
-fn persist_general_settings(mut settings: GeneralSettings, state: &super::process::CoreStateMutex) -> Result<GeneralSettings, String> {
+pub(crate) fn persist_general_settings(mut settings: GeneralSettings, state: &super::process::CoreStateMutex) -> Result<GeneralSettings, String> {
     crate::platform::validate_traffic_mode(&settings.traffic_mode, settings.tun_mode)?;
     if cfg!(target_os = "android") {
         if !settings.enable_controller_port { return Err("Android 要求内部控制端口开启".into()); }
@@ -191,8 +193,9 @@ fn persist_general_settings(mut settings: GeneralSettings, state: &super::proces
     let autostart_rollback = if get_general_settings()?.auto_start != settings.auto_start {
         use winreg::{RegKey, enums::*};
         let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run").map_err(|e| e.to_string())?;
-        let previous = match key.get_raw_value("ProcWeaver") {
+        let previous = match key.get_raw_value(crate::edition::AUTOSTART) {
             Ok(value) => Some(value),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && crate::edition::PROCESS => None,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => match key.get_raw_value("NetBox") {
                 Ok(value) => Some(value),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -202,11 +205,11 @@ fn persist_general_settings(mut settings: GeneralSettings, state: &super::proces
         };
         if settings.auto_start {
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-            key.set_value("ProcWeaver", &format!("\"{}\"", exe.display())).map_err(|e| e.to_string())?;
-            let _ = key.delete_value("NetBox");
+            key.set_value(crate::edition::AUTOSTART, &format!("\"{}\"", exe.display())).map_err(|e| e.to_string())?;
+            if !crate::edition::PROCESS { let _ = key.delete_value("NetBox"); }
         } else {
-            let _ = key.delete_value("ProcWeaver");
-            let _ = key.delete_value("NetBox");
+            let _ = key.delete_value(crate::edition::AUTOSTART);
+            if !crate::edition::PROCESS { let _ = key.delete_value("NetBox"); }
         }
         Some((key, previous))
     } else { None };
@@ -219,8 +222,8 @@ fn persist_general_settings(mut settings: GeneralSettings, state: &super::proces
         if mac_autostart_previous != settings.auto_start { crate::platform::macos::apps::set_autostart(mac_autostart_previous).map_err(|_| format!("{error}；登录启动项恢复失败"))?; }
         #[cfg(windows)] if let Some((key, previous)) = autostart_rollback {
             let restored = match previous {
-                Some(value) => key.set_raw_value("ProcWeaver", &value),
-                None => match key.delete_value("ProcWeaver") {
+                Some(value) => key.set_raw_value(crate::edition::AUTOSTART, &value),
+                None => match key.delete_value(crate::edition::AUTOSTART) {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                     result => result,
                 },
@@ -676,7 +679,8 @@ mod tests {
     fn performance_settings_support_old_files_and_both_switch_states() {
         let old: GeneralSettings = serde_json::from_str(r#"{"mixedPort":7890,"controllerPort":9090,"allowLan":false,"tunMode":false,"autoStart":false}"#).unwrap();
         assert!(old.unified_delay && !old.tcp_concurrent && old.geo_low_memory);
-        assert!(!old.minimize_on_close && !old.silent_start && old.auto_run && old.only_proxy_traffic);
+        assert_eq!(old.minimize_on_close, crate::edition::PROCESS);
+        assert!(!old.silent_start && old.auto_run && old.only_proxy_traffic);
         for enabled in [false, true] {
             let settings = GeneralSettings { unified_delay: enabled, tcp_concurrent: enabled, geo_low_memory: enabled, ..old.clone() };
             let persisted = serde_json::to_vec(&settings).unwrap();
@@ -687,6 +691,15 @@ mod tests {
             assert_eq!(value["tcp-concurrent"].as_bool(), Some(enabled));
             assert_eq!(value["geodata-loader"].as_str(), Some(if enabled { "memconservative" } else { "standard" }));
             assert_eq!(value["geodata-mode"].as_bool(), Some(false));
+        }
+    }
+    #[test]
+    fn close_to_tray_defaults_follow_edition_and_preserve_saved_choices() {
+        assert_eq!(GeneralSettings::default().minimize_on_close, crate::edition::PROCESS);
+        for enabled in [false, true] {
+            let settings = GeneralSettings { minimize_on_close: enabled, ..GeneralSettings::default() };
+            let restored: GeneralSettings = serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+            assert_eq!(restored.minimize_on_close, enabled);
         }
     }
     #[test]

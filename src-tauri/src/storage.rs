@@ -4,6 +4,41 @@ use tauri::Manager;
 static DATA: OnceLock<PathBuf> = OnceLock::new();
 static RESOURCES: OnceLock<PathBuf> = OnceLock::new();
 
+#[cfg(feature = "process-edition")]
+pub(crate) fn initialize_process(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    let exe = std::env::current_exe()?;
+    let resources = exe.parent().ok_or("无法确定进程版目录")?.to_path_buf();
+    let data = process_data_root(&resources, app.path().app_local_data_dir()?);
+    // Never recover/import the full client's data or copy its Mihomo defaults.
+    fs::create_dir_all(data.join("config"))?;
+    fs::create_dir_all(data.join("logs"))?;
+    DATA.set(data).map_err(|_| "数据路径重复初始化")?;
+    RESOURCES.set(resources).map_err(|_| "资源路径重复初始化")?;
+    Ok(())
+}
+
+#[cfg(any(test, feature = "process-edition"))]
+fn process_data_root(exe_dir: &Path, installed: PathBuf) -> PathBuf {
+    if exe_dir.join("process-portable").is_file() || exe_dir.join("process-data").is_dir() {
+        exe_dir.join("process-data")
+    } else { installed }
+}
+
+#[cfg(test)]
+mod process_storage_tests {
+    #[test]
+    fn full_portable_marker_does_not_select_full_data() {
+        let dir = std::env::temp_dir().join(format!("pw-edition-storage-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::write(dir.join("portable"), "").unwrap();
+        let installed = dir.join("installed-process");
+        assert_eq!(super::process_data_root(&dir, installed.clone()), installed);
+        std::fs::write(dir.join("process-portable"), "").unwrap();
+        assert_eq!(super::process_data_root(&dir, installed), dir.join("process-data"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn reserve_test_mixed_port() -> std::net::TcpListener {
     use std::sync::atomic::{AtomicU32, Ordering};

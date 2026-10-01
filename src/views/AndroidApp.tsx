@@ -214,14 +214,41 @@ export function AndroidApp() {
         />
         {readError && <p role="alert" className="mobile-notice">{readError}</p>}
 
-        {/* 首屏核心：当前出口节点与出口 IP 状态 */}
+        {/* 首屏核心：当前出口节点与出口 IP 状态 / 待命就绪卡片 */}
         {status.running ? (
           <ActiveExitCard proxyPort={status.mixedPort} corePid={status.generation ?? status.pid} activeNodeName={exit} />
         ) : (
-          <section className="mobile-card">
-            <h2 className="mobile-section-title">准备连接</h2>
-            <p className="mobile-help">节点和订阅可以离线管理；连接 VPN 后可切换出口和运行模式。</p>
-            <button className="mobile-primary cursor-pointer" onClick={() => navigateTo("proxies")}>管理节点与订阅</button>
+          <section className="mobile-card space-y-3 border-indigo-100 dark:border-indigo-950/60 bg-gradient-to-b from-white to-slate-50/50 dark:from-slate-900 dark:to-slate-950/50">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="w-2.5 h-2.5 rounded-full bg-slate-400 dark:bg-slate-600 ring-2 ring-slate-200 dark:ring-slate-800" />
+                <h2 className="mobile-section-title mb-0">系统已就绪 · 待命中</h2>
+              </div>
+              <span className="text-[11px] px-2 py-0.5 rounded-md font-medium text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-200/60 dark:border-indigo-800/40">
+                离线就绪
+              </span>
+            </div>
+            <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
+              节点、规则与订阅配置均支持离线编辑；轻触上方“连接 VPN”即可接管网络流量。
+            </p>
+            <div className="pt-1 flex items-center gap-2.5">
+              <button
+                type="button"
+                className="flex-1 min-h-[42px] px-3 py-2 rounded-xl text-xs font-semibold bg-white dark:bg-slate-800/90 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 hover:border-indigo-400 dark:hover:border-indigo-600 transition shadow-xs cursor-pointer flex items-center justify-center gap-1.5 active:scale-[0.98]"
+                onClick={() => navigateTo("proxies")}
+              >
+                <Radio size={14} className="text-indigo-500" />
+                <span>节点池列表</span>
+              </button>
+              <button
+                type="button"
+                className="flex-1 min-h-[42px] px-3 py-2 rounded-xl text-xs font-semibold bg-white dark:bg-slate-800/90 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 hover:border-emerald-400 dark:hover:border-emerald-600 transition shadow-xs cursor-pointer flex items-center justify-center gap-1.5 active:scale-[0.98]"
+                onClick={() => navigateTo("profiles")}
+              >
+                <FileText size={14} className="text-emerald-500" />
+                <span>订阅管理</span>
+              </button>
+            </div>
           </section>
         )}
 
@@ -242,7 +269,7 @@ export function AndroidApp() {
             ))}
           </div>
           <p className="mobile-help">
-            {!status.running ? "连接 VPN 后可切换模式。节点和订阅可以离线管理。" : mode.mode === "rule" ? "按应用、域名和 IP 规则选择出口。" : "应用独立出口仅在规则模式下生效。"}
+            {!status.running ? "待机状态保留预设规则；连接 VPN 后生效并可实时无缝切换。" : mode.mode === "rule" ? "按应用、域名和 IP 规则选择出口。" : "应用独立出口仅在规则模式下生效。"}
           </p>
           {mode.error && <p role="alert" className="mobile-notice">{mode.error}</p>}
         </section>

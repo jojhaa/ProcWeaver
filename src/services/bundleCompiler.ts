@@ -121,7 +121,7 @@ export function ruleSignature(rules: (ProcessRule | DnsRule)[]): string {
     .map(([key, value]) => [key, key === "target" && value ? [value.profileId, value.kind, value.name] : value]))));
 }
 export function networkSignature(instance: BundleLocalInstance): string {
-  return JSON.stringify([instance.enabled, instance.slotBindings, instance.slotTargets,
+  return JSON.stringify([instance.enabled, instance.backend ?? "core", instance.externalEndpointId, instance.externalFallback, instance.slotBindings, instance.slotTargets,
     instance.definition.mode, instance.definition.fallback ?? "rules", instance.definition.processes.map(p => [p.exe, p.includeDescendants]), instance.definition.macosProcesses?.map(p => [p.exe, p.includeDescendants]), instance.definition.androidPackages, instance.definition.additionalExes, instance.definition.domains, instance.processBindings]);
 }
 export function compileBundleRoutes(instances: BundleLocalInstance[], previous: BundleRoute[] = [], platform: BundlePlatform = bundlePlatform()): BundleRoute[] {

@@ -40,7 +40,11 @@ export const TrafficOverview: React.FC<Props> = ({ reading, onlyProxy, error, na
             <span className={`w-1.5 h-1.5 rounded-full ${downSpeed > 0 || upSpeed > 0 ? "bg-emerald-500 animate-pulse" : "bg-slate-400 dark:bg-slate-500"}`} />
             <span>{onlyProxy ? (nativeTotals ? "仅代理 · 本次连接累计" : "仅代理 · 连接采样") : "全流量 · 含直连"}</span>
           </span>
-          {error && <span className="text-rose-500 dark:text-rose-400 font-mono">({error})</span>}
+          {error && (
+            <span className={error.includes("未启动") ? "text-slate-400 dark:text-slate-500 text-[10px] bg-slate-100 dark:bg-slate-800 px-2 py-0.5 rounded-full border border-slate-200 dark:border-slate-700/60" : "text-rose-500 dark:text-rose-400 font-mono"}>
+              {error.includes("未启动") ? "待机待命中" : error}
+            </span>
+          )}
         </div>
       </div>
 

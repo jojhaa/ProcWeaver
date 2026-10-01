@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useRef } from "react";
 import { BundleLocalInstance, BundleWatcherMode } from "../../types/businessBundle";
 import type { BundleStatus } from "../../utils/bundleController";
 import type { BundleEntryState } from "../../api/bundleTools";
@@ -23,6 +23,9 @@ interface Props {
   status?: BundleStatus;
   entry?: BundleEntryState;
   proxyLabels?: Record<string, string>;
+  externalLabel?: string;
+  drawer?: boolean;
+  unavailable?: boolean;
   onChangeWatcherMode: (instanceId: string, mode: BundleWatcherMode) => void;
   onShortcuts?: (instanceId: string) => void;
   onLaunch?: (instanceId: string) => void;
@@ -37,6 +40,9 @@ export const BundleDetailModal: React.FC<Props> = ({
   status,
   entry,
   proxyLabels = {},
+  externalLabel,
+  drawer = false,
+  unavailable = false,
   onChangeWatcherMode,
   onShortcuts,
   onLaunch,
@@ -44,11 +50,32 @@ export const BundleDetailModal: React.FC<Props> = ({
   onOpenSelectExit,
 }) => {
   const platform = usePlatform();
+  const panel = useRef<HTMLDivElement>(null);
+  const close = useRef(onClose); close.current = onClose;
+  useEffect(() => {
+    if (!isOpen || !drawer) return;
+    const previous = document.activeElement as HTMLElement | null;
+    panel.current?.focus();
+    const key = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
+      // Nested editor dialogs own keyboard focus while open.
+      if (document.querySelector('[role="dialog"][aria-modal="true"]:not([data-bundle-detail])')) return;
+      if (e.key === "Escape") { e.preventDefault(); close.current(); }
+      if (e.key !== "Tab") return;
+      const items = [...(panel.current?.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled),select:not(:disabled),a[href]') || [])];
+      if (!items.length) { e.preventDefault(); return; }
+      if (e.shiftKey && (document.activeElement === items[0] || document.activeElement === panel.current)) { e.preventDefault(); items[items.length - 1].focus(); }
+      else if (!e.shiftKey && (document.activeElement === items[items.length - 1] || document.activeElement === panel.current)) { e.preventDefault(); items[0].focus(); }
+    };
+    document.addEventListener("keydown", key);
+    return () => { document.removeEventListener("keydown", key); if (previous?.isConnected) previous.focus(); };
+  }, [isOpen, drawer]);
 
   if (!isOpen || !instance) return null;
 
   const def = instance.definition;
-  const boundNode = instance.slotBindings.main;
+  const independent = instance.backend === "external";
+  const boundNode = independent ? externalLabel || "未选择代理" : instance.slotBindings.main;
   const isEnabled = instance.enabled && Boolean(boundNode) && status?.phase === "applied";
   const processes = bundleProcesses(
     def,
@@ -56,8 +83,8 @@ export const BundleDetailModal: React.FC<Props> = ({
   );
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
-      <div className="w-full max-w-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh] animate-in fade-in duration-150">
+    <div className={`fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex ${drawer ? "justify-end" : "items-center justify-center p-4"}`} onMouseDown={e => { if (drawer && e.target === e.currentTarget) onClose(); }}>
+      <div ref={panel} tabIndex={-1} data-bundle-detail role="dialog" aria-modal="true" aria-label="业务包详情" className={`w-full max-w-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-2xl overflow-hidden flex flex-col outline-none ${drawer ? "h-full" : "rounded-2xl max-h-[90vh]"} animate-in fade-in duration-150`}>
         
         {/* 头部 */}
         <div className="px-6 py-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between bg-slate-50/80 dark:bg-slate-950/60">
@@ -111,11 +138,11 @@ export const BundleDetailModal: React.FC<Props> = ({
             <div className="flex items-center justify-between border-b border-slate-200/60 dark:border-slate-800 pb-2">
               <span className="font-bold text-slate-800 dark:text-slate-200 flex items-center space-x-1.5 text-xs">
                 <Activity className="w-4 h-4 text-emerald-500" />
-                <span>核心运行与连接核验</span>
+                <span>{independent ? "独立代理与连接核验" : "核心运行与连接核验"}</span>
               </span>
               <span className={`font-bold flex items-center space-x-1 ${isEnabled ? "text-emerald-600 dark:text-emerald-400" : "text-amber-600 dark:text-amber-400"}`}>
                 {isEnabled ? <CheckCircle2 className="w-3.5 h-3.5" /> : <AlertCircle className="w-3.5 h-3.5" />}
-                <span>{isEnabled ? "核心已应用 · 规则正常生效" : status?.message || "未确认就绪"}</span>
+                <span>{isEnabled ? (independent ? "独立入口已就绪" : "核心已应用 · 规则正常生效") : status?.message || "未确认就绪"}</span>
               </span>
             </div>
 
@@ -164,7 +191,7 @@ export const BundleDetailModal: React.FC<Props> = ({
 
             {/* 分流模式说明 */}
             <p className="text-[11px] text-slate-500 dark:text-slate-400 pt-1">
-              {def.mode === "sandbox"
+              {independent ? (def.mode === "sandbox" ? `独立沙盒：同时匹配本包进程和域名时使用包内代理；其他请求${instance.externalFallback === "default" ? "使用默认外部代理" : "直连"}。域名清单为空也使用未命中策略。` : "独立强锁：已接入且归属本包的请求使用包内代理；UDP 需应用与 SOCKS5 上游支持。尚未接入的请求不会被自动接管。") : def.mode === "sandbox"
                 ? "沙盒分流：仅程序访问清单内的域名时使用本包出口，其余流量遵循默认规则。"
                 : "强锁分流：已接入的主进程及其所有衍生子进程均强制使用本包指定出口，杜绝异地风控。"}
             </p>
@@ -201,16 +228,16 @@ export const BundleDetailModal: React.FC<Props> = ({
                 )}
               </p>
               <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                {boundNode && isEnabled ? "核心已正确应用该节点并保持长连接监听" : "需绑定有效节点后方可生效"}
+                {independent ? status?.message : boundNode && isEnabled ? "核心已正确应用该节点并保持长连接监听" : "需绑定有效节点后方可生效"}
               </p>
             </div>
 
             <div className="p-3.5 rounded-xl bg-slate-50/80 dark:bg-slate-950/60 border border-slate-200/80 dark:border-slate-800 space-y-2">
               <span className="font-bold text-slate-800 dark:text-slate-200 text-xs block">
-                DNS 解析出口插槽 [dns]
+                {independent ? "域名解析与协议范围" : "DNS 解析出口插槽 [dns]"}
               </span>
               <p className="text-slate-600 dark:text-slate-300 font-mono text-xs">
-                {instance.slotBindings.dns && instance.slotBindings.dns !== "FOLLOW_MAIN" ? (
+                {independent ? "有域名的代理请求交由上游解析" : instance.slotBindings.dns && instance.slotBindings.dns !== "FOLLOW_MAIN" ? (
                   <span className="text-indigo-600 dark:text-indigo-400 font-bold">
                     独立节点: {instance.slotBindings.dns}
                   </span>
@@ -221,7 +248,7 @@ export const BundleDetailModal: React.FC<Props> = ({
                 )}
               </p>
               <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                {isEnabled && def.domains?.length
+                {independent ? "支持 SOCKS5 TCP / UDP；可在独立代理设置中开启本包 DNS 入口，按查询域名分流。系统 DNS 不自动修改；只有 IP 的请求不推测域名。代理失败不自动直连。" : isEnabled && def.domains?.length
                   ? "核心域名专属 DNS 规则已应用，有效防止 DNS 投毒与污染"
                   : "尚未确认域名 DNS 生效，应用自带加密 DNS 不由此规则接管"}
               </p>
@@ -358,7 +385,7 @@ export const BundleDetailModal: React.FC<Props> = ({
           )}
 
           {/* 5. 快捷方式工具接入 */}
-          {platform.shortcutManagement && onShortcuts && (
+          {!unavailable && platform.shortcutManagement && onShortcuts && (
             <div className="p-4 rounded-xl bg-slate-50/80 dark:bg-slate-950/60 border border-slate-200/80 dark:border-slate-800 flex items-center justify-between">
               <div>
                 <span className="font-bold text-slate-800 dark:text-slate-200 text-xs block">
@@ -408,7 +435,7 @@ export const BundleDetailModal: React.FC<Props> = ({
           </div>
 
           <div className="flex items-center space-x-2.5">
-            {platform.appProxy && onLaunch && (
+            {!unavailable && platform.appProxy && onLaunch && (
               <button
                 type="button"
                 onClick={() => {

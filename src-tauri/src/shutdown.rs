@@ -15,6 +15,13 @@ pub(crate) fn request(app: &tauri::AppHandle, code: i32) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let _lifecycle = crate::commands::process::LIFECYCLE.lock().await;
+        if crate::edition::PROCESS {
+            crate::process_capture::stop();
+            crate::external_proxy::shutdown();
+            PHASE.store(2, Ordering::Release);
+            if code == tauri::RESTART_EXIT_CODE { app.request_restart(); } else { app.exit(code); }
+            return;
+        }
         let result = restore_before_stop(crate::commands::dns_adapter::restore_dns_guard(), || {
             // Restore the proxy before stopping its endpoint. Failure keeps the app alive.
             crate::commands::sysproxy::set_system_proxy_raw(false, None)?;
@@ -24,6 +31,7 @@ pub(crate) fn request(app: &tauri::AppHandle, code: i32) {
         }).await;
         match result {
             Ok(()) => {
+                crate::external_proxy::shutdown();
                 crate::commands::process_watcher::stop_watcher_loop();
                 crate::commands::health_probe::shutdown();
                 PHASE.store(2, Ordering::Release);

@@ -67,6 +67,14 @@ fn format_speed(bps: f64) -> String {
 }
 
 pub fn rebuild_tray_in_place(app: &tauri::AppHandle) {
+    if !crate::function_mode::core_features_enabled() {
+        if let Some(window) = app.get_webview_window("tray-menu") { let _ = window.hide(); }
+        if let Some(tray) = app.tray_by_id("procweaver") {
+            let _ = tray.set_tooltip(Some("ProcWeaver · 进程代理功能"));
+            if let Ok(menu) = process_menu(app) { let _ = tray.set_menu(Some(menu)); }
+        }
+        return;
+    }
     if let Ok(guard) = CURRENT_TRAY_PAYLOAD.lock() {
         if let Some(payload) = guard.as_ref() {
             let _ = app.emit("tray-payload-updated", payload.clone());
@@ -162,7 +170,14 @@ async fn switch_node_to_available_groups(node_name: &str) {
 }
 
 pub fn handle_menu_event(app: &tauri::AppHandle, id: &str) {
+    if !crate::function_mode::core_features_enabled() && !matches!(id, "open" | "quit" | "process_bundles" | "process_diagnostics") {
+        show(app); return;
+    }
     match id {
+        "process_bundles" | "process_diagnostics" => {
+            show(app);
+            let _ = app.emit("procweaver-navigate-tab", if id == "process_bundles" { "routing" } else { "connections" });
+        }
         "open" => show(app),
         "open_node_view" => {
             show(app);
@@ -705,6 +720,7 @@ pub fn update_tray_menu(
     app: tauri::AppHandle,
     mut payload: TrayMenuPayload,
 ) -> Result<(), String> {
+    if !crate::function_mode::core_features_enabled() { rebuild_tray_in_place(&app); return Ok(()); }
     let proxy = crate::commands::sysproxy::system_proxy_snapshot();
     payload.sys_proxy_enabled = proxy.enabled();
     payload.sys_proxy_state = proxy.state;
@@ -850,6 +866,7 @@ fn parse_tray_groups(proxies_obj: &serde_json::Map<String, serde_json::Value>, a
 }
 
 pub fn show_or_toggle_tray_menu(app: &tauri::AppHandle, pos: tauri::PhysicalPosition<f64>) {
+    if !crate::function_mode::core_features_enabled() { show(app); return; }
     if let Some(window) = app.get_webview_window("tray-menu") {
         if window.is_visible().unwrap_or(false) {
             let _ = window.hide();
@@ -932,6 +949,7 @@ pub fn show_or_toggle_tray_menu(app: &tauri::AppHandle, pos: tauri::PhysicalPosi
 
 #[tauri::command]
 pub async fn get_tray_payload(app: tauri::AppHandle) -> Option<TrayMenuPayload> {
+    if !crate::function_mode::core_features_enabled() { return None; }
     let mut payload = CURRENT_TRAY_PAYLOAD.lock().ok().and_then(|g| g.clone()).unwrap_or_else(|| TrayMenuPayload {
         running: false,
         mode: "rule".into(),
@@ -1035,7 +1053,9 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .tooltip(concat!("ProcWeaver V", env!("CARGO_PKG_VERSION"), "\n双击或右键打开控制面板"))
         .show_menu_on_left_click(false);
 
-    if style == "classic" {
+    if !crate::function_mode::core_features_enabled() {
+        builder = builder.menu(&process_menu(app.handle())?);
+    } else if style == "classic" {
         let open = MenuItem::with_id(app, "open", "打开主界面", true, None::<&str>)?;
         let quit = MenuItem::with_id(app, "quit", "彻底退出 ProcWeaver", true, None::<&str>)?;
         let menu = Menu::with_items(app, &[&open, &quit])?;
@@ -1069,7 +1089,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 let style = crate::commands::settings::get_general_settings()
                     .map(|s| s.tray_menu_style)
                     .unwrap_or_else(|_| "modern".into());
-                if style == "modern" {
+                if style == "modern" && crate::function_mode::core_features_enabled() {
                     show_or_toggle_tray_menu(tray.app_handle(), position);
                 }
             }
@@ -1077,4 +1097,11 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         })
         .build(app)?;
     Ok(())
+}
+
+fn process_menu(app: &tauri::AppHandle) -> Result<Menu<tauri::Wry>, tauri::Error> {
+    let open = MenuItem::with_id(app, "process_bundles", "业务包", true, None::<&str>)?;
+    let records = MenuItem::with_id(app, "process_diagnostics", "连接与诊断", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出 ProcWeaver", true, None::<&str>)?;
+    Menu::with_items(app, &[&open, &records, &quit])
 }

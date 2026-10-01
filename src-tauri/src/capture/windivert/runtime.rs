@@ -35,6 +35,7 @@ pub struct Stats {
     pub failures: u64,
 }
 struct Route {
+    external: Option<crate::external_proxy::captured::Context>,
     flow: Flow,
     token: u16,
     port: u16,
@@ -52,6 +53,7 @@ struct Tables {
     generation: u64,
 }
 struct Shared {
+    external: bool,
     plan: RwLock<Plan>,
     network: Arc<Device>,
     sockets: Arc<Device>,
@@ -82,14 +84,24 @@ impl Engine {
         components: &std::path::Path,
         excluded: Vec<Identity>,
     ) -> Result<Self, String> {
-        Self::start_inner(plan, components, excluded, None)
+        Self::start_backend(plan, components, excluded, None, false)
     }
+    pub(crate) fn start_external(components: &std::path::Path, excluded: Vec<Identity>) -> Result<Self,String> {
+        Self::start_backend(Plan {entries:vec![],targets:vec![],instances:vec![]}, components, excluded, None, true)
+    }
+    #[cfg(test)] pub(crate) fn external_fixture(components:&std::path::Path,excluded:Vec<Identity>,filter:&str)->Result<Self,String>{
+        Self::start_backend(Plan{entries:vec![],targets:vec![],instances:vec![]},components,excluded,Some(filter),true)
+    }
+    #[cfg(test)]
     fn start_inner(
         plan: Plan,
         components: &std::path::Path,
         excluded: Vec<Identity>,
         filter: Option<&str>,
     ) -> Result<Self, String> {
+        Self::start_backend(plan,components,excluded,filter,false)
+    }
+    fn start_backend(plan:Plan,components:&std::path::Path,excluded:Vec<Identity>,filter:Option<&str>,external:bool)->Result<Self,String> {
         plan.validate()?;
         let pool = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -117,7 +129,7 @@ impl Engine {
         if sockets.version().map_err(|_| "驱动版本读取失败")? != (2, 2) {
             return Err("WinDivert 共享驱动版本不兼容".into());
         }
-        let default_filter = if plan.targets.is_empty() && plan.instances.is_empty() {
+        let default_filter = if !external && plan.targets.is_empty() && plan.instances.is_empty() {
             "false"
         } else {
             "outbound and (tcp or udp)"
@@ -128,6 +140,7 @@ impl Engine {
             .replace("{relay6}", &ports.1.to_string());
         let network_device = loaded.api.open(&filter_text, 0, 0)?;
         let shared = Arc::new(Shared {
+            external,
             plan: RwLock::new(plan),
             network: network_device,
             sockets,
@@ -400,7 +413,13 @@ fn network(s: Arc<Shared>) {
                 }
             }
         }
-        let choice = owner
+        let external = if s.external {
+            match owner.as_ref().filter(|o|!s.excluded.contains(&o.identity)).map(|o|crate::external_proxy::captured::resolve(&o.identity)).transpose() {
+                Ok(context)=>context.flatten(),
+                Err(_)=>{s.failures.fetch_add(1,Ordering::Relaxed);continue;}
+            }
+        } else {None};
+        let choice = if s.external {external.as_ref().map(|_|0)} else {owner
             .as_ref()
             .filter(|o| !s.excluded.contains(&o.identity))
             .and_then(|o| {
@@ -409,7 +428,7 @@ fn network(s: Arc<Shared>) {
                     o.identity.pid,
                     o.identity.created_at,
                 )
-            });
+            })};
         let Some(port) = choice else {
             if owner.is_none() {
                 s.unknown.fetch_add(1, Ordering::Relaxed);
@@ -446,6 +465,7 @@ fn network(s: Arc<Shared>) {
                 continue;
             };
             let route = Arc::new(Route {
+                external,
                 flow,
                 token,
                 port,
@@ -490,6 +510,7 @@ fn network(s: Arc<Shared>) {
                     rx,
                     generation,
                     owner,
+                    external,
                 )
                 .await
                 .is_err()
@@ -541,6 +562,9 @@ async fn accept(s: Arc<Shared>, listener: TcpListener) {
             let _permit = permit;
             shared.tcp.fetch_add(1, Ordering::Relaxed);
             let result = async {
+                if let Some(context)=route.external.clone() {
+                    return crate::external_proxy::captured::tcp(context,stream,route.flow.destination).await.map_err(std::io::Error::other);
+                }
                 let (mut upstream, _) = socks(route.port, route.flow.destination, false).await?;
                 tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
                 Ok::<(), std::io::Error>(())
@@ -606,7 +630,22 @@ async fn udp(
     mut rx: mpsc::Receiver<Vec<u8>>,
     generation: u64,
     owner: super::ownership::Owner,
+    external: Option<crate::external_proxy::captured::Context>,
 ) -> std::io::Result<()> {
+    if let Some(context)=external {
+        let (tx,mut replies)=mpsc::channel(16);
+        let mut worker=tokio::spawn(crate::external_proxy::captured::udp(context,p.flow.destination,rx,tx));
+        let mut completed=false;
+        let result=loop {tokio::select! {
+            result=&mut worker=>{completed=true;break result.map_err(std::io::Error::other)?.map_err(std::io::Error::other);},
+            payload=replies.recv()=>{let Some(payload)=payload else{break Ok(());};
+                if !s.owners.lock().unwrap().current(&owner)||!s.table.lock().unwrap().udp.get(&p.flow).is_some_and(|(g,_,_)|*g==generation){break Ok(());}
+                if p.flow.destination.port()==53{s.dns.fetch_add(1,Ordering::Relaxed);}
+                if let Some(mut response)=p.udp_reply(&template,&payload){if address.flags&(1<<18)==0{address.inbound();}send(&s,&mut response,&mut address,true);}
+            }
+        }};
+        if !completed {worker.abort();let _=worker.await;}return result;
+    }
     let (mut control, relay) =
         socks(port, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), true).await?;
     if !relay.ip().is_loopback() || relay.port() == 0 {

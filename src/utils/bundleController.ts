@@ -1,10 +1,15 @@
 import type { RoutingApi } from "../api/routingOverrides";
 import type { BundleLocalInstance } from "../types/businessBundle";
 import type { RoutingView } from "../types/routingOverrides";
+import type { ExternalProxyApi } from "../api/externalProxy";
+import type { ExternalProxyView } from "../types/externalProxy";
+import { compileExternalBundles, externalSignature } from "../services/externalBundleCompiler";
+import { syncBundleBackends } from "../services/bundleBackends";
 import { bundlePlatform } from "../services/platform";
 import { compileBundlesToProcessRules, compileBundlesToDnsRules, compileBundleRoutes, routeSignature, resolveBundleTargets, ruleSignature, syncBundlesToCore, networkSignature } from "../services/bundleCompiler";
 
 export interface BundleState {
+  functionMode?: "full" | "process_proxy";
   instances: BundleLocalInstance[];
   view?: RoutingView;
   pending: boolean;
@@ -13,6 +18,8 @@ export interface BundleState {
   error: string;
   readError: string;
   errorInstanceIds?: string[];
+  external?: ExternalProxyView;
+  externalReadError?: string;
 }
 export interface BundleStatus {
   phase: "applied" | "pending" | "saved" | "error" | "disabled" | "unbound" | "paused";
@@ -40,7 +47,7 @@ function savedInstances(instances: BundleLocalInstance[], view?: RoutingView): B
       return [exe.toLowerCase(), { exe, role: exe.toLowerCase() === mainName.toLowerCase() ? "main" as const : "helper" as const,
         description: rule.label, includeDescendants: rule.includeDescendants }] as const;
     })).values()].sort((a, b) => Number(b.role === "main") - Number(a.role === "main"));
-    return [{ ...instance, enabled: saved.enabled,
+    return [{ ...instance, backend: "core" as const, enabled: saved.enabled,
       ...(os !== "android" && processes.length ? { processBindings: { ...instance.processBindings, [os]: processes.filter(r => r.matchKind === "path").map(r => ({ exe: basename(r.matchValue), executablePath: r.matchValue, includeDescendants: r.includeDescendants })) } } : {}),
       slotBindings: { main: saved.mainTarget?.name || instance.slotBindings.main, dns: saved.dnsTarget?.name || "FOLLOW_MAIN" },
       slotTargets: { main: saved.mainTarget || undefined, dns: saved.dnsTarget || undefined },
@@ -51,12 +58,43 @@ function savedInstances(instances: BundleLocalInstance[], view?: RoutingView): B
     }];
   });
 }
+function savedExternalInstances(instances: BundleLocalInstance[], view?: ExternalProxyView): BundleLocalInstance[] {
+  if (!view) return [];
+  return instances.flatMap(instance => {
+    const saved = view.bundles.find(b => b.id === instance.instanceId);
+    if (!saved) return [];
+    const basename = (path: string) => path.split(/[\\/]/).pop() || path;
+    const main = basename(saved.mainExe);
+    return [{ ...instance, backend: "external" as const, enabled: saved.enabled, externalEndpointId: saved.endpointId, externalFallback: saved.fallback,
+      processBindings: { ...instance.processBindings, windows: saved.members.filter(m => m.kind === "path").map(m => ({ exe: basename(m.value), executablePath: m.value, includeDescendants: m.descendants })) },
+      definition: { ...instance.definition, mode: saved.mode, domains: saved.domains, additionalExes: [], processes: saved.members.map(m => ({ exe: basename(m.value), role: basename(m.value).toLowerCase() === main.toLowerCase() ? "main" as const : "helper" as const, description: "", includeDescendants: m.descendants })) },
+    }];
+  });
+}
 
 export function getBundleStatus(instance: BundleLocalInstance, state: BundleState): BundleStatus {
   const rules = state.view?.config.processRules.filter(r => r.id.startsWith(`bundle-${instance.instanceId}-`)) || [];
   const previousTargets = [...new Set(rules.filter(r => r.enabled && r.target).map(r => r.target!.name))];
   const result = (phase: BundleStatus["phase"], message: string): BundleStatus => ({ phase, message, previousTargets });
+  if (state.functionMode === "process_proxy" && instance.backend !== "external") return result("paused", "当前模式不可用；原核心绑定保留，可选择外部代理后启用");
   if (state.pending && (!state.pendingInstanceIds || state.pendingInstanceIds.includes(instance.instanceId))) return result("pending", state.masterPending ? "正在切换业务包总开关" : "正在更新此业务包，其他包保持原配置");
+  if (instance.backend === "external") {
+    if (state.externalReadError) return result("error", state.externalReadError);
+    if (state.error && state.errorInstanceIds?.includes(instance.instanceId)) return result("error", state.error);
+    const view = state.external;
+    if (!view) return result("pending", "正在核实独立代理状态");
+    if (!view.supported) return result("error", "独立进程代理首期支持 Windows");
+    const saved = view.bundles.filter(b => b.id === instance.instanceId);
+    try {
+      if (externalSignature(saved) !== externalSignature(compileExternalBundles([instance]))) return result("error", "本次独立设置尚未应用，请重新应用");
+    } catch (error) { return result("error", error instanceof Error ? error.message : String(error)); }
+    if (!instance.enabled) return result("disabled", "已停用独立入口；应用需恢复自身代理设置后联网");
+    if (!view.enabled) return result("paused", "独立代理总开关已暂停，核心状态不影响此开关");
+    const runtime = view.states.find(s => s.id === instance.instanceId);
+    if (runtime?.error) return result("error", runtime.error);
+    if (!runtime?.ready) return result("error", "独立入口未就绪，请重新应用");
+    return result("applied", `独立入口 127.0.0.1:${runtime.port} 已就绪；实际出口以新连接记录为准`);
+  }
   if (state.readError) return result("error", state.readError);
   if (state.error && state.errorInstanceIds?.includes(instance.instanceId)) return result("error", state.error);
   if (!instance.enabled || !instance.slotBindings.main) {
@@ -101,7 +139,7 @@ export function getBundleStatus(instance: BundleLocalInstance, state: BundleStat
 export function createBundleController(api: Pick<RoutingApi, "read" | "save">, storage: {
   load: () => BundleLocalInstance[];
   save: (instances: BundleLocalInstance[]) => void;
-}) {
+}, externalApi?: ExternalProxyApi) {
   let state: BundleState = { instances: storage.load(), pending: false, error: "", readError: "" };
   const listeners = new Set<() => void>();
   let sequence = 0;
@@ -109,11 +147,13 @@ export function createBundleController(api: Pick<RoutingApi, "read" | "save">, s
   let reading: Promise<void> | undefined;
   let tail: Promise<unknown> = Promise.resolve();
   let confirmed: BundleLocalInstance[] | undefined;
+  let suspended = false;
   const publish = (patch: Partial<BundleState>) => {
     state = { ...state, ...patch };
     listeners.forEach(fn => fn());
   };
   const apply = (instances = state.instances, restoring = false) => {
+    if (suspended) return Promise.resolve(false);
     const ticket = ++sequence;
     ++readSequence;
     const snapshot: BundleLocalInstance[] = JSON.parse(JSON.stringify(instances));
@@ -136,14 +176,16 @@ export function createBundleController(api: Pick<RoutingApi, "read" | "save">, s
       if (ticket !== sequence) return false;
       try {
         storage.save(snapshot);
-        const result = await syncBundlesToCore(effective, api, restoring);
+        const result: Awaited<ReturnType<typeof syncBundlesToCore>> & { external?: ExternalProxyView } = externalApi
+          ? await syncBundleBackends(effective, api, externalApi, restoring, affected, state.view, state.functionMode === "process_proxy", state.functionMode === "full")
+          : await syncBundlesToCore(effective, api, restoring);
         if (result.success) confirmed = result.instances;
-        else if (!confirmed && result.view) confirmed = savedInstances(snapshot, result.view);
+        else if (!confirmed) confirmed = [...savedInstances(snapshot, result.view), ...savedExternalInstances(snapshot, result.external)];
         if (ticket !== sequence) return false;
         const desired = snapshot.map(item => affected.includes(item.instanceId) || !state.view
           ? result.instances.find(next => next.instanceId === item.instanceId) || item : item);
         if (result.success) storage.save(desired);
-        publish({ instances: desired, view: result.view, pending: false, pendingInstanceIds: [], error: result.error || "",
+        publish({ instances: desired, view: result.view, ...(result.external ? { external: result.external, externalReadError: "" } : {}), pending: false, pendingInstanceIds: [], error: result.error || "",
           errorInstanceIds: result.errorInstanceIds?.length ? result.errorInstanceIds : affected });
         return result.success;
       } catch (error) {
@@ -155,16 +197,23 @@ export function createBundleController(api: Pick<RoutingApi, "read" | "save">, s
     return work;
   };
   const refresh = (): Promise<void> => {
-    if (state.pending) return Promise.resolve();
+    if (state.pending || suspended) return Promise.resolve();
     if (reading) return reading;
     const ticket = ++readSequence;
     reading = (async () => {
+      if (externalApi) {
+        try {
+          const external = await externalApi.read();
+          if (ticket === readSequence && !state.pending && (state.externalReadError || JSON.stringify(external) !== JSON.stringify(state.external))) publish({ external, externalReadError: "" });
+        } catch (error) { if (ticket === readSequence) publish({ externalReadError: error instanceof Error ? error.message : String(error) }); }
+      }
+      if (state.functionMode === "process_proxy" || ticket !== readSequence) return;
       try {
         const view = await api.read();
         if (ticket !== readSequence || state.pending) return;
         const restarted = state.view?.running === false && view.running;
         if (state.readError || JSON.stringify(view) !== JSON.stringify(state.view)) publish({ view, readError: "" });
-        if (restarted) await apply(state.instances, true);
+        if (restarted && !externalApi) await apply(state.instances, true);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (ticket === readSequence && state.readError !== message) publish({ readError: message });
@@ -173,8 +222,9 @@ export function createBundleController(api: Pick<RoutingApi, "read" | "save">, s
     return reading;
   };
   const setMasterEnabled = (enabled: boolean) => {
+    if (suspended || state.functionMode === "process_proxy") return Promise.resolve(false);
     const ticket = ++sequence; ++readSequence;
-    publish({ pending: true, masterPending: true, pendingInstanceIds: undefined, error: "", readError: "", errorInstanceIds: [] });
+    publish({ pending: true, masterPending: true, pendingInstanceIds: state.instances.filter(i => i.backend !== "external").map(i => i.instanceId), error: "", readError: "", errorInstanceIds: [] });
     const work = tail.then(async () => {
       if (ticket !== sequence) return false;
       try {
@@ -195,6 +245,28 @@ export function createBundleController(api: Pick<RoutingApi, "read" | "save">, s
   return {
     getSnapshot: () => state,
     subscribe: (fn: () => void) => { listeners.add(fn); return () => { listeners.delete(fn); }; },
-    apply, refresh, setMasterEnabled, restore: () => apply(state.instances, true), whenIdle: () => tail,
+    apply, refresh, setMasterEnabled,
+    suspend: (value: boolean) => { suspended = value; if (value) ++readSequence; },
+    setFunctionMode: (mode: "full" | "process_proxy") => {
+      ++readSequence;
+      publish({ functionMode: mode, view: undefined, readError: "", error: "", errorInstanceIds: [] });
+    },
+    setExternalEnabled: (enabled: boolean) => {
+      if (!externalApi || suspended) return Promise.resolve(false);
+      const ticket = ++sequence; ++readSequence;
+      const ids = state.instances.filter(i => i.backend === "external").map(i => i.instanceId);
+      publish({ pending: true, pendingInstanceIds: ids, error: "", errorInstanceIds: [] });
+      const work = tail.then(async () => {
+        if (ticket !== sequence) return false;
+        try {
+          const before = await externalApi.read();
+          const external = await externalApi.apply(before.revision, before.bundles, enabled);
+          if (ticket === sequence) publish({ external, externalReadError: "", pending: false, pendingInstanceIds: [] }); return true;
+        } catch (error) { if (ticket === sequence) publish({ pending: false, pendingInstanceIds: [], errorInstanceIds: ids, error: error instanceof Error ? error.message : String(error) }); return false; }
+      });
+      tail = work;
+      return work;
+    },
+    restore: () => apply(state.instances, true), whenIdle: () => tail,
   };
 }

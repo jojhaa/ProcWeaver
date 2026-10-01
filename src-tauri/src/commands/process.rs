@@ -217,6 +217,7 @@ pub(crate) async fn start_core_locked(core_mode: Option<String>, state: &CoreSta
 }
 
 async fn start_core_inner(core_mode: Option<String>, state: &CoreStateMutex) -> Result<CoreStatus, String> {
+    crate::function_mode::require_full()?;
     if crate::shutdown::in_progress() { return Err("正在恢复网络并退出，暂不启动核心".into()); }
     // 如果已经在运行，先检查并返回
     {
@@ -422,6 +423,7 @@ pub async fn restart_core_transaction(app: &tauri::AppHandle) -> Result<CoreStat
     use tauri::Manager;
     use tauri::Emitter;
     let _lifecycle = LIFECYCLE.lock().await;
+    crate::function_mode::require_full()?;
 
     // 1. 抓取重启前环境快照
     let was_proxy_enabled = get_system_proxy_status()?;

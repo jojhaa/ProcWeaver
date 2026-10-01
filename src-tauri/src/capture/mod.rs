@@ -205,6 +205,7 @@ pub fn status() -> Status {
     s
 }
 pub fn stop() {
+    crate::process_capture::stop();
     #[cfg(windows)]
     windivert::session::stop();
     let mut s = STATUS.lock().unwrap_or_else(|p| p.into_inner());
@@ -420,6 +421,11 @@ pub async fn run() {
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let _lock = crate::commands::process::LIFECYCLE.lock().await;
+        if !crate::function_mode::core_features_enabled() {
+            crate::process_capture::tick().await;
+            previous = None;
+            continue;
+        }
         if !crate::commands::process::ACTIVE.load(Ordering::SeqCst) {
             stop();
             previous = None;

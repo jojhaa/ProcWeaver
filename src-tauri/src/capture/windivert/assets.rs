@@ -79,7 +79,7 @@ fn cache_root() -> Result<PathBuf, String> {
             .map(PathBuf::from)
             .map_err(|_| "组件目录无效");
         CoTaskMemFree(Some(value.0.cast()));
-        Ok(path?.join("ProcWeaver Components"))
+        Ok(path?.join(crate::edition::COMPONENTS))
     }
 }
 

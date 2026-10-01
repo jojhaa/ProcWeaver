@@ -1,12 +1,14 @@
 {
   "name": "proc-weaver",
   "private": true,
-  "version": "2.0.5",
+  "version": "2.0.6",
   "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "dev:process": "vite --config vite.process.config.ts --open /process.html",
+    "build:process": "tsc && vite build --config vite.process.config.ts",
     "preview": "vite preview",
     "tauri": "tauri"
   },

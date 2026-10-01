@@ -54,7 +54,7 @@ fn managed_link(original:&Link,executable:&Path,bundle_id:&str,id:&str)->Link {
     Link{target:executable.to_string_lossy().into(),arguments:format!("--launch-bundle {bundle_id} --shortcut {id}"),
         directory:executable.parent().unwrap_or(executable).to_string_lossy().into(),
         icon:if original.icon.is_empty(){original.target.clone()}else{original.icon.clone()}, icon_index:original.icon_index,
-        description:"由 ProcWeaver 按业务包启动，保留应用原有用户资料".into()}
+        description:format!("由 {} 按业务包启动，保留应用原有用户资料", crate::edition::NAME)}
 }
 fn write_verified(path:&Path,link:&Link,preserve:bool)->Result<(),String> {
     native::write_link(path,link,preserve)?;
@@ -117,7 +117,7 @@ pub async fn change_bundle_shortcut(instance_id:String,action:String,candidate:O
         let id=bundle_launch::id();
         let destination=if action=="patch" {PathBuf::from(selected.ok_or("未选择原快捷方式")?)}else{
             let safe:String=bundle.name.chars().map(|c|if "<>:\"/\\|?*".contains(c)||c.is_control(){'_'}else{c}).take(60).collect();
-            native::desktop(false)?.join(format!("{safe} (ProcWeaver-{}).lnk",&id[id.len().saturating_sub(8)..]))
+            native::desktop(false)?.join(format!("{safe} ({}-{}).lnk",crate::edition::AUTOSTART,&id[id.len().saturating_sub(8)..]))
         };
         if action=="create" && destination.exists(){return Err("目标文件已存在，未覆盖".into());}
         let backup=if action=="patch"{Some(backup(&destination,&id)?.to_string_lossy().into_owned())}else{None};

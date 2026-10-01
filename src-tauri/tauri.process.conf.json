@@ -1,0 +1,16 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ProcWeaver Process",
+  "identifier": "com.procweaver.process",
+  "build": {
+    "beforeDevCommand": "npm run dev:process",
+    "devUrl": "http://localhost:1422/process.html",
+    "beforeBuildCommand": "npm run build:process",
+    "frontendDist": "../dist-process"
+  },
+  "app": { "windows": [], "security": {
+    "csp": null,
+    "capabilities": [{ "identifier": "process-main", "windows": ["main"], "permissions": ["core:event:default"] }]
+  } },
+  "bundle": { "active": false, "resources": [], "icon": ["icons/icon.ico"] }
+}

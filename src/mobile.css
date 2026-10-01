@@ -26,7 +26,8 @@
 .dark .mobile-notice { color: #fcd34d; background: #292014; }
 .mobile-segments { display: flex; border-radius: 14px; padding: 4px; background: #e2e8f0; gap: 4px; }
 .dark .mobile-segments { background: #1e293b; }
-.mobile-segments button { flex: 1; min-height: 44px; border-radius: 10px; font-size: 13px; }
+.mobile-segments button { flex: 1; min-height: 44px; border-radius: 10px; font-size: 13px; transition: transform 0.08s ease, background-color 0.15s ease; }
+.mobile-segments button:active { transform: scale(0.96); }
 .mobile-segments button[aria-pressed=true] { background: #4f46e5; color: white; font-weight: 600; }
 .mobile-segments button:disabled { opacity: .5; }
 .mobile-routing-nav { width: 100%; padding-top: 8px; padding-bottom: 8px; }
@@ -52,20 +53,38 @@
 .dark .mobile-quick-links button { background: #0f172a; border-color: #1e293b; color: #cbd5e1; }
 .dark .mobile-quick-links button:active { background: #1e293b; }
 .mobile-menu { padding: 4px 16px; }
-.mobile-menu button { width: 100%; text-align: left; display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid #e2e8f0; }
+.mobile-menu button {
+  width: 100%;
+  text-align: left;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 8px;
+  border-bottom: 1px solid #e2e8f0;
+  border-radius: 14px;
+  transition: background-color 0.12s ease, transform 0.08s ease;
+}
+.mobile-menu button:active {
+  background-color: rgba(99, 102, 241, 0.08);
+  transform: scale(0.985);
+}
 .mobile-menu button:last-child { border-bottom: 0; }
 .dark .mobile-menu button { border-color: #1e293b; }
+.dark .mobile-menu button:active { background-color: rgba(99, 102, 241, 0.15); }
 .mobile-menu button span, .mobile-setting-row span { flex: 1; min-width: 0; }
 .mobile-menu strong, .mobile-setting-row strong { display: block; font-size: 14px; font-weight: 600; }
 .mobile-menu small, .mobile-setting-row small { display: block; margin-top: 4px; color: #64748b; font-size: 12px; line-height: 1.5; }
 .dark .mobile-menu small, .dark .mobile-setting-row small { color: #94a3b8; }
-.mobile-setting-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid #e2e8f0; }
+.mobile-setting-row { display: flex; align-items: center; gap: 12px; padding: 12px 8px; border-bottom: 1px solid #e2e8f0; border-radius: 12px; transition: background-color 0.12s ease; }
+.mobile-setting-row:active { background-color: rgba(99, 102, 241, 0.04); }
 .dark .mobile-setting-row { border-color: #1e293b; }
+.dark .mobile-setting-row:active { background-color: rgba(99, 102, 241, 0.1); }
 .mobile-setting-row:last-child { border-bottom: 0; }
-.mobile-setting-row input[type=checkbox] { width: 22px; height: 22px; accent-color: #4f46e5; }
-.mobile-number { width: 64px; min-height: 44px; border: 1px solid #94a3b8; border-radius: 10px; text-align: center; background: transparent; appearance: textfield; }
+.mobile-setting-row input[type=checkbox] { width: 22px; height: 22px; accent-color: #4f46e5; cursor: pointer; }
+.mobile-number { width: 68px; min-height: 44px; border: 1px solid #94a3b8; border-radius: 12px; text-align: center; background: transparent; appearance: textfield; font-weight: 700; font-size: 16px; }
 .mobile-number::-webkit-inner-spin-button, .mobile-number::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
-.mobile-back, .mobile-icon-button { display: inline-flex; align-items: center; gap: 10px; min-height: 44px; min-width: 44px; font-size: 14px; font-weight: 600; }
+.mobile-back, .mobile-icon-button { display: inline-flex; align-items: center; gap: 10px; min-height: 44px; min-width: 44px; font-size: 14px; font-weight: 600; transition: transform 0.08s ease; }
+.mobile-back:active, .mobile-icon-button:active { transform: scale(0.92); }
 .mobile-app button:focus-visible, .mobile-app input:focus-visible, .mobile-app select:focus-visible { outline: 2px solid #6366f1; outline-offset: 3px; }
 .mobile-app button { touch-action: manipulation; }
 .mobile-app .text-xs { font-size: 13px; }

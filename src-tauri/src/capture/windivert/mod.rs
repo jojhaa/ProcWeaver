@@ -20,6 +20,14 @@ mod packet;
 pub(crate) mod socks;
 #[path = "../owner.rs"]
 mod owner;
+/// Read-only endpoint ownership; does not extract, load or open WinDivert.
+pub(crate) fn tcp_owner(source: std::net::SocketAddr, destination: std::net::SocketAddr) -> Option<u32> {
+    owner::lookup(packet::Flow { source, destination, protocol: 6 })
+}
+/// IP Helper lookup only; no driver dependency or extraction.
+pub(crate) fn udp_owner(source: std::net::SocketAddr) -> Option<u32> {
+    owner::lookup(packet::Flow { source, destination: source, protocol: 17 })
+}
 #[cfg(test)]
 mod tcp_lab;
 #[cfg(test)]

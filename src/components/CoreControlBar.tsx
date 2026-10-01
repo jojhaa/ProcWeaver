@@ -89,88 +89,154 @@ export const CoreControlBar: React.FC<Props> = ({ extraAction }) => {
       {(error || (!status.running && status.lastStartError)) && <p role="alert" className="text-sm text-rose-500 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/30 p-2.5 rounded-xl border border-rose-200 dark:border-rose-900/50">{error || status.lastStartError}</p>}
       {!mobile && known && !status.running && <p className="text-xs text-slate-500 dark:text-slate-400">核心未启动，可继续管理订阅、节点和规则；保存的配置将在核心启动后应用。</p>}
       
-      {/* 顶部主控制行 */}
-      <div className="flex flex-wrap items-center justify-between gap-4">
-        {/* 核心状态信息 */}
-        <div className="flex items-center space-x-3.5">
-          <div className="relative flex items-center justify-center">
-            <div
-              className={`w-3.5 h-3.5 rounded-full ${
-                !unknown && status.running ? "bg-emerald-500 shadow-sm shadow-emerald-500/50" : "bg-slate-400 dark:bg-slate-600"
-              }`}
-            />
-            {!unknown && status.running && (
-              <div className="absolute -inset-1 bg-emerald-500/30 rounded-full animate-ping pointer-events-none" />
-            )}
-          </div>
-
-          <div>
-            <div className="flex items-center space-x-2.5">
-              <span className="font-bold text-slate-900 dark:text-white text-base tracking-tight">
-                {mobile ? "VPN 连接" : "Mihomo 核心"}
-              </span>
-              <span
-                className={`px-2.5 py-0.5 rounded-md text-[11px] font-medium transition-all ${
-                  !unknown && status.running
-                    ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30 font-mono shadow-xs"
-                    : "bg-slate-100 text-slate-600 border border-slate-200 dark:bg-slate-800 dark:text-slate-400 dark:border-slate-700 font-sans"
-                }`}
-              >
-                {unknown ? "状态未知" : status.running ? formatUptime(uptimeSeconds) : "已停止"}
-              </span>
+      {/* 顶部主控制行：移动端专属全宽触控与桌面端排版 */}
+      {mobile ? (
+        <div className="space-y-3.5">
+          {/* 移动端顶栏：状态指示与直连排除快捷入口 */}
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center space-x-2.5 min-w-0">
+              <div className="relative flex items-center justify-center shrink-0">
+                <div
+                  className={`w-3.5 h-3.5 rounded-full ${
+                    !unknown && status.running ? "bg-emerald-500 shadow-sm shadow-emerald-500/50" : "bg-slate-400 dark:bg-slate-600"
+                  }`}
+                />
+                {!unknown && status.running && (
+                  <div className="absolute -inset-1 bg-emerald-500/30 rounded-full animate-ping pointer-events-none" />
+                )}
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center space-x-2">
+                  <span className="font-bold text-slate-900 dark:text-white text-base tracking-tight truncate">
+                    VPN 连接
+                  </span>
+                  <span
+                    className={`px-2 py-0.5 rounded-md text-[11px] font-medium transition-all shrink-0 ${
+                      !unknown && status.running
+                        ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30 font-mono shadow-xs"
+                        : "bg-slate-100 text-slate-600 border border-slate-200 dark:bg-slate-800 dark:text-slate-400 dark:border-slate-700 font-sans"
+                    }`}
+                  >
+                    {unknown ? "状态未知" : status.running ? formatUptime(uptimeSeconds) : "待机待命"}
+                  </span>
+                </div>
+              </div>
             </div>
-            {!mobile && <div className="flex items-center space-x-2 text-xs text-slate-500 dark:text-slate-400 mt-1.5">
-              <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800/70 border border-slate-200/80 dark:border-slate-700/60 font-mono text-[11px]">
-                Mixed: <strong className="text-slate-800 dark:text-slate-200 ml-1">{status.mixedPort}</strong>
-              </span>
-              <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800/70 border border-slate-200/80 dark:border-slate-700/60 font-mono text-[11px]">
-                API: <strong className="text-slate-800 dark:text-slate-200 ml-1">{status.controllerPort}</strong>
-              </span>
-            </div>}
+            <div className="shrink-0">{extraAction}</div>
           </div>
-        </div>
 
-        {/* 控制按钮组 */}
-        <div className="flex items-center space-x-2.5">
-          {/* 嵌入的扩展设置（排除域名/IP） */}
-          {extraAction}
-
-          {/* 系统代理开关 */}
-          {platform.systemProxy && <button
-            onClick={handleToggleSystemProxy}
-            title={proxy.state === "external" ? "点击将系统代理接入本核心" : proxy.message}
-            disabled={!platform.systemProxy || loading || (!status.running && proxy.state !== "enabled" && proxy.state !== "unknown")}
-            className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl text-xs font-semibold border transition shadow-sm ${
-              status.systemProxyEnabled
-                ? "bg-indigo-600 hover:bg-indigo-500 text-white border-indigo-500 shadow-indigo-600/30"
-                : "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300/80 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 dark:border-slate-700 disabled:opacity-40"
-            }`}
-          >
-            <Globe className="w-3.5 h-3.5" />
-            <span>系统代理: {loading ? "切换中…" : proxyStateLabel(proxy.state)}</span>
-          </button>}
-
-          {/* 内核启动/关闭 */}
+          {/* 移动端下层：大尺寸高可视度触控操作按钮 */}
           <button
+            type="button"
             onClick={handleToggleCore}
             disabled={loading || unknown}
-            className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-semibold border transition shadow-sm ${
+            className={`w-full min-h-[48px] py-2.5 px-4 rounded-xl text-sm font-bold flex items-center justify-center space-x-2 transition-all cursor-pointer active:scale-[0.98] ${
               status.running
-                ? "bg-rose-500/10 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400 border-rose-500/30"
-                : "bg-emerald-600 hover:bg-emerald-500 text-white border-emerald-500 shadow-emerald-600/30"
+                ? "bg-rose-50 hover:bg-rose-100/90 text-rose-600 dark:bg-rose-950/30 dark:hover:bg-rose-900/40 dark:text-rose-400 border border-rose-300 dark:border-rose-900/60 shadow-xs"
+                : "bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white border border-emerald-500/30 shadow-md shadow-emerald-600/20"
             }`}
           >
             {loading ? (
-              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+              <RefreshCw className="w-4 h-4 animate-spin" />
             ) : status.running ? (
-              <Square className="w-3.5 h-3.5" />
+              <Square className="w-4 h-4" />
             ) : (
-              <Play className="w-3.5 h-3.5 fill-current" />
+              <Play className="w-4 h-4 fill-current" />
             )}
-            <span className="whitespace-nowrap">{unknown ? (mobile ? "等待 VPN 状态" : "等待核心状态") : mobile ? (status.running ? "断开 VPN" : "连接 VPN") : (status.running ? "停止核心" : "启动核心")}</span>
+            <span>
+              {unknown
+                ? "等待 VPN 状态…"
+                : loading
+                ? "正在切换 VPN…"
+                : status.running
+                ? "断开 VPN"
+                : "连接 VPN"}
+            </span>
           </button>
         </div>
-      </div>
+      ) : (
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          {/* 核心状态信息 */}
+          <div className="flex items-center space-x-3.5">
+            <div className="relative flex items-center justify-center">
+              <div
+                className={`w-3.5 h-3.5 rounded-full ${
+                  !unknown && status.running ? "bg-emerald-500 shadow-sm shadow-emerald-500/50" : "bg-slate-400 dark:bg-slate-600"
+                }`}
+              />
+              {!unknown && status.running && (
+                <div className="absolute -inset-1 bg-emerald-500/30 rounded-full animate-ping pointer-events-none" />
+              )}
+            </div>
+
+            <div>
+              <div className="flex items-center space-x-2.5">
+                <span className="font-bold text-slate-900 dark:text-white text-base tracking-tight">
+                  Mihomo 核心
+                </span>
+                <span
+                  className={`px-2.5 py-0.5 rounded-md text-[11px] font-medium transition-all ${
+                    !unknown && status.running
+                      ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30 font-mono shadow-xs"
+                      : "bg-slate-100 text-slate-600 border border-slate-200 dark:bg-slate-800 dark:text-slate-400 dark:border-slate-700 font-sans"
+                  }`}
+                >
+                  {unknown ? "状态未知" : status.running ? formatUptime(uptimeSeconds) : "已停止"}
+                </span>
+              </div>
+              <div className="flex items-center space-x-2 text-xs text-slate-500 dark:text-slate-400 mt-1.5">
+                <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800/70 border border-slate-200/80 dark:border-slate-700/60 font-mono text-[11px]">
+                  Mixed: <strong className="text-slate-800 dark:text-slate-200 ml-1">{status.mixedPort}</strong>
+                </span>
+                <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800/70 border border-slate-200/80 dark:border-slate-700/60 font-mono text-[11px]">
+                  API: <strong className="text-slate-800 dark:text-slate-200 ml-1">{status.controllerPort}</strong>
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* 控制按钮组 */}
+          <div className="flex items-center space-x-2.5">
+            {/* 嵌入的扩展设置（排除域名/IP） */}
+            {extraAction}
+
+            {/* 系统代理开关 */}
+            {platform.systemProxy && <button
+              onClick={handleToggleSystemProxy}
+              title={proxy.state === "external" ? "点击将系统代理接入本核心" : proxy.message}
+              disabled={!platform.systemProxy || loading || (!status.running && proxy.state !== "enabled" && proxy.state !== "unknown")}
+              className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl text-xs font-semibold border transition shadow-sm ${
+                status.systemProxyEnabled
+                  ? "bg-indigo-600 hover:bg-indigo-500 text-white border-indigo-500 shadow-indigo-600/30"
+                  : "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300/80 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 dark:border-slate-700 disabled:opacity-40"
+              }`}
+            >
+              <Globe className="w-3.5 h-3.5" />
+              <span>系统代理: {loading ? "切换中…" : proxyStateLabel(proxy.state)}</span>
+            </button>}
+
+            {/* 内核启动/关闭 */}
+            <button
+              onClick={handleToggleCore}
+              disabled={loading || unknown}
+              className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-semibold border transition shadow-sm ${
+                status.running
+                  ? "bg-rose-500/10 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400 border-rose-500/30"
+                  : "bg-emerald-600 hover:bg-emerald-500 text-white border-emerald-500 shadow-emerald-600/30"
+              }`}
+            >
+              {loading ? (
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+              ) : status.running ? (
+                <Square className="w-3.5 h-3.5" />
+              ) : (
+                <Play className="w-3.5 h-3.5 fill-current" />
+              )}
+              <span className="whitespace-nowrap">{unknown ? "等待核心状态" : status.running ? "停止核心" : "启动核心"}</span>
+            </button>
+          </div>
+        </div>
+      )}
 
       {unknown && <div role="status" className="text-xs text-amber-700 dark:text-amber-400 flex items-center gap-3">
         <span>{readError || (mobile ? "正在读取 VPN 状态…" : "正在读取核心状态…")}</span>

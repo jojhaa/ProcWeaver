@@ -22,6 +22,9 @@ interface Props {
   status: BundleStatus;
   entry?: BundleEntryState;
   proxyLabels?: Record<string, string>;
+  externalLabel?: string;
+  unavailable?: boolean;
+  compact?: boolean;
   onLaunch: () => void;
   onShortcuts: () => void;
   onToggleSwitch: (instanceId: string, nextState: boolean) => void;
@@ -41,6 +44,9 @@ export const BundleRow: React.FC<Props> = ({
   status,
   entry,
   proxyLabels = {},
+  externalLabel,
+  unavailable = false,
+  compact = false,
   onLaunch,
   onShortcuts,
   onToggleSwitch,
@@ -61,10 +67,12 @@ export const BundleRow: React.FC<Props> = ({
   );
 
   const def = instance.definition;
-  const boundNode = instance.slotBindings.main;
+  const independent = instance.backend === "external";
+  const boundNode = independent ? externalLabel || "未选择代理" : instance.slotBindings.main;
   const isRequested = instance.enabled && Boolean(boundNode);
   const isEnabled = isRequested && status.phase === "applied";
-  const canLaunch = !instance.enabled || isEnabled || status.phase === "saved" || status.phase === "paused";
+  const isObservedActive = isEnabled && (entry?.connectionState === "observed" || entry?.state === "connected");
+  const canLaunch = !unavailable && (independent ? isEnabled : !instance.enabled || isEnabled || status.phase === "saved" || status.phase === "paused");
 
   // 右键菜单与更多操作状态
   const [contextMenuPos, setContextMenuPos] = useState<{ x: number; y: number } | null>(null);
@@ -127,7 +135,15 @@ export const BundleRow: React.FC<Props> = ({
     <div
       onContextMenu={handleContextMenu}
       onDoubleClick={() => onOpenDetail(instance)}
-      className="group relative flex items-center justify-between px-4 py-3 rounded-2xl bg-white dark:bg-slate-900/90 border border-slate-200/80 dark:border-slate-800/80 hover:border-indigo-400/80 dark:hover:border-indigo-500/50 hover:shadow-md transition-all select-none cursor-pointer"
+      className={`group relative flex ${compact ? "flex-wrap gap-3" : ""} items-center justify-between px-4 py-3 rounded-2xl bg-white dark:bg-slate-900/90 border transition-all select-none cursor-pointer ${
+        isObservedActive
+          ? "border-emerald-400/90 dark:border-emerald-500/70 ring-1 ring-emerald-500/30 shadow-md shadow-emerald-500/10"
+          : isEnabled
+          ? "border-indigo-300/80 dark:border-indigo-600/50 hover:border-indigo-400 dark:hover:border-indigo-500 hover:shadow-md"
+          : isRequested
+          ? "border-amber-300 dark:border-amber-700/60"
+          : "border-slate-200/80 dark:border-slate-800/80 hover:border-slate-300 dark:hover:border-slate-700 hover:shadow-sm"
+      }`}
       title="双击查看运行详情，右键呼出管理菜单"
     >
       {/* 左侧区域：开关 + 应用信息 + 模式 */}
@@ -141,7 +157,7 @@ export const BundleRow: React.FC<Props> = ({
           aria-label={`${def.packageName}启用开关`}
           aria-checked={instance.enabled}
           aria-busy={status.phase === "pending"}
-          disabled={status.phase === "pending"}
+          disabled={unavailable || status.phase === "pending"}
           className={`shrink-0 relative inline-flex w-10 h-[22px] items-center rounded-full transition-colors duration-200 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 disabled:cursor-wait disabled:opacity-60 ${
             isEnabled
               ? "bg-emerald-500 shadow-sm"
@@ -178,6 +194,12 @@ export const BundleRow: React.FC<Props> = ({
                   自定义
                 </span>
               )}
+              {isObservedActive && (
+                <span className="text-[9px] px-1.5 py-0.2 rounded font-bold bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30 shrink-0 flex items-center gap-1">
+                  <span className="w-1 h-1 rounded-full bg-emerald-500 animate-ping" />
+                  活跃分流中
+                </span>
+              )}
             </div>
 
             {/* 状态小灯与简讯 */}
@@ -190,6 +212,8 @@ export const BundleRow: React.FC<Props> = ({
                   isEnabled
                     ? entry?.connectionState === "error"
                       ? "bg-amber-400"
+                      : isObservedActive
+                      ? "bg-emerald-500 shadow-sm shadow-emerald-500/50 ring-2 ring-emerald-400/40 animate-pulse"
                       : "bg-emerald-500 shadow-xs"
                     : isRequested
                     ? "bg-amber-500"
@@ -197,10 +221,10 @@ export const BundleRow: React.FC<Props> = ({
                 }`}
               />
               <span className="truncate">
-                {isEnabled
+                {unavailable ? "当前模式不可用，原绑定保留" : isEnabled
                   ? entry?.message
                     ? entry.message.slice(0, 16)
-                    : "已接管运行"
+                    : independent ? "独立入口已就绪" : "核心规则已应用"
                   : status.phase === "pending"
                   ? "正在确认变更"
                   : status.phase === "error"
@@ -218,8 +242,15 @@ export const BundleRow: React.FC<Props> = ({
                 {processes.length}进程/{def.domains?.length || 0}域名
               </span>
             </div>
+            {compact && !unavailable && <p className="mt-1 text-[10px] text-slate-500 dark:text-slate-400 flex flex-wrap gap-x-3 gap-y-1">
+              <span>进程：{!entry ? "检测中" : entry.state === "not_running" || entry.state === "idle" ? "待发现" : "已发现"}</span>
+              <span>入口：{isEnabled ? "就绪" : status.phase === "error" ? "异常" : "未就绪"}</span>
+              <span>连接：{entry?.connectionState === "observed" ? "有历史记录" : entry?.connectionState === "error" ? "失败" : "待观察"}</span>
+            </p>}
           </div>
         </div>
+
+        {compact && <button type="button" onClick={() => onOpenDetail(instance)} className="shrink-0 text-xs text-indigo-600 dark:text-indigo-400 focus-visible:ring-2 focus-visible:ring-indigo-500">详情</button>}
 
         {/* 3. 分流模式 */}
         <div className="shrink-0 hidden sm:block">
@@ -248,10 +279,10 @@ export const BundleRow: React.FC<Props> = ({
               ? "bg-emerald-50/80 hover:bg-emerald-100/80 dark:bg-emerald-950/40 dark:hover:bg-emerald-900/60 border-emerald-500/40 text-emerald-700 dark:text-emerald-300 shadow-2xs"
               : "bg-slate-50 hover:bg-amber-50 dark:bg-slate-800/80 dark:hover:bg-slate-800 border-slate-200 dark:border-slate-700 hover:border-amber-400 text-slate-500 dark:text-slate-400"
           }`}
-          title="点击更换该业务包的出站节点"
+          title={independent || unavailable ? "选择此业务包的外部代理" : "点击更换该业务包的出站节点"}
         >
           <Network className="w-3 h-3 shrink-0 text-emerald-600 dark:text-emerald-400" />
-          <span className="truncate">{boundNode ? proxyLabels[boundNode] || boundNode : "选择出口..."}</span>
+          <span className="truncate">{unavailable ? "选择外部代理" : boundNode ? proxyLabels[boundNode] || boundNode : "选择出口..."}</span>
           <span className="text-[10px] text-slate-400 shrink-0">▾</span>
         </button>
 

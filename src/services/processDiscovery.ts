@@ -1,6 +1,7 @@
 import type { ProcessEntry } from "../types/routingOverrides";
 import type { BundleProcessBinding, BundleProcessMember } from "../types/businessBundle";
 import type { ConnectionItem } from "../api/connections";
+import type { ExternalRecord } from "../types/externalProxy";
 import type { BundlePlatform } from "../types/platform";
 import { executableName, processKey } from "../utils/bundlePlatform";
 
@@ -96,6 +97,18 @@ export function observationScope(entries: ProcessEntry[], members: BundleProcess
 }
 
 export interface DomainCandidate { domain: string; connections: number; lastSeen: number; sources: string[]; processes: string[]; confirmed: boolean }
+export function externalDiscoveryConnections(records: ExternalRecord[], since: number): ConnectionItem[] {
+  return records.filter(r => r.at >= since && r.target.includes(":")) .map(r => {
+    const split = r.target.lastIndexOf(":");
+    const path = /[\\/]/.test(r.process) ? r.process : "";
+    const owner = [...new TextEncoder().encode(r.bundleId)].map(b => b.toString(16).padStart(2, "0")).join("");
+    return { id: `external:${r.bundleId}:${r.generation}:${r.id}`, metadata: {
+      network: "", type: "external", sourceIP: "", destinationIP: "", sourcePort: "",
+      destinationPort: r.target.slice(split + 1), host: r.target.slice(0, split), processPath: path,
+      process: path ? "" : r.process, inboundName: `PW-${owner}-entry`,
+    }, upload: r.uploaded, download: r.downloaded, start: new Date(r.at).toISOString(), chains: [], rule: "", rulePayload: "" };
+  });
+}
 export function detectedDomain(raw: string): string | null {
   const domain = raw.trim().toLowerCase().replace(/\.$/, "");
   if (!domain.includes(".") || domain.length > 253 || /^[\d.]+$/.test(domain)) return null;
@@ -116,10 +129,10 @@ function attribution(item: ConnectionItem, scope: ObservationScope, includeBundl
   if (path && scope.paths.has(processKey(path, scope.platform))) {
     const ambiguous = scope.ambiguousPaths.has(processKey(path, scope.platform));
     return { process: executableName(path), confirmed: !ambiguous,
-      source: ambiguous ? "同路径其他实例存在，归属待核实" : relay ? "WinDivert 程序路径入口（非 PID 核验）" : "核心程序路径（非 PID 核验）" };
+      source: ambiguous ? "同路径其他实例存在，归属待核实" : m.type === "external" ? "独立代理连接路径（非 PID 核验）" : relay ? "WinDivert 程序路径入口（非 PID 核验）" : "核心程序路径（非 PID 核验）" };
   }
   // A conflicting exact path must not degrade to a same-name match.
-  if (!path && name && scope.names.has(processKey(name, scope.platform))) return { process: name, confirmed: false, source: relay ? "WinDivert 进程名入口（路径未核实）" : "核心进程名（路径未核实）" };
+  if (!path && name && scope.names.has(processKey(name, scope.platform))) return { process: name, confirmed: false, source: m.type === "external" ? "独立代理进程名（路径未核实）" : relay ? "WinDivert 进程名入口（路径未核实）" : "核心进程名（路径未核实）" };
   if (!relay && includeBundle && scope.bundleInbound && m.inboundName === scope.bundleInbound) return { process: "业务包入口", confirmed: false, source: "业务包入口（未定位进程）" };
   return null;
 }

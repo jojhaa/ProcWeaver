@@ -281,6 +281,7 @@ pub async fn emergency_repair_network() -> Result<String, String> {
 #[tauri::command]
 pub async fn toggle_dns_guard(enable: bool) -> Result<bool, String> {
     let _lifecycle = super::process::LIFECYCLE.lock().await;
+    if enable { crate::function_mode::require_full()?; }
     if crate::shutdown::in_progress() { return Err("正在恢复网络并退出，请稍候".into()); }
     if enable {
         enable_dns_guard().await?;

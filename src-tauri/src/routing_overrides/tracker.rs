@@ -252,10 +252,11 @@ impl Notifications {
         let effective = config.effective();
         let health = (state.monitor_state, running);
         let refresh_all = self.health != Some(health);
-        let current: BTreeMap<_, _> = effective.bundles.iter().filter(|b| b.enabled).map(|b| {
+        let mut current: BTreeMap<_, _> = effective.bundles.iter().filter(|b| b.enabled).map(|b| {
             let rules: Vec<_> = effective.process_rules.iter().filter(|r| r.enabled && super::bundles::owner(&r.id, &effective.bundles).is_some_and(|owner| owner.id == b.id)).collect();
             (b.id.clone(), bundle_fingerprint(b, &rules, state))
         }).collect();
+        current.extend(crate::external_proxy::monitor_fingerprints(state));
         let mut changed: Vec<_> = current.iter().filter(|(id, value)| self.bundles.get(*id) != Some(*value)).map(|(id, _)| id.clone()).collect();
         changed.extend(self.bundles.keys().filter(|id| !current.contains_key(*id)).cloned());
         self.health = Some(health); self.bundles = current;
@@ -279,11 +280,12 @@ pub async fn run(notify: impl Fn(MonitorChange) + Send + 'static) {
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticks.tick().await;
-        let config = match super::read() { Ok(c) => c, Err(e) => {
-            TRACKER.lock().unwrap_or_else(|p| p.into_inner()).apply_error = Some(e); continue;
-        } };
+        let config = if !crate::function_mode::core_features_enabled() { Overrides::default() } else { match super::read() { Ok(c) => c, Err(e) => {
+            TRACKER.lock().unwrap_or_else(|p| p.into_inner()).apply_error = Some(e);
+            if crate::external_proxy::monitoring_required() { Overrides::default() } else { continue; }
+        } } };
         // 本轮扩展 Windows 全局监控；macOS 保持既有快照跟踪的启用条件。
-        let enabled = if cfg!(windows) { monitoring_required(&config) } else {
+        let enabled = if cfg!(windows) { monitoring_required(&config) || crate::external_proxy::monitoring_required() } else {
             let effective = config.effective();
             cfg!(target_os = "macos") && crate::commands::process::ACTIVE.load(Ordering::SeqCst)
                 && effective.process_enabled && effective.process_rules.iter().any(|r| r.enabled && r.include_descendants)

@@ -317,9 +317,11 @@ pub async fn save(config: Overrides, selections: Vec<Selection>) -> Result<View,
     #[cfg(target_os = "android")]
     let config = config.without_bundles();
     let _lock = process::LIFECYCLE.lock().await;
+    crate::function_mode::require_full()?;
     let old = read()?;
     if config.revision != old.revision { return Err("规则已被其他页面修改，请重新加载后再保存".into()); }
     let mut config = normalize(config)?;
+    crate::external_proxy::check_core_conflicts(&config)?;
     let active = current_source().0;
     let preserved = foreign_targets::saved_bindings(&old, &active);
     if foreign_targets::saved_bindings(&config, &active).iter().any(|target| !preserved.contains(target)) {
@@ -339,7 +341,15 @@ pub async fn save(config: Overrides, selections: Vec<Selection>) -> Result<View,
     }
     config.revision = old.revision.checked_add(1).ok_or("规则修订号已耗尽")?;
     let old_runtime = if process::ACTIVE.load(Ordering::SeqCst) { Some(std::fs::read_to_string(crate::storage::data_dir().join("core_data/config.yaml")).map_err(|_| "读取恢复配置失败")?) } else { None };
-    reapply(&config).await?;
+    // Removing/disabling bundle rules while offline must not require a Mihomo
+    // executable. New effective rules still take the existing validation path.
+    let removal_only = !process::ACTIVE.load(Ordering::SeqCst)
+        && config.process_enabled == old.process_enabled && config.dns_enabled == old.dns_enabled
+        && config.retain_foreign_targets == old.retain_foreign_targets
+        && config.process_rules.iter().all(|r| old.process_rules.contains(r))
+        && config.dns_rules.iter().all(|r| old.dns_rules.iter().any(|o| serde_json::to_value(o).ok() == serde_json::to_value(r).ok()))
+        && config.bundles.iter().all(|b| !b.enabled || old.bundles.iter().any(|o| serde_json::to_value(o).ok() == serde_json::to_value(b).ok()));
+    if !removal_only { reapply(&config).await?; }
     let bytes = serde_json::to_vec_pretty(&config).map_err(|_| "规则序列化失败")?;
     if let Err(e) = crate::storage::replace_atomic(&path(), &bytes) {
         if let Some(raw) = old_runtime { apply_runtime(&raw).await.map_err(|restore| format!("保存失败：{e}；恢复失败：{restore}"))?; }

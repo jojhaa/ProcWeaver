@@ -62,6 +62,7 @@ import {
   Eye,
   EyeOff,
   ScrollText,
+  ChevronDown,
 } from "lucide-react";
 
 // 格式化字节为易读格式 (GB / MB)
@@ -127,6 +128,17 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
     }
   });
   const [sortBy, setSortBy] = useState<"default" | "latency-asc" | "name-asc">("default");
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const addMenuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const handleOutsideClick = (e: MouseEvent) => {
+      if (addMenuRef.current && !addMenuRef.current.contains(e.target as Node)) {
+        setAddMenuOpen(false);
+      }
+    };
+    if (addMenuOpen) document.addEventListener("mousedown", handleOutsideClick);
+    return () => document.removeEventListener("mousedown", handleOutsideClick);
+  }, [addMenuOpen]);
 
   // 自建智能策略组规则
   const [smartRules, setSmartRules] = useState<SmartGroupRule[]>([]);
@@ -953,23 +965,23 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
           {/* 第一行：搜索 + 排除超时 + 排序 */}
           <div className="flex items-center gap-2 w-full">
             <div className="relative flex-1 min-w-0">
-              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
               <input
                 type="text"
                 aria-label="搜索节点"
                 placeholder="搜索节点、地区、协议..."
                 value={searchKeyword}
                 onChange={(e) => setSearchKeyword(e.target.value)}
-                className="w-full pl-8 pr-7 py-1.5 text-xs bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700/80 rounded-xl focus:outline-hidden focus:border-indigo-500 transition"
+                className="w-full pl-9 pr-9 py-2 text-xs bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700/80 rounded-xl focus:outline-hidden focus:border-indigo-500 transition"
               />
               {searchKeyword && (
                 <button
                   type="button"
                   onClick={() => setSearchKeyword("")}
                   aria-label="清空搜索"
-                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-1"
+                  className="absolute right-1 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 w-8 h-8 flex items-center justify-center cursor-pointer active:scale-90 transition-transform"
                 >
-                  <X className="w-3.5 h-3.5" />
+                  <X className="w-4 h-4" />
                 </button>
               )}
             </div>
@@ -983,7 +995,7 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
                   localStorage.setItem("netbox_hide_timeout_nodes", String(next));
                 } catch {}
               }}
-              className={`px-2.5 py-1.5 text-xs rounded-xl border font-medium transition cursor-pointer shrink-0 ${
+              className={`h-9 px-3 text-xs rounded-xl border font-medium transition cursor-pointer shrink-0 active:scale-95 ${
                 hideTimeout
                   ? "bg-indigo-50 text-indigo-600 border-indigo-200 dark:bg-indigo-600/15 dark:text-indigo-400 dark:border-indigo-500/30"
                   : "bg-slate-100 text-slate-600 border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700"
@@ -997,7 +1009,7 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
               aria-label="节点排序"
               value={sortBy}
               onChange={(e) => setSortBy(e.target.value as any)}
-              className="px-2 py-1.5 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 shrink-0 font-medium cursor-pointer"
+              className="h-9 px-2 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 shrink-0 font-medium cursor-pointer"
             >
               <option value="default">默认</option>
               <option value="latency-asc">延迟优先</option>
@@ -1006,7 +1018,7 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
           </div>
 
           {/* 数量与操作在窄屏下自动分行，避免状态被按钮覆盖。 */}
-          <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 text-xs pt-1 border-t border-slate-100 dark:border-slate-800/60 text-slate-500 dark:text-slate-400">
+          <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1.5 text-xs pt-1 border-t border-slate-100 dark:border-slate-800/60 text-slate-500 dark:text-slate-400">
             <div className="flex items-center gap-1.5 min-w-[130px] flex-1 truncate">
               <span className="font-semibold text-slate-800 dark:text-slate-200">
                 {filteredNodes.length < realNodes.length ? `${filteredNodes.length}/${realNodes.length}` : `${filteredNodes.length}`} 个节点
@@ -1017,13 +1029,13 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
               </span>
             </div>
 
-            <div className="flex items-center gap-2 shrink-0 ml-auto">
+            <div className="flex items-center gap-1.5 shrink-0 ml-auto">
               {unprobedCount > 0 && (
                 <button
                   type="button"
                   onClick={() => void handleProbeAllHealth(filteredNodes.filter(n => !persistedNodeRegions[n.name] && !healthCache[n.name]?.countryCode).map(n => n.name))}
                   disabled={probingAll || anySingleProbe}
-                  className="text-[11px] text-purple-600 dark:text-purple-400 font-semibold flex items-center gap-0.5"
+                  className="h-7 px-2.5 text-xs text-purple-600 dark:text-purple-400 font-semibold flex items-center gap-1 rounded-lg border border-purple-200/80 dark:border-purple-800/60 bg-purple-50/50 dark:bg-purple-950/30 active:scale-95 transition-transform cursor-pointer"
                   title="一键体检待确认真实出口的节点"
                 >
                   <Shield size={12} className={probingAll ? "animate-spin" : ""} />
@@ -1034,14 +1046,14 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
                 type="button"
                 aria-pressed={mobileSelecting}
                 onClick={() => { setMobileSelecting(prev => !prev); setSelectedNodes([]); }}
-                className={`text-[11px] px-2 py-0.5 rounded-lg border font-medium ${mobileSelecting ? "bg-indigo-50 border-indigo-300 text-indigo-700 dark:bg-indigo-950/40 dark:border-indigo-700 dark:text-indigo-300" : "border-slate-200 dark:border-slate-700"}`}
+                className={`h-7 px-2.5 rounded-lg border text-xs font-semibold flex items-center gap-1 active:scale-95 transition-transform cursor-pointer ${mobileSelecting ? "bg-indigo-50 border-indigo-300 text-indigo-700 dark:bg-indigo-950/40 dark:border-indigo-700 dark:text-indigo-300 shadow-xs" : "border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300"}`}
               >
                 {mobileSelecting ? "完成" : "多选"}
               </button>
               <button
                 type="button"
                 onClick={() => setMobileToolsOpen(prev => !prev)}
-                className={`text-[11px] px-2 py-0.5 rounded-lg border font-medium transition cursor-pointer ${
+                className={`h-7 px-2.5 rounded-lg border text-xs font-semibold flex items-center gap-1 transition active:scale-95 cursor-pointer ${
                   mobileToolsOpen
                     ? "bg-indigo-50 border-indigo-200 text-indigo-600 dark:bg-indigo-950/40 dark:border-indigo-800 dark:text-indigo-400"
                     : "bg-slate-100 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300"
@@ -1052,7 +1064,7 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
               <button
                 type="button"
                 onClick={openSubscriptions}
-                className="text-[11px] text-indigo-600 dark:text-indigo-400 font-semibold flex items-center gap-0.5"
+                className="h-7 px-2.5 rounded-lg border border-indigo-200 dark:border-indigo-800/80 bg-indigo-50/60 dark:bg-indigo-950/40 text-xs text-indigo-600 dark:text-indigo-400 font-semibold flex items-center gap-1 active:scale-95 transition-transform cursor-pointer"
               >
                 <Radio size={12} />
                 <span>订阅</span>
@@ -1080,15 +1092,15 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
 
           {/* 高级工具面板（展开时展示） */}
           {mobileToolsOpen && (
-            <div className="pt-2 pb-1 border-t border-slate-200/80 dark:border-slate-800/80 flex flex-wrap items-center gap-2">
+            <div className="pt-2 pb-1 border-t border-slate-200/80 dark:border-slate-800/80 space-y-2">
               {coreMode === "rule" && (
                 <label className="flex items-center gap-1.5 w-full min-w-0 text-xs text-slate-600 dark:text-slate-300">
-                  <span className="shrink-0">切换策略组:</span>
+                  <span className="shrink-0 font-medium">策略组:</span>
                   <select
                     aria-label="切换策略组"
                     value={mobileSelectionGroup(groups, coreMode, selectionGroup)?.name ?? ""}
                     onChange={event => setSelectionGroup(event.target.value)}
-                    className="min-w-0 flex-1 px-2 py-1 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800"
+                    className="min-w-0 flex-1 px-2.5 py-1.5 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800"
                   >
                     <option value="" disabled>请选择策略组</option>
                     {groups.filter(g => g.name !== "GLOBAL" && /^(selector|select)$/i.test(g.type)).map(g => (
@@ -1097,61 +1109,67 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
                   </select>
                 </label>
               )}
-              <select
-                aria-label="节点来源"
-                value={sourceFilter}
-                onChange={e => setSourceFilter(e.target.value)}
-                className="px-2.5 py-1 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800"
-              >
-                <option value="all">全部来源</option>
-                <option value="subscription">订阅节点</option>
-                <option value="local">本地节点</option>
-              </select>
-              <button
-                type="button"
-                disabled={localNodes.busy || !localNodes.view}
-                onClick={localNodes.openNew}
-                className="flex items-center gap-1 px-2.5 py-1 rounded-xl border border-indigo-200 dark:border-indigo-700 text-indigo-600 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950/30 text-xs disabled:opacity-50"
-              >
-                <Plus size={13} />
-                <span>新增节点</span>
-              </button>
-              <button
-                type="button"
-                disabled={localNodes.busy || !localNodes.view}
-                onClick={localNodes.openImport}
-                className="px-2.5 py-1 rounded-xl border border-slate-200 dark:border-slate-700 text-xs"
-              >
-                导入节点
-              </button>
-              <button
-                type="button"
-                onClick={handleTestAll}
-                disabled={testingAll || realNodes.length === 0 || catalogOffline}
-                className="flex items-center space-x-1 px-2.5 py-1 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 text-xs font-semibold disabled:opacity-50"
-              >
-                <RefreshCw className={`w-3 h-3 ${testingAll ? "animate-spin text-indigo-500" : ""}`} />
-                <span>{testingAll ? "测速中…" : "全量测速"}</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleProbeAllHealth()}
-                disabled={probingAll || anySingleProbe || realNodes.length === 0}
-                className="flex items-center space-x-1 px-2.5 py-1 rounded-xl bg-purple-50 text-purple-700 dark:bg-purple-600/15 dark:text-purple-300 border border-purple-200 dark:border-purple-800/60 text-xs font-semibold disabled:opacity-50"
-              >
-                <Shield className={`w-3 h-3 ${probingAll ? "animate-spin text-purple-600 dark:text-purple-400" : "text-purple-500"}`} />
-                <span>{probingAll ? `体检 ${probeProgress?.completed || 0}/${probeProgress?.total || realNodes.length}` : "全量 IP 体检"}</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  window.dispatchEvent(new CustomEvent("netbox-navigate-tab", { detail: "logs" }));
-                }}
-                className="flex items-center space-x-1 px-2.5 py-1 rounded-xl bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300 border border-slate-200 dark:border-slate-700 text-xs"
-              >
-                <ScrollText className="w-3 h-3 text-indigo-500" />
-                <span>日志</span>
-              </button>
+              <div className="grid grid-cols-2 gap-2">
+                <select
+                  aria-label="节点来源"
+                  value={sourceFilter}
+                  onChange={e => setSourceFilter(e.target.value)}
+                  className="w-full px-2.5 py-1.5 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 font-medium cursor-pointer"
+                >
+                  <option value="all">全部来源</option>
+                  <option value="subscription">订阅节点</option>
+                  <option value="local">本地节点</option>
+                </select>
+                <button
+                  type="button"
+                  onClick={handleTestAll}
+                  disabled={testingAll || realNodes.length === 0 || catalogOffline}
+                  className="w-full flex items-center justify-center space-x-1 px-2.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 text-xs font-semibold disabled:opacity-50 active:scale-95 transition-transform cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${testingAll ? "animate-spin text-indigo-500" : ""}`} />
+                  <span>{testingAll ? "测速中…" : "全量测速"}</span>
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  disabled={localNodes.busy || !localNodes.view}
+                  onClick={localNodes.openNew}
+                  className="flex items-center justify-center gap-1 px-2.5 py-1.5 rounded-xl border border-indigo-200 dark:border-indigo-700 text-indigo-600 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950/30 text-xs font-semibold disabled:opacity-50 active:scale-95 transition-transform cursor-pointer"
+                >
+                  <Plus size={13} />
+                  <span>新增节点</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={localNodes.busy || !localNodes.view}
+                  onClick={localNodes.openImport}
+                  className="flex items-center justify-center px-2.5 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-300 disabled:opacity-50 active:scale-95 transition-transform cursor-pointer"
+                >
+                  导入节点
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handleProbeAllHealth()}
+                  disabled={probingAll || anySingleProbe || realNodes.length === 0}
+                  className="flex items-center justify-center space-x-1 px-2.5 py-1.5 rounded-xl bg-purple-50 text-purple-700 dark:bg-purple-600/15 dark:text-purple-300 border border-purple-200 dark:border-purple-800/60 text-xs font-semibold disabled:opacity-50 active:scale-95 transition-transform cursor-pointer"
+                >
+                  <Shield className={`w-3.5 h-3.5 ${probingAll ? "animate-spin text-purple-600 dark:text-purple-400" : "text-purple-500"}`} />
+                  <span>{probingAll ? `体检 ${probeProgress?.completed || 0}/${probeProgress?.total || realNodes.length}` : "全量 IP 体检"}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    window.dispatchEvent(new CustomEvent("netbox-navigate-tab", { detail: "logs" }));
+                  }}
+                  className="flex items-center justify-center space-x-1 px-2.5 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-400 text-xs font-semibold active:scale-95 transition-transform cursor-pointer"
+                >
+                  <ScrollText size={13} />
+                  <span>查看日志</span>
+                </button>
+              </div>
               <button
                 type="button"
                 onClick={(event) => {
@@ -1159,19 +1177,20 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
                   setEditingRule(null);
                   setSmartModalOpen(true);
                 }}
-                className="flex items-center space-x-1 px-2.5 py-1 rounded-xl bg-indigo-600 text-white text-xs font-semibold"
+                className="w-full flex items-center justify-center space-x-1.5 px-3 py-2 rounded-xl bg-indigo-600 text-white text-xs font-semibold active:scale-[0.98] transition-transform cursor-pointer shadow-xs"
               >
-                <Plus className="w-3 h-3" />
+                <Plus className="w-3.5 h-3.5" />
                 <span>新建自建线路</span>
               </button>
             </div>
           )}
         </div>
       ) : (
-        <div className="px-6 py-3.5 border-b border-slate-200/90 dark:border-slate-800/80 bg-white/70 dark:bg-slate-900/40 backdrop-blur-md flex flex-wrap items-center justify-between gap-3 shrink-0">
-          <div className="flex items-center space-x-2.5 flex-1 min-w-[280px] max-w-md">
+        <div className="px-5 py-2.5 border-b border-slate-200/90 dark:border-slate-800/80 bg-white/70 dark:bg-slate-900/40 backdrop-blur-md flex items-center justify-between gap-3 shrink-0 relative z-20 shadow-2xs overflow-x-auto">
+          {/* 左侧：搜索 + 来源筛选 + 超时过滤 + 排序 (单行规整排布，严禁断行错位) */}
+          <div className="flex items-center gap-2 min-w-0 flex-1">
             {/* 搜索框 */}
-            <div className="relative flex-1">
+            <div className="relative flex-1 min-w-[130px] max-w-[220px]">
               <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
               <input
                 type="text"
@@ -1179,129 +1198,198 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
                 placeholder="搜索节点名称、地区、协议..."
                 value={searchKeyword}
                 onChange={(e) => setSearchKeyword(e.target.value)}
-                className="w-full pl-9 pr-3 py-1.5 text-xs bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700/80 rounded-xl focus:outline-hidden focus:border-indigo-500 transition"
+                className="w-full pl-9 pr-7 py-1.5 text-xs bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700/80 rounded-xl focus:outline-hidden focus:border-indigo-500 transition"
               />
               {searchKeyword && (
                 <button
                   type="button"
                   onClick={() => setSearchKeyword("")}
                   aria-label="清空搜索"
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-0.5"
                 >
                   <X className="w-3.5 h-3.5" />
                 </button>
               )}
             </div>
 
-            {/* 排序筛选 */}
-            <div className="flex items-center space-x-1.5 shrink-0">
-              <button
-                type="button"
-                onClick={() => {
-                  const next = !hideTimeout;
-                  setHideTimeout(next);
-                  try {
-                    localStorage.setItem("netbox_hide_timeout_nodes", String(next));
-                  } catch {}
-                }}
-                className={`px-2.5 py-1.5 text-xs rounded-xl border font-medium transition cursor-pointer ${
-                  hideTimeout
-                    ? "bg-indigo-50 text-indigo-600 border-indigo-200 dark:bg-indigo-600/15 dark:text-indigo-400 dark:border-indigo-500/30"
-                    : "bg-slate-100 text-slate-600 border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700"
-                }`}
-                title="过滤测速超时的无效节点"
-              >
-                排除超时
-              </button>
+            {/* 来源下拉 */}
+            <select
+              aria-label="节点来源"
+              value={sourceFilter}
+              onChange={(e) => setSourceFilter(e.target.value)}
+              className="px-2.5 py-1.5 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-medium cursor-pointer shrink-0"
+            >
+              <option value="all">全部来源</option>
+              <option value="subscription">仅订阅节点</option>
+              <option value="local">仅本地自建</option>
+            </select>
 
-              <select
-                aria-label="节点排序"
-                value={sortBy}
-                onChange={(e) => setSortBy(e.target.value as any)}
-                className="px-2.5 py-1.5 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-medium cursor-pointer"
-              >
-                <option value="default">默认排序</option>
-                <option value="latency-asc">延迟优先</option>
-                <option value="name-asc">名称排序</option>
-              </select>
-            </div>
+            {/* 排除超时 */}
+            <button
+              type="button"
+              onClick={() => {
+                const next = !hideTimeout;
+                setHideTimeout(next);
+                try {
+                  localStorage.setItem("netbox_hide_timeout_nodes", String(next));
+                } catch {}
+              }}
+              className={`px-2.5 py-1.5 text-xs rounded-xl border font-medium transition cursor-pointer select-none shrink-0 whitespace-nowrap ${
+                hideTimeout
+                  ? "bg-indigo-50 text-indigo-600 border-indigo-200 dark:bg-indigo-600/15 dark:text-indigo-400 dark:border-indigo-500/30 font-semibold"
+                  : "bg-slate-100 text-slate-600 border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700"
+              }`}
+              title="过滤测速超时的无效节点"
+            >
+              排除超时
+            </button>
+
+            {/* 排序方式 */}
+            <select
+              aria-label="节点排序"
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value as any)}
+              className="px-2.5 py-1.5 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-medium cursor-pointer shrink-0"
+            >
+              <option value="default">默认排序</option>
+              <option value="latency-asc">延迟优先</option>
+              <option value="name-asc">名称排序</option>
+            </select>
           </div>
 
-          <div className="contents">
-            <div className="flex flex-wrap items-center gap-2">
-              <select aria-label="节点来源" value={sourceFilter} onChange={e => setSourceFilter(e.target.value)} className="px-2.5 py-1.5 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800">
-                <option value="all">全部来源</option><option value="subscription">订阅节点</option><option value="local">本地节点</option>
-              </select>
-              <button type="button" disabled={localNodes.busy || !localNodes.view} onClick={localNodes.openNew} className="flex items-center gap-1 px-3 py-1.5 rounded-xl border border-indigo-200 dark:border-indigo-700 text-indigo-600 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950/30 text-xs disabled:opacity-50"><Plus size={14} />新增节点</button>
-              <button type="button" disabled={localNodes.busy || !localNodes.view} onClick={localNodes.openImport} className="px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs">导入节点</button>
-              <button
-                type="button"
-                onClick={handleTestAll}
-                disabled={testingAll || realNodes.length === 0 || catalogOffline}
-                className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 text-xs font-semibold transition shadow-2xs disabled:opacity-50 cursor-pointer"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${testingAll ? "animate-spin text-indigo-500" : ""}`} />
-                <span>{testingAll ? "全量测速中..." : "全量测速"}</span>
-              </button>
+          {/* 右侧：诊断运维 + 订阅入口 + 聚合添加菜单 */}
+          <div className="flex items-center space-x-2 shrink-0">
+            {/* 1. 全量测速 */}
+            <button
+              type="button"
+              onClick={handleTestAll}
+              disabled={testingAll || realNodes.length === 0 || catalogOffline}
+              className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 text-xs font-semibold transition shadow-2xs disabled:opacity-50 cursor-pointer"
+              title="测试全部节点真实往返握手延迟"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${testingAll ? "animate-spin text-indigo-500" : ""}`} />
+              <span>{testingAll ? "测速中..." : "全量测速"}</span>
+            </button>
 
-              <button
-                type="button"
-                onClick={() => void handleProbeAllHealth()}
-                disabled={probingAll || anySingleProbe || realNodes.length === 0}
-                className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-purple-50 hover:bg-purple-100 text-purple-700 dark:bg-purple-600/15 dark:hover:bg-purple-600/25 dark:text-purple-300 border border-purple-200 dark:border-purple-800/60 text-xs font-semibold transition shadow-2xs disabled:opacity-50 cursor-pointer"
-                title="检测全部未忽略节点，不受当前搜索和来源筛选影响"
-              >
-                <Shield className={`w-3.5 h-3.5 ${probingAll ? "animate-spin text-purple-600 dark:text-purple-400" : "text-purple-500"}`} />
-                <span>
-                  {probingAll
-                    ? `体检中 ${probeProgress?.completed || 0}/${probeProgress?.total || realNodes.length}`
-                    : "全量 IP 体检"}
+            {/* 2. 全量 IP 体检 */}
+            <button
+              type="button"
+              onClick={() => void handleProbeAllHealth()}
+              disabled={probingAll || anySingleProbe || realNodes.length === 0}
+              className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-purple-50 hover:bg-purple-100 text-purple-700 dark:bg-purple-600/15 dark:hover:bg-purple-600/25 dark:text-purple-300 border border-purple-200 dark:border-purple-800/60 text-xs font-semibold transition shadow-2xs disabled:opacity-50 cursor-pointer"
+              title="深度检测全部节点的真实出口 IP、风控评分与住宅/机房属性"
+            >
+              <Shield className={`w-3.5 h-3.5 ${probingAll ? "animate-spin text-purple-600 dark:text-purple-400" : "text-purple-500"}`} />
+              <span>
+                {probingAll
+                  ? `体检中 ${probeProgress?.completed || 0}/${probeProgress?.total || realNodes.length}`
+                  : "IP 体检"}
+              </span>
+            </button>
+
+            {/* 3. 日志 */}
+            <button
+              type="button"
+              onClick={() => {
+                window.dispatchEvent(
+                  new CustomEvent("netbox-navigate-tab", { detail: "logs" })
+                );
+              }}
+              className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 text-xs transition shadow-2xs cursor-pointer"
+              title="查看测速、IP 体检与网络运行日志"
+            >
+              <ScrollText className="w-3.5 h-3.5 text-indigo-500" />
+            </button>
+
+            {/* 分隔线 */}
+            <div className="h-4 w-px bg-slate-200 dark:bg-slate-700 mx-1 hidden sm:block" />
+
+            {/* 4. 订阅管理 */}
+            <button
+              type="button"
+              onClick={() => {
+                openSubscriptions();
+                if (!mobile) void runSubscriptionAction(async () => { setProfiles(await getProfiles()); });
+              }}
+              className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-600 dark:bg-indigo-600/15 dark:hover:bg-indigo-600/25 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-500/30 text-xs font-semibold transition shadow-2xs cursor-pointer"
+            >
+              <Radio className="w-3.5 h-3.5" />
+              <span>订阅管理</span>
+              {profiles.length > 0 && (
+                <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-indigo-200/80 dark:bg-indigo-500/40 font-mono">
+                  {profiles.length}
                 </span>
-              </button>
+              )}
+            </button>
 
+            {/* 5. 聚合操作：添加与自建 ▾ */}
+            <div className="relative inline-block" ref={addMenuRef}>
               <button
                 type="button"
-                onClick={() => {
-                  window.dispatchEvent(
-                    new CustomEvent("netbox-navigate-tab", { detail: "logs" })
-                  );
-                }}
-                className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 text-xs font-semibold transition shadow-2xs cursor-pointer"
-                title="查看测速、IP 体检与网络运行日志"
-              >
-                <ScrollText className="w-3.5 h-3.5 text-indigo-500" />
-                <span>测速/IP日志</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  openSubscriptions();
-                  if (!mobile) void runSubscriptionAction(async () => { setProfiles(await getProfiles()); });
-                }}
-                className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-600 dark:bg-indigo-600/15 dark:hover:bg-indigo-600/25 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-500/30 text-xs font-semibold transition shadow-2xs cursor-pointer"
-              >
-                <Radio className="w-3.5 h-3.5" />
-                <span>订阅管理</span>
-                {profiles.length > 0 && (
-                  <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-indigo-200/80 dark:bg-indigo-500/40 font-mono">
-                    {profiles.length}
-                  </span>
-                )}
-              </button>
-
-              <button
-                type="button"
-                onClick={(event) => {
-                  smartTrigger.current = event.currentTarget;
-                  setEditingRule(null);
-                  setSmartModalOpen(true);
-                }}
-                className="flex items-center space-x-1 px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-md shadow-indigo-600/20 transition cursor-pointer"
+                onClick={() => setAddMenuOpen(!addMenuOpen)}
+                className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-md shadow-indigo-600/20 transition cursor-pointer select-none"
               >
                 <Plus className="w-3.5 h-3.5" />
-                <span>新建自建线路</span>
+                <span>节点与自建</span>
+                <ChevronDown className={`w-3 h-3 text-white/80 transition-transform duration-200 ${addMenuOpen ? "rotate-180" : ""}`} />
               </button>
+
+              {/* 下拉浮层卡片 */}
+              {addMenuOpen && (
+                <div className="absolute right-0 top-full mt-1.5 z-50 w-52 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-2xl p-1.5 text-xs space-y-1 animate-in fade-in zoom-in-95 duration-100 font-sans">
+                  <div className="px-2.5 py-1.5 text-[10px] text-slate-400 font-semibold uppercase tracking-wider border-b border-slate-100 dark:border-slate-800/80">
+                    管理与自定义
+                  </div>
+                  <button
+                    type="button"
+                    disabled={localNodes.busy || !localNodes.view}
+                    onClick={() => {
+                      setAddMenuOpen(false);
+                      localNodes.openNew();
+                    }}
+                    className="w-full p-2 rounded-xl text-left hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition flex items-center space-x-2.5 cursor-pointer disabled:opacity-50"
+                  >
+                    <Plus className="w-3.5 h-3.5 text-indigo-500" />
+                    <div>
+                      <div className="font-semibold text-slate-900 dark:text-slate-100">新增本地节点</div>
+                      <div className="text-[10px] text-slate-400">手动录入单节点配置</div>
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={localNodes.busy || !localNodes.view}
+                    onClick={() => {
+                      setAddMenuOpen(false);
+                      localNodes.openImport();
+                    }}
+                    className="w-full p-2 rounded-xl text-left hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition flex items-center space-x-2.5 cursor-pointer disabled:opacity-50"
+                  >
+                    <Link2 className="w-3.5 h-3.5 text-emerald-500" />
+                    <div>
+                      <div className="font-semibold text-slate-900 dark:text-slate-100">导入节点配置</div>
+                      <div className="text-[10px] text-slate-400">从剪贴板或链接批量导入</div>
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      setAddMenuOpen(false);
+                      smartTrigger.current = event.currentTarget;
+                      setEditingRule(null);
+                      setSmartModalOpen(true);
+                    }}
+                    className="w-full p-2 rounded-xl text-left hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition flex items-center space-x-2.5 cursor-pointer"
+                  >
+                    <Zap className="w-3.5 h-3.5 text-amber-500" />
+                    <div>
+                      <div className="font-semibold text-slate-900 dark:text-slate-100">新建自建线路</div>
+                      <div className="text-[10px] text-slate-400">配置轮询/负载均衡策略组</div>
+                    </div>
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </div>

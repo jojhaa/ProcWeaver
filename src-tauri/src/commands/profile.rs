@@ -401,6 +401,7 @@ pub async fn import_profile_content(name: String, content: String) -> Result<Pro
 #[tauri::command]
 pub async fn update_profile(id: String) -> Result<ProfileItem, String> {
     let _write = PROFILE_WRITE.lock().await;
+    crate::function_mode::require_full()?;
     let mut list = read_profiles_index();
     let idx = list.iter().position(|p| p.id == id).ok_or_else(|| "订阅未找到".to_string())?;
 
@@ -672,6 +673,7 @@ pub(crate) async fn run_due_updates() -> Result<(), String> {
 pub async fn run_profile_scheduler() {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        if !crate::function_mode::core_features_enabled() { continue; }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -693,6 +695,7 @@ pub async fn run_profile_scheduler() {
         };
 
         for id in pending_ids {
+            if !crate::function_mode::core_features_enabled() { break; }
             eprintln!("[ProfileScheduler] 正在触发自动更新订阅: {}", id);
             if let Err(e) = update_profile(id).await {
                 eprintln!("[ProfileScheduler] 自动更新订阅失败: {}", e);
