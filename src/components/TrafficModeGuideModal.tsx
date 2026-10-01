@@ -71,6 +71,7 @@ export const TrafficModeGuideModal: React.FC<Props> = ({
         "需管理员提权 (UAC)：底层驱动安装与初始化必须拥有 Windows 管理员授权。",
         "内核反作弊游戏兼容性风险：易与带有内核级反作弊驱动的游戏（如 EAC、BattlEye、Vanguard 等）发生冲突；排错或游玩外服游戏时建议改用 TUN 模式或临时关闭。",
         "仅接管新建立的连接：仅对驱动启动后新发起的 TCP/UDP 连接生效；已有长连接及借道系统 DNS 代查 (svchost.exe) 的流量不保证接管。",
+        "杀毒软件可能会报毒（请知悉）：WinDivert 包含底层驱动组件 (.sys)，内核级网络拦截行为易被部分安全杀毒软件误报或拦截；如遇提示可将驱动加入信任白名单，或切换为纯应用代理。",
       ],
       icon: <Shield className="w-4 h-4 text-violet-500" />,
       tagColor: "bg-violet-500/10 text-violet-600 dark:text-violet-400 border-violet-500/20",
