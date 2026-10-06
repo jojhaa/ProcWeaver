@@ -7,6 +7,7 @@ import { initializePlatform } from "./services/platform";
 import { ProcessProxyView } from "./views/ProcessProxyView";
 import { ProcessMaintenanceView } from "./views/ProcessMaintenanceView";
 import { bundleController } from "./services/bundleRuntime";
+import { configureDesktopContextMenu } from "./utils/desktopContextMenu";
 
 bundleController.setFunctionMode("process_proxy");
 document.documentElement.dataset.edition = "process";
@@ -16,6 +17,7 @@ async function bootstrap() {
   try {
     const platform = await initializePlatform();
     document.documentElement.dataset.platform = platform.os;
+    configureDesktopContextMenu(platform.os !== "android");
     root.render(<React.StrictMode><PlatformContext.Provider value={platform}><ThemeProvider>
       <ProcessProxyView standalone maintenance={<ProcessMaintenanceView />} capability={{
         mode: "process_proxy", coreRunning: false, independentWinDivert: true,

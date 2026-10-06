@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
+import { createPortal } from "react-dom";
 import { ProxyGroup, ProxyItem, IpHealthInfo, ProfileItem } from "../types";
 import { SmartGroupRule } from "../types/smartGroup";
 import { fetchProxies, fetchMihomoConfig, switchProxy, testDelay, getPreferredSpeedTestUrl } from "../api/mihomo";
@@ -78,6 +79,7 @@ function formatBytes(bytes?: number): string {
 export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = React.memo(({ coreMode = null }) => {
   const mobile = document.documentElement.dataset.platform === "android";
   const [catalogOffline, setCatalogOffline] = useState(false);
+  const healthUnavailable = !mobile && catalogOffline;
   const [catalogMessage, setCatalogMessage] = useState("");
   const [probeMessage, setProbeMessage] = useState("");
   const readRevision = useRef(0);
@@ -129,15 +131,49 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
   });
   const [sortBy, setSortBy] = useState<"default" | "latency-asc" | "name-asc">("default");
   const [addMenuOpen, setAddMenuOpen] = useState(false);
-  const addMenuRef = useRef<HTMLDivElement>(null);
+  const [addMenuPos, setAddMenuPos] = useState({ top: 0, right: 0 });
+  const addMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const addMenuDropdownRef = useRef<HTMLDivElement>(null);
+
+  const updateAddMenuPos = () => {
+    if (addMenuButtonRef.current) {
+      const rect = addMenuButtonRef.current.getBoundingClientRect();
+      setAddMenuPos({
+        top: rect.bottom + 6,
+        right: Math.max(8, window.innerWidth - rect.right),
+      });
+    }
+  };
+
+  const handleToggleAddMenu = () => {
+    if (!addMenuOpen) {
+      updateAddMenuPos();
+    }
+    setAddMenuOpen((prev) => !prev);
+  };
+
   useEffect(() => {
+    if (!addMenuOpen) return;
     const handleOutsideClick = (e: MouseEvent) => {
-      if (addMenuRef.current && !addMenuRef.current.contains(e.target as Node)) {
+      const target = e.target as Node;
+      if (
+        addMenuButtonRef.current && !addMenuButtonRef.current.contains(target) &&
+        addMenuDropdownRef.current && !addMenuDropdownRef.current.contains(target)
+      ) {
         setAddMenuOpen(false);
       }
     };
-    if (addMenuOpen) document.addEventListener("mousedown", handleOutsideClick);
-    return () => document.removeEventListener("mousedown", handleOutsideClick);
+    const handleWindowChange = () => {
+      updateAddMenuPos();
+    };
+    document.addEventListener("mousedown", handleOutsideClick);
+    window.addEventListener("resize", handleWindowChange);
+    window.addEventListener("scroll", handleWindowChange, true);
+    return () => {
+      document.removeEventListener("mousedown", handleOutsideClick);
+      window.removeEventListener("resize", handleWindowChange);
+      window.removeEventListener("scroll", handleWindowChange, true);
+    };
   }, [addMenuOpen]);
 
   // 自建智能策略组规则
@@ -256,7 +292,12 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
       const profs = await getProfiles();
       if (profileVersion === profileReadVersion.current) setProfiles(profs);
     } catch (err) {
-      if (revision === readRevision.current) setCatalogMessage(`读取节点失败：${String(err)}`);
+      if (revision === readRevision.current) {
+        setCatalogMessage(`读取节点失败：${String(err)}`);
+        setCatalogOffline(true);
+        setProxies({});
+        setGroups([]);
+      }
       console.error("加载线路管理大盘数据失败:", err);
     }
   };
@@ -359,7 +400,7 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
 
   // 全量测速
   const handleTestAll = async () => {
-    if (testingAll || realNodes.length === 0) return;
+    if (catalogOffline || testingAll || realNodes.length === 0) return;
     setTestingAll(true);
     const job = new AbortController(); pendingJobs.current.add(job);
     const targetNodes = realNodes.map((n) => n.name);
@@ -438,8 +479,8 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
 
   // 单节点测速
   const handleTestNode = async (name: string, e?: React.MouseEvent) => {
-    if (catalogOffline) { setCatalogMessage("延迟测速需要先连接 VPN；IP 体检可以独立运行。"); return; }
     e?.stopPropagation();
+    if (catalogOffline) { setCatalogMessage(mobile ? "延迟测速需要先连接 VPN；IP 体检可以独立运行。" : "延迟测速需要先启动核心，节点配置可继续管理。"); return; }
     if (testingAll || testingNodes[name]) return;
     const revision = nodeSession.current;
     setTestingNodes((prev) => ({ ...prev, [name]: true }));
@@ -474,6 +515,7 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
   // 单节点深度 IP 体检 (体检完成立即将真实出口国家持久化)
   const handleProbeHealth = async (name: string, e?: React.MouseEvent) => {
     e?.stopPropagation();
+    if (healthUnavailable) { setProbeMessage("IP 体检需要先启动核心，节点配置可继续管理。"); return; }
     if (probingAll || singleProbeBusy.current) return;
     singleProbeBusy.current = true;
     setProbeMessage("");
@@ -523,6 +565,7 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
 
   // 全量 IP 纯净体检与真实地区重排
   const handleProbeAllHealth = async (requestedNames?: string[]) => {
+    if (healthUnavailable) { setProbeMessage("IP 体检需要先启动核心，节点配置可继续管理。"); return; }
     const targetNames = realNodes.filter(n => !ignoredSet.has(n.name) && (!requestedNames || requestedNames.includes(n.name))).map(n => n.name);
     if (targetNames.length === 0 || probingAll || singleProbeBusy.current) return;
 
@@ -591,7 +634,7 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
 
   // Android 只切换当前模式下明确选择的策略组，保留应用独立出口。
   const handleSelectProxy = async (nodeName: string) => {
-    if (catalogOffline) { setCatalogMessage("节点已保存，请先连接 VPN 再切换当前出口。"); return; }
+    if (catalogOffline) { setCatalogMessage(mobile ? "节点已保存，请先连接 VPN 再切换当前出口。" : "节点已保存，请先启动核心再切换当前出口。"); return; }
     if (mobile) {
       if (switchingNode.current) return;
       switchingNode.current = true;
@@ -804,7 +847,7 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
       );
       setNewSubUrl("");
       setNewSubName("");
-      await refreshSubscriptions("订阅已添加，可点击“切换使用”应用此订阅。");
+      await refreshSubscriptions("订阅已添加，点击订阅卡片即可使用。");
       setShowAddSubModal(false);
     }, true);
   };
@@ -826,7 +869,7 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
       setProfiles(current => current.map(profile => ({ ...profile, isSelected: profile.id === id })));
       setSelectedNodes([]);
       setDelayMap({});
-      await refreshSubscriptions("已切换并应用订阅配置。已有连接仍沿用原连接出口。");
+      await refreshSubscriptions("已切换订阅；核心运行时立即应用，未运行时将在启动后使用。已有连接沿用原出口。");
     });
   };
 
@@ -954,7 +997,7 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
   return (
     <div className={`${mobile ? "mobile-nodes-page " : ""}flex-1 flex flex-col h-full overflow-hidden bg-slate-50 dark:bg-slate-950 transition-colors duration-200 relative`}>
       {(catalogMessage || (!mobile && catalogOffline) || (probeMessage && (!mobile || (!probingAll && !anySingleProbe))) || (!mobile && (probingAll || anySingleProbe))) && <div role="status" className="mobile-notice mx-3 my-2 shrink-0">
-        {!mobile && catalogOffline && <p>节点已从本地订阅读取。连接 VPN 后可切换出口和测速；IP 体检可独立运行。</p>}
+        {!mobile && catalogOffline && <p>当前为本地配置管理，可管理订阅、本地节点和自建线路，保存后在下次启动核心时使用。切换出口、测速和 IP 体检需启动核心。</p>}
         {catalogMessage && <p>{catalogMessage} <button onClick={() => void loadData()}>重新读取</button></p>}
         {probeMessage && (!mobile || (!probingAll && !anySingleProbe)) && <p>{probeMessage}</p>}
         {!mobile && (probingAll || anySingleProbe) && <button onClick={() => { pendingJobs.current.forEach(job => job.abort()); setProbeMessage("正在取消体检…"); }}>取消检测</button>}
@@ -1275,9 +1318,9 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
             <button
               type="button"
               onClick={() => void handleProbeAllHealth()}
-              disabled={probingAll || anySingleProbe || realNodes.length === 0}
+              disabled={healthUnavailable || probingAll || anySingleProbe || realNodes.length === 0}
               className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-purple-50 hover:bg-purple-100 text-purple-700 dark:bg-purple-600/15 dark:hover:bg-purple-600/25 dark:text-purple-300 border border-purple-200 dark:border-purple-800/60 text-xs font-semibold transition shadow-2xs disabled:opacity-50 cursor-pointer"
-              title="深度检测全部节点的真实出口 IP、风控评分与住宅/机房属性"
+              title={healthUnavailable ? "启动核心后可进行 IP 体检" : "深度检测全部节点的真实出口 IP、风控评分与住宅/机房属性"}
             >
               <Shield className={`w-3.5 h-3.5 ${probingAll ? "animate-spin text-purple-600 dark:text-purple-400" : "text-purple-500"}`} />
               <span>
@@ -1323,10 +1366,11 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
             </button>
 
             {/* 5. 聚合操作：添加与自建 ▾ */}
-            <div className="relative inline-block" ref={addMenuRef}>
+            <div className="relative inline-block">
               <button
+                ref={addMenuButtonRef}
                 type="button"
-                onClick={() => setAddMenuOpen(!addMenuOpen)}
+                onClick={handleToggleAddMenu}
                 className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-md shadow-indigo-600/20 transition cursor-pointer select-none"
               >
                 <Plus className="w-3.5 h-3.5" />
@@ -1334,62 +1378,69 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
                 <ChevronDown className={`w-3 h-3 text-white/80 transition-transform duration-200 ${addMenuOpen ? "rotate-180" : ""}`} />
               </button>
 
-              {/* 下拉浮层卡片 */}
-              {addMenuOpen && (
-                <div className="absolute right-0 top-full mt-1.5 z-50 w-52 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-2xl p-1.5 text-xs space-y-1 animate-in fade-in zoom-in-95 duration-100 font-sans">
-                  <div className="px-2.5 py-1.5 text-[10px] text-slate-400 font-semibold uppercase tracking-wider border-b border-slate-100 dark:border-slate-800/80">
-                    管理与自定义
-                  </div>
-                  <button
-                    type="button"
-                    disabled={localNodes.busy || !localNodes.view}
-                    onClick={() => {
-                      setAddMenuOpen(false);
-                      localNodes.openNew();
-                    }}
-                    className="w-full p-2 rounded-xl text-left hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition flex items-center space-x-2.5 cursor-pointer disabled:opacity-50"
+              {/* 下拉浮层卡片 (Portal 挂载到 body，彻底消除局部 overflow-x-auto 容器的裁剪和下层遮挡) */}
+              {addMenuOpen &&
+                createPortal(
+                  <div
+                    ref={addMenuDropdownRef}
+                    style={{ top: `${addMenuPos.top}px`, right: `${addMenuPos.right}px` }}
+                    className="fixed z-[9999] w-52 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-2xl p-1.5 text-xs space-y-1 animate-in fade-in zoom-in-95 duration-100 font-sans"
+                    data-no-drag
                   >
-                    <Plus className="w-3.5 h-3.5 text-indigo-500" />
-                    <div>
-                      <div className="font-semibold text-slate-900 dark:text-slate-100">新增本地节点</div>
-                      <div className="text-[10px] text-slate-400">手动录入单节点配置</div>
+                    <div className="px-2.5 py-1.5 text-[10px] text-slate-400 font-semibold uppercase tracking-wider border-b border-slate-100 dark:border-slate-800/80">
+                      管理与自定义
                     </div>
-                  </button>
+                    <button
+                      type="button"
+                      disabled={localNodes.busy || !localNodes.view}
+                      onClick={() => {
+                        setAddMenuOpen(false);
+                        localNodes.openNew();
+                      }}
+                      className="w-full p-2 rounded-xl text-left hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition flex items-center space-x-2.5 cursor-pointer disabled:opacity-50"
+                    >
+                      <Plus className="w-3.5 h-3.5 text-indigo-500" />
+                      <div>
+                        <div className="font-semibold text-slate-900 dark:text-slate-100">新增本地节点</div>
+                        <div className="text-[10px] text-slate-400">手动录入单节点配置</div>
+                      </div>
+                    </button>
 
-                  <button
-                    type="button"
-                    disabled={localNodes.busy || !localNodes.view}
-                    onClick={() => {
-                      setAddMenuOpen(false);
-                      localNodes.openImport();
-                    }}
-                    className="w-full p-2 rounded-xl text-left hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition flex items-center space-x-2.5 cursor-pointer disabled:opacity-50"
-                  >
-                    <Link2 className="w-3.5 h-3.5 text-emerald-500" />
-                    <div>
-                      <div className="font-semibold text-slate-900 dark:text-slate-100">导入节点配置</div>
-                      <div className="text-[10px] text-slate-400">从剪贴板或链接批量导入</div>
-                    </div>
-                  </button>
+                    <button
+                      type="button"
+                      disabled={localNodes.busy || !localNodes.view}
+                      onClick={() => {
+                        setAddMenuOpen(false);
+                        localNodes.openImport();
+                      }}
+                      className="w-full p-2 rounded-xl text-left hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition flex items-center space-x-2.5 cursor-pointer disabled:opacity-50"
+                    >
+                      <Link2 className="w-3.5 h-3.5 text-emerald-500" />
+                      <div>
+                        <div className="font-semibold text-slate-900 dark:text-slate-100">导入节点配置</div>
+                        <div className="text-[10px] text-slate-400">从剪贴板或链接批量导入</div>
+                      </div>
+                    </button>
 
-                  <button
-                    type="button"
-                    onClick={(event) => {
-                      setAddMenuOpen(false);
-                      smartTrigger.current = event.currentTarget;
-                      setEditingRule(null);
-                      setSmartModalOpen(true);
-                    }}
-                    className="w-full p-2 rounded-xl text-left hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition flex items-center space-x-2.5 cursor-pointer"
-                  >
-                    <Zap className="w-3.5 h-3.5 text-amber-500" />
-                    <div>
-                      <div className="font-semibold text-slate-900 dark:text-slate-100">新建自建线路</div>
-                      <div className="text-[10px] text-slate-400">配置轮询/负载均衡策略组</div>
-                    </div>
-                  </button>
-                </div>
-              )}
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        setAddMenuOpen(false);
+                        smartTrigger.current = event.currentTarget;
+                        setEditingRule(null);
+                        setSmartModalOpen(true);
+                      }}
+                      className="w-full p-2 rounded-xl text-left hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition flex items-center space-x-2.5 cursor-pointer"
+                    >
+                      <Zap className="w-3.5 h-3.5 text-amber-500" />
+                      <div>
+                        <div className="font-semibold text-slate-900 dark:text-slate-100">新建自建线路</div>
+                        <div className="text-[10px] text-slate-400">配置轮询/负载均衡策略组</div>
+                      </div>
+                    </button>
+                  </div>,
+                  document.body
+                )}
             </div>
           </div>
         </div>
@@ -1493,7 +1544,7 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
                             </span>
                           ) : (
                             <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 opacity-70 group-hover:opacity-100 transition font-medium">
-                              点击启用
+                              {catalogOffline ? "已保存" : "点击启用"}
                             </span>
                           )}
                           <button
@@ -1587,8 +1638,8 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
               <button
                 type="button"
                 onClick={() => void handleProbeAllHealth()}
-                disabled={probingAll || anySingleProbe}
-                className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold transition shadow-xs cursor-pointer shrink-0"
+                disabled={healthUnavailable || probingAll || anySingleProbe}
+                className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold transition shadow-xs cursor-pointer shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Shield className="w-3.5 h-3.5" />
                 <span>{probingAll ? "体检中..." : "一键体检确认"}</span>
@@ -1750,8 +1801,8 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
                               <button
                                 type="button"
                                 onClick={(e) => handleTestNode(node.name, e)}
-                                disabled={isTesting}
-                                title={delay === null ? "尚未测速，点击为此节点测速" : "单独为此节点测速"}
+                                disabled={catalogOffline || isTesting}
+                                title={catalogOffline ? "启动核心后可测速" : delay === null ? "尚未测速，点击为此节点测速" : "单独为此节点测速"}
                                 className={`inline-flex items-center space-x-0.5 px-1.5 py-0.5 rounded-md text-[11px] font-mono font-semibold transition cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800 ${
                                   isTesting
                                     ? "text-indigo-500 animate-pulse"
@@ -1774,8 +1825,8 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
                               <button
                                 type="button"
                                 onClick={(e) => handleProbeHealth(node.name, e)}
-                                disabled={isProbing || probingAll || anySingleProbe}
-                                title="单节点 IP 深度体检并锁定真实出口国家"
+                                disabled={healthUnavailable || isProbing || probingAll || anySingleProbe}
+                                title={healthUnavailable ? "启动核心后可进行 IP 体检" : "单节点 IP 深度体检并锁定真实出口国家"}
                                 className="p-1 rounded-md text-slate-400 hover:text-purple-600 hover:bg-purple-50 dark:hover:bg-purple-950/40 transition cursor-pointer"
                               >
                                 <Shield className={`w-3.5 h-3.5 ${isProbing ? "animate-spin text-purple-600" : ""}`} />
@@ -1998,13 +2049,22 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
                 profiles.map((prof) => (
                   <div
                     key={prof.id}
-                    className={`p-4 rounded-xl border space-y-2.5 ${prof.isSelected ? "border-indigo-300 dark:border-indigo-600 bg-indigo-50/60 dark:bg-indigo-950/30" : "border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/40"}`}
+                    className={`relative p-4 rounded-xl border flex flex-col gap-2.5 ${prof.isSelected ? "border-indigo-300 dark:border-indigo-600 bg-indigo-50/60 dark:bg-indigo-950/30" : "border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/40 hover:border-indigo-300 dark:hover:border-indigo-600"}`}
                   >
-                    <div className="flex items-center justify-between">
+                    <button
+                      type="button"
+                      aria-label={`使用订阅：${prof.name}`}
+                      aria-pressed={prof.isSelected}
+                      aria-busy={switchingProfileId === prof.id}
+                      disabled={subLoading}
+                      onClick={() => void handleSelectSubscription(prof.id)}
+                      className="absolute inset-0 rounded-xl cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 disabled:cursor-wait"
+                    />
+                    <div className="relative pointer-events-none flex items-center justify-between">
                       <span className="text-xs font-bold text-slate-800 dark:text-slate-200 truncate max-w-[200px]">
                         {prof.name}
                       </span>
-                      <div className="flex items-center space-x-1">
+                      <div className="pointer-events-auto flex items-center space-x-1">
                         <button
                           type="button"
                           onClick={() => handleUpdateSubscription(prof.id)}
@@ -2027,19 +2087,13 @@ export const LinesManagementView: React.FC<{ coreMode?: MobileCoreMode }> = Reac
                         </button>
                       </div>
                     </div>
-                    <div className="flex justify-end">
-                      <button
-                        type="button"
-                        disabled={subLoading || prof.isSelected}
-                        aria-label={`${prof.isSelected ? "正在使用" : "切换使用"}：${prof.name}`}
-                        onClick={() => void handleSelectSubscription(prof.id)}
-                        className="px-3 py-1.5 rounded-lg text-xs font-medium bg-indigo-600 text-white hover:bg-indigo-500 disabled:bg-slate-100 disabled:text-slate-500 dark:disabled:bg-slate-800 dark:disabled:text-slate-400 disabled:cursor-default"
-                      >
-                        {switchingProfileId === prof.id ? "正在切换…" : prof.isSelected ? "使用中" : "切换使用"}
-                      </button>
+                    <div className="relative pointer-events-none flex justify-end">
+                      <span role="status" className="text-xs text-indigo-600 dark:text-indigo-400">
+                        {switchingProfileId === prof.id ? "正在切换…" : prof.isSelected ? "✓ 使用中" : "点击卡片使用"}
+                      </span>
                     </div>
 
-                    <div className="text-[11px] text-slate-400 flex justify-between">
+                    <div className="relative pointer-events-none text-[11px] text-slate-400 flex justify-between">
                       <span>节点数量: {prof.nodeCount || 0} 个</span>
                       {prof.upload !== undefined && (
                         <span>已用: {formatBytes((prof.upload || 0) + (prof.download || 0))}</span>

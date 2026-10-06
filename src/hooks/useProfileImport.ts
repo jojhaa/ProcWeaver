@@ -37,5 +37,5 @@ export function useProfileImport(mobile: boolean, onImported: () => void, api = 
       window.dispatchEvent(new Event("netbox-profile-changed"));
     } catch (error) { setMessage(String(error)); } finally { setBusy(false); }
   }
-  return { content, setContent, name, setName, message, busy, receive, file, confirm };
+  return { content, setContent, name, setName, message, dismissMessage: () => setMessage(""), busy, receive, file, confirm };
 }

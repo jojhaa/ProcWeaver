@@ -10,6 +10,7 @@ import { PlatformContext } from "./context/PlatformContext";
 import { initializePlatform } from "./services/platform";
 import { isAppHidden } from "./utils/appVisibility";
 import { applyPendingBrowserRestore } from "./api/configTransfer";
+import { configureDesktopContextMenu } from "./utils/desktopContextMenu";
 
 const root = ReactDOM.createRoot(document.getElementById("root") as HTMLElement);
 async function bootstrap() {
@@ -18,6 +19,7 @@ async function bootstrap() {
     await applyPendingBrowserRestore();
     const platform = await initializePlatform();
     document.documentElement.dataset.platform = platform.os;
+    configureDesktopContextMenu(platform.os !== "android");
     if (platform.os === "android") {
       const visibility = () => monitorStore.setPaused(isAppHidden());
       document.addEventListener("visibilitychange", visibility);

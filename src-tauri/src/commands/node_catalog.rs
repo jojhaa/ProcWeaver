@@ -38,7 +38,7 @@ fn parse(raw: &str, profile: String, home: &Path) -> Result<Catalog, String> {
             })();
             match loaded {
                 Ok(data) => insert_nodes(&data, &mut result.nodes)?,
-                Err(reason) => result.warnings.push(format!("节点集合「{name}」{reason}，请更新订阅或连接 VPN 下载")),
+                Err(reason) => result.warnings.push(format!("节点集合「{name}」{reason}，请更新订阅或{}下载", if cfg!(target_os = "android") { "连接 VPN" } else { "启动核心" })),
             }
         }
     }

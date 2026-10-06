@@ -49,6 +49,54 @@ pub(crate) fn controller_client() -> reqwest::ClientBuilder {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn stopped_core_lists_current_subscription_and_local_nodes_without_controller() {
+        const NAME: &str = "commands::mihomo_api::tests::stopped_core_lists_current_subscription_and_local_nodes_without_controller";
+        const FLAG: &str = "PROCWEAVER_OFFLINE_CATALOG_TEST";
+        if std::env::var_os(FLAG).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"]).env(FLAG, "1").status().unwrap().success());
+            return;
+        }
+        use crate::commands::{process, profile};
+        use serde_json::json;
+        let root = std::env::temp_dir().join(format!("pw-offline-catalog-{}", std::process::id()));
+        crate::storage::initialize_test(root.clone(), root.join("resources"));
+        // This must work even with the controller disabled and no runtime config.
+        std::fs::write(root.join("config/preferences.json"), br#"{"enableControllerPort":false}"#).unwrap();
+        std::fs::write(root.join("config/local-nodes.json"), json!({"revision":1,"nodes":[{
+            "id":"abc123","name":"Local fixture","config":{"type":"http","server":"local.invalid","port":8080,"password":"local-secret"}
+        }]}).to_string()).unwrap();
+        for id in ["one", "two"] {
+            std::fs::write(root.join(format!("config/{id}.yaml")), format!(
+                "proxies: [{{name: {id}, type: socks5, server: example.invalid, port: 1080, password: subscription-secret}}]\nproxy-groups: [{{name: PROXY, type: select, proxies: [{id}]}}]"
+            )).unwrap();
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for selected in ["one", "two"] {
+            let profiles: Vec<_> = ["one", "two"].iter().map(|id| profile::ProfileItem {
+                id: (*id).into(), name: (*id).into(), file_path: format!("config/{id}.yaml"),
+                is_selected: *id == selected, ..Default::default()
+            }).collect();
+            profile::write_profiles_index(&profiles).unwrap();
+            let result = runtime.block_on(super::get_mihomo_proxies()).unwrap();
+            assert_eq!(result["offline"], true);
+            assert_eq!(result["catalogProfile"], selected);
+            assert!(result["proxies"][selected].is_object());
+            assert!(result["proxies"]["PW-L-abc123"].is_object());
+            assert_eq!(result["proxies"].as_object().unwrap().len(), 3);
+            assert_eq!(result["proxies"]["PROXY"]["all"], json!([selected, "PW-L-abc123"]));
+            assert!(!result.to_string().contains("secret"));
+            assert!(!result.to_string().contains(".invalid"));
+            assert!(!process::ACTIVE.load(std::sync::atomic::Ordering::SeqCst));
+        }
+        std::fs::write(root.join("config/two.yaml"), "proxies: [").unwrap();
+        assert!(runtime.block_on(super::get_mihomo_proxies()).is_err());
+        assert!(!root.join("core_data/config.yaml").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn traffic_filter_uses_outbound_type_not_only_display_name() {
         assert!(super::is_proxy_connection("node", "Shadowsocks"));
@@ -115,6 +163,11 @@ fn url_encode(input: &str) -> String {
 
 #[tauri::command]
 pub async fn get_mihomo_proxies() -> Result<Value, String> {
+    // Configuration remains manageable even with the core/controller stopped.
+    #[cfg(not(target_os = "android"))]
+    if !super::process::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(super::node_catalog::read()?.public());
+    }
     #[cfg(target_os = "android")]
     let catalog = super::node_catalog::read()?.public();
     #[cfg(target_os = "android")]

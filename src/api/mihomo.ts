@@ -66,7 +66,7 @@ export async function fetchProxies(): Promise<{
           return { groups, proxies, offline: data.offline, warnings: data.catalogWarnings };
         }
       } catch (err) {
-        if (typeof document !== "undefined" && document.documentElement.dataset.platform === "android") throw err;
+        if (attempt === 3 || (typeof document !== "undefined" && document.documentElement.dataset.platform === "android")) throw err;
         // 内核可能刚拉起，等待 350ms 后重试
         await new Promise((resolve) => setTimeout(resolve, 350));
       }
