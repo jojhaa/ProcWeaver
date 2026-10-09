@@ -31,6 +31,7 @@ pub(crate) fn initialize() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => *ERROR.lock().unwrap() = Some("进程接入配置读取失败".into()),
     }
+    crate::external_proxy::diagnostics::emit("capture.initialized","info",serde_json::json!({"windivertSelected":SELECTED.load(Ordering::Acquire),"error":ERROR.lock().unwrap_or_else(|e|e.into_inner()).clone()}));
 }
 pub(crate) fn selected() -> bool {
     SELECTED.load(Ordering::Acquire) && !crate::function_mode::core_features_enabled()
@@ -94,6 +95,7 @@ fn stop_blocking() {
     #[cfg(windows)]
     {
         let engine = ENGINE.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(engine)=&engine { crate::external_proxy::diagnostics::emit("capture.stopping","info",serde_json::json!({"stats":engine.stats()})); }
         drop(engine);
     }
 }
@@ -105,6 +107,11 @@ pub(crate) fn stop() {
     let _ = std::thread::spawn(stop_blocking).join();
 }
 fn start_blocking() -> Result<(), String> {
+    crate::external_proxy::diagnostics::emit("capture.start_requested","info",serde_json::json!({"mode":"windivert"}));
+    let result=start_inner();
+    crate::external_proxy::diagnostics::emit(if result.is_ok(){"capture.start_ok"}else{"capture.start_failed"},if result.is_ok(){"info"}else{"warning"},serde_json::json!({"error":result.as_ref().err()})); result
+}
+fn start_inner() -> Result<(), String> {
     #[cfg(feature = "process-edition")]
     if let Err(error) = crate::process_conflict::check() {
         // A retry can race with another client's startup. Do not leave our old
@@ -179,6 +186,7 @@ pub(crate) async fn tick() {
         .await
         .unwrap_or_else(|_| Err("独立接管启动任务失败".into()))
     {
+        crate::external_proxy::diagnostics::emit("capture.tick_failed","warning",serde_json::json!({"error":e}));
         *ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
     }
 }
@@ -201,6 +209,7 @@ pub async fn set_process_capture(
         AccessMode::AppProxy
     };
     validate(mode, expected_mode, previous, confirmed)?;
+    crate::external_proxy::diagnostics::emit("capture.mode_requested","info",serde_json::json!({"previous":previous,"requested":mode}));
     if mode == AccessMode::Windivert {
         // Retry is explicit. On first activation a failed start cannot persist selection.
         let result = tokio::task::spawn_blocking(start_blocking)
@@ -225,6 +234,7 @@ pub async fn set_process_capture(
         let _ = tokio::task::spawn_blocking(stop_blocking).await;
     }
     *ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    crate::external_proxy::diagnostics::emit("capture.mode_applied","info",serde_json::json!({"mode":mode}));
     Ok(get_process_capture())
 }
 fn validate(

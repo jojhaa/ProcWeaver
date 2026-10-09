@@ -3,6 +3,7 @@ use super::{
     dns, identity,
     transport::{self, Destination},
     udp::Channel,
+    diagnostics::{self, Trace},
     Engine,
 };
 use crate::{
@@ -122,7 +123,7 @@ impl Context {
         let question = dns::question(query)?;
         let policy = Destination::new(&question.name, 53)?;
         let (endpoint, ports, revision, record) = self.select(&policy)?;
-        let result = dns::exchange_using(endpoint.as_ref(), target, query, &ports, tcp).await;
+        let result = dns::exchange_traced(endpoint.as_ref(), target, query, &ports, tcp,&Trace::new(Some(record))).await;
         match result {
             Ok(reply) if self.valid() && self.runtime.config().revision == revision => {
                 self.runtime.update(
@@ -158,7 +159,7 @@ pub(crate) async fn tcp(
         .capacity
         .clone()
         .try_acquire_owned()
-        .map_err(|_| "独立代理连接已达上限")?;
+        .map_err(|_| { diagnostics::emit("capacity.rejected","warning",serde_json::json!({"kind":"tcp","pid":context.process.pid,"target":destination.to_string()})); "独立代理连接已达上限" })?;
     let target = Destination::new(&destination.ip().to_string(), destination.port())?;
     if destination.port() == 53 {
         loop {
@@ -214,24 +215,29 @@ pub(crate) async fn tcp(
         }
     }
     let (endpoint, ports, _, record) = context.select(&policy)?;
+    let trace=Trace::new(Some(record)); let _activity=trace.activity("tcp");
     let result:Result<(u64,u64),String>=async {
-        let mut upstream=transport::connect(endpoint.as_ref(),&target,&ports).await?;
+        let mut upstream=transport::connect_traced(endpoint.as_ref(),&target,&ports,&trace).await?;
         if !context.valid(){return Err("业务包已停用或进程身份改变".into());}
         upstream.write_all(&prefix).await.map_err(|_|"转发首包失败")?;
         context.runtime.update(record,"active","已建立独立透明 TCP 隧道",(prefix.len()as u64,0));
+        trace.event("tcp.tunnel_ready","info",serde_json::json!({"entry":"windivert","initialBytes":prefix.len()}));
         let copy=tokio::io::copy_bidirectional(&mut client,&mut upstream);tokio::pin!(copy);
         let mut interval=tokio::time::interval(Duration::from_secs(1));
+        let mut checkpoint=tokio::time::Instant::now();
         loop {tokio::select! {
-            r=&mut copy=>return r.map(|(up,down)|(up+prefix.len()as u64,down)).map_err(|_|"透明 TCP 连接中断，未直连重试".into()),
-            _=interval.tick()=>if !context.valid(){return Err("业务包已停用或原始进程退出".into());}
+            r=&mut copy=>return r.map(|(up,down)|(up+prefix.len()as u64,down)).map_err(|error| { trace.event("tcp.copy_failed","warning",transport::io_detail(&error)); "透明 TCP 连接中断，未直连重试".into() }),
+            _=interval.tick()=>{if !context.valid(){return Err("业务包已停用或原始进程退出".into());}if checkpoint.elapsed()>=Duration::from_secs(30){trace.event("tcp.tunnel_alive","info",serde_json::json!({"pid":context.process.pid}));checkpoint=tokio::time::Instant::now();}}
         }}
     }.await;
     match result {
         Ok(bytes) => {
+            trace.event("tcp.tunnel_end","info",serde_json::json!({"reason":"streams_completed","uploaded":bytes.0,"downloaded":bytes.1}));
             context.runtime.update(record, "closed", "连接结束", bytes);
             Ok(())
         }
         Err(e) => {
+            trace.event("tcp.tunnel_end","warning",serde_json::json!({"error":e}));
             context.runtime.update(record, "failed", &e, (0, 0));
             Err(e)
         }
@@ -248,7 +254,7 @@ pub(crate) async fn udp(
         .capacity
         .clone()
         .try_acquire_owned()
-        .map_err(|_| "独立代理连接已达上限")?;
+        .map_err(|_| { diagnostics::emit("capacity.rejected","warning",serde_json::json!({"kind":"udp","pid":context.process.pid,"target":destination.to_string()})); "独立代理连接已达上限" })?;
     let target = Destination::new(&destination.ip().to_string(), destination.port())?;
     if destination.port() == 53 {
         let mut queries = tokio::task::JoinSet::new();
@@ -271,25 +277,29 @@ pub(crate) async fn udp(
         }
     }
     let (endpoint, ports, revision, record) = context.select(&target)?;
+    let trace=Trace::new(Some(record)); let _activity=trace.activity("udp");
     let result:Result<(u64,u64),String>=async {
-        let mut channel=Channel::open(endpoint.as_ref(),&target,&ports).await?;
+        let mut channel=Channel::open_traced(endpoint.as_ref(),&target,&ports,trace.clone()).await?;
         context.runtime.update(record,"active","UDP 关联已建立",(0,0));
         let mut buffer=vec![0;65535];let mut bytes=(0,0);let mut check=tokio::time::interval(Duration::from_secs(1));
         let mut last=tokio::time::Instant::now();
+        let mut checkpoint=last;
         loop {tokio::select! {
-            packet=requests.recv()=>{let Some(packet)=packet else{return Ok(bytes);};if !context.valid()||context.runtime.config().revision!=revision{return Err("UDP 配置或原始进程已改变".into());}channel.send(&packet).await?;bytes.0+=packet.len() as u64;last=tokio::time::Instant::now();},
-            reply=channel.receive(&mut buffer)=>{let (_,reply)=reply?;if !context.valid()||context.runtime.config().revision!=revision{return Err("UDP 配置或原始进程已改变".into());}bytes.1+=reply.len() as u64;if responses.send(reply).await.is_err(){return Ok(bytes);}last=tokio::time::Instant::now();},
-            _=check.tick()=>{if last.elapsed()>Duration::from_secs(30){return Ok(bytes);}if !context.valid()||context.runtime.config().revision!=revision{return Err("UDP 配置或原始进程已改变".into());}}
+            packet=requests.recv()=>{let Some(packet)=packet else{trace.event("udp.relay_end","info",serde_json::json!({"reason":"input_closed"}));return Ok(bytes);};if !context.valid()||context.runtime.config().revision!=revision{return Err("UDP 配置或原始进程已改变".into());}channel.send(&packet).await?;bytes.0+=packet.len() as u64;last=tokio::time::Instant::now();},
+            reply=channel.receive(&mut buffer)=>{let (_,reply)=reply?;if !context.valid()||context.runtime.config().revision!=revision{return Err("UDP 配置或原始进程已改变".into());}bytes.1+=reply.len() as u64;if responses.send(reply).await.is_err(){trace.event("udp.relay_end","info",serde_json::json!({"reason":"response_receiver_closed"}));return Ok(bytes);}last=tokio::time::Instant::now();},
+            _=check.tick()=>{if last.elapsed()>Duration::from_secs(30){trace.event("udp.relay_end","info",serde_json::json!({"reason":"idle","idleMs":30000}));return Ok(bytes);}if !context.valid()||context.runtime.config().revision!=revision{return Err("UDP 配置或原始进程已改变".into());}if checkpoint.elapsed()>=Duration::from_secs(30){trace.event("udp.relay_alive","info",serde_json::json!({"uploaded":bytes.0,"downloaded":bytes.1,"idleMs":last.elapsed().as_millis() as u64}));checkpoint=tokio::time::Instant::now();}}
         }}
     }.await;
     match result {
         Ok(bytes) => {
+            trace.event("udp.relay_closed","info",serde_json::json!({"uploaded":bytes.0,"downloaded":bytes.1}));
             context
                 .runtime
                 .update(record, "closed", "UDP 关联结束", bytes);
             Ok(())
         }
         Err(e) => {
+            trace.event("udp.relay_closed","warning",serde_json::json!({"error":e,"selectedRevision":revision,"currentRevision":context.runtime.config().revision}));
             context.runtime.update(record, "failed", &e, (0, 0));
             Err(e)
         }

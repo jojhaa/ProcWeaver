@@ -8,6 +8,7 @@ mod udp;
 mod dns;
 mod probe;
 mod sniff;
+pub(crate) mod diagnostics;
 #[cfg(windows)] pub(crate) mod captured;
 #[cfg(test)] mod tests;
 #[cfg(all(test, windows))] mod udp_tests;
@@ -51,6 +52,8 @@ pub struct View {
     pub endpoints: Vec<EndpointView>, pub bundles: Vec<Bundle>, pub states: Vec<BundleState>,
     pub records: Vec<Record>, pub supported: bool,
     pub dns: model::DnsSettings,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<diagnostics::Status>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -84,7 +87,7 @@ impl Engine {
             upstream: model::endpoint(&config, b).map(|e| e.name.clone()).unwrap_or_default(), error: errors.get(&b.id).cloned().unwrap_or_default() }).collect();
         View { revision: config.revision, enabled: config.enabled, default_endpoint_id: config.default_endpoint_id,
             endpoints: config.endpoints.iter().map(|e| EndpointView { id: e.id.clone(), name: e.name.clone(), protocol: e.protocol.clone(), host: e.host.clone(), port: e.port, username: e.username.clone(), has_password: !e.secret.is_empty() }).collect(),
-            dns: config.dns, bundles: config.bundles, states, records: self.records.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().take(100).cloned().collect(), supported: cfg!(windows) }
+            dns: config.dns, bundles: config.bundles, states, records: self.records.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().take(100).cloned().collect(), supported: cfg!(windows), diagnostics: diagnostics::status() }
     }
     async fn apply(self: &Arc<Self>, mut next: Config) -> Result<View, String> {
         model::validate(&mut next)?;
@@ -118,6 +121,7 @@ impl Engine {
         next.revision = old.revision.checked_add(1).ok_or("配置版本已耗尽")?;
         crate::storage::replace_atomic(&self.root.join("config/external-proxy.json"), &serde_json::to_vec_pretty(&next).map_err(|_| "生成独立代理配置失败")?).map_err(|_| "独立代理配置保存失败，原运行状态保留")?;
         *self.config.write().unwrap_or_else(|e| e.into_inner()) = next.clone();
+        diagnostics::emit("config.applied", "info", serde_json::json!({"revision":next.revision,"enabled":next.enabled,"enabledBundles":next.bundles.iter().filter(|b|b.enabled).count(),"endpoints":next.endpoints.len(),"dnsEnabled":next.dns.enabled}));
         let mut stopped = {
             let mut listeners = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
             let remove: Vec<_> = listeners.iter().filter(|(id, entry)| !next.enabled || !next.bundles.iter().any(|b| b.id == **id && b.enabled) || entry.task.is_finished()).map(|(id, _)| id.clone()).collect();
@@ -160,13 +164,22 @@ impl Engine {
     }
     fn record(&self, bundle: &str, pid: u32, process: &str, target: &str, route: &str, generation: u64, endpoint: Option<&Endpoint>) -> u64 {
         let id = self.serial.fetch_add(1, Ordering::Relaxed);
+        diagnostics::emit("connection.selected", "info", serde_json::json!({"recordId":id,"bundleId":bundle,"pid":pid,
+            "processName":process.rsplit(['\\','/']).next().unwrap_or(process),"target":target,"route":route,"revision":generation,
+            "upstream":endpoint.map(|e|serde_json::json!({"id":e.id,"protocol":e.protocol,"host":e.host,"port":e.port}))}));
         let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
         while records.len() >= 200 { records.pop_front(); }
         records.push_back(Record { id, bundle_id: bundle.into(), generation, pid, process: process.into(), target: target.into(), route: route.into(), upstream: endpoint.map(|e| e.name.clone()).unwrap_or_else(|| "直连".into()), state: "connecting".into(), message: String::new(), uploaded: 0, downloaded: 0,
             at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64 }); id
     }
     fn update(&self, id: u64, state: &str, message: &str, bytes: (u64, u64)) {
-        if let Some(record) = self.records.lock().unwrap_or_else(|e| e.into_inner()).iter_mut().find(|r| r.id == id) {
+        let mut records=self.records.lock().unwrap_or_else(|e|e.into_inner());
+        let record=records.iter_mut().find(|r|r.id==id);
+        // Long connections may outlive the 200-row UI ring; their final event still goes to disk.
+        if record.as_ref().is_none_or(|record|record.state!=state) || state=="failed" {
+                diagnostics::emit("connection.state", if state == "failed" { "warning" } else { "info" }, serde_json::json!({"recordId":id,"state":state,"message":message,"uploaded":bytes.0,"downloaded":bytes.1}));
+        }
+        if let Some(record)=record {
             record.state = state.into(); record.message = message.into(); record.uploaded = bytes.0; record.downloaded = bytes.1;
         }
     }

@@ -6,6 +6,7 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
 }
 export const externalProxyApi = {
   read: () => call<ExternalProxyView>("get_external_proxy"),
+  openLogs: () => call<void>("open_process_log_directory"),
   apply: (revision: number, bundles: ExternalBundle[], enabled: boolean) => call<ExternalProxyView>("apply_external_bundles", { revision, bundles, enabled }),
   settings: (input: ExternalSettingsInput) => call<ExternalProxyView>("save_external_proxy_settings", { input }),
   test: (endpointId: string, host: string, port: number, protocol = "tcp", queryName?: string, timeoutMs = 10000) => call<string>("test_external_proxy", { endpointId, host, port, protocol, queryName, timeoutMs }),

@@ -129,8 +129,8 @@ pub(super) fn fit_udp(query: &[u8], mut response: Vec<u8>) -> Vec<u8> {
     }
     response
 }
-async fn tcp_exchange(endpoint: Option<&Endpoint>, target: &Destination, query: &[u8], ports: &[u16]) -> Result<Vec<u8>, String> {
-    let mut stream = transport::connect(endpoint, target, ports).await?;
+async fn tcp_exchange(endpoint: Option<&Endpoint>, target: &Destination, query: &[u8], ports: &[u16], trace: &super::diagnostics::Trace) -> Result<Vec<u8>, String> {
+    let mut stream = transport::connect_traced(endpoint, target, ports,trace).await?;
     stream.write_u16(query.len() as u16).await.map_err(|_| "DNS TCP 查询失败")?;
     stream.write_all(query).await.map_err(|_| "DNS TCP 查询失败")?;
     let len = stream.read_u16().await.map_err(|_| "DNS TCP 响应不完整")? as usize;
@@ -141,12 +141,17 @@ pub(super) async fn exchange(endpoint: Option<&Endpoint>, target: &Destination, 
     exchange_using(endpoint, target, query, ports, false).await
 }
 pub(super) async fn exchange_using(endpoint: Option<&Endpoint>, target: &Destination, query: &[u8], ports: &[u16], tcp: bool) -> Result<Vec<u8>, String> {
+    exchange_traced(endpoint,target,query,ports,tcp,&super::diagnostics::Trace::new(None)).await
+}
+pub(super) async fn exchange_traced(endpoint: Option<&Endpoint>, target: &Destination, query: &[u8], ports: &[u16], tcp: bool, trace: &super::diagnostics::Trace) -> Result<Vec<u8>, String> {
     let q = question(query)?;
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let _activity=trace.activity("dns"); let step=trace.step("dns.exchange");
+    trace.event("dns.query","info",serde_json::json!({"name":q.name,"resolver":target.authority(),"tcp":tcp,"bytes":query.len(),"budgetMs":10000}));
+    let result=tokio::time::timeout(Duration::from_secs(10), async {
         let mut reply = if tcp || endpoint.is_some_and(|e| e.protocol == "http") {
-            tcp_exchange(endpoint, target, query, ports).await?
+            tcp_exchange(endpoint, target, query, ports,trace).await?
         } else {
-            let mut channel = Channel::open(endpoint, target, ports).await?;
+            let mut channel = Channel::open_traced(endpoint, target, ports,trace.clone()).await?;
             channel.send(query).await?;
             let mut buffer = vec![0; 65535];
             loop {
@@ -158,11 +163,13 @@ pub(super) async fn exchange_using(endpoint: Option<&Endpoint>, target: &Destina
         if reply[2] & 2 != 0 {
             // TCP retry follows the very same selected endpoint, never a local
             // or direct fallback when a proxy was selected.
-            reply = tcp_exchange(endpoint, target, query, ports).await?;
+            trace.event("dns.tcp_retry","info",serde_json::json!({"reason":"truncated_response"}));
+            reply = tcp_exchange(endpoint, target, query, ports,trace).await?;
             if parse(&reply, true)? != q || reply[2] & 2 != 0 { return Err("DNS TCP 重试仍返回截断或不匹配的响应".into()); }
         }
         Ok(reply)
-    }).await.map_err(|_| "DNS 上游查询超时，未改走本机 DNS 或直连".to_string())?
+    }).await.unwrap_or_else(|_|Err("DNS 上游查询超时，未改走本机 DNS 或直连".into()));
+    step.finish(result.is_ok(),match &result { Ok(reply)=>serde_json::json!({"responseBytes":reply.len(),"rcode":reply[3]&15}),Err(error)=>serde_json::json!({"error":error}) }); result
 }
 
 pub(super) async fn bind(port: u16) -> Result<(TcpListener, UdpSocket), String> {
@@ -233,7 +240,7 @@ async fn handle(runtime: &Engine, id: &str, process: &crate::routing_overrides::
     if !settings.enabled { return failure(query, 5); }
     let target = Destination { host: settings.server, port: settings.port };
     let record = runtime.record(id, process.pid, &process.name, &policy_target.authority(), &format!("DNS · {route}"), generation, endpoint.as_ref());
-    let result = exchange_using(endpoint.as_ref(), &target, query, &ports, tcp).await;
+    let result = exchange_traced(endpoint.as_ref(), &target, query, &ports, tcp,&super::diagnostics::Trace::new(Some(record))).await;
     let current = runtime.config().dns;
     if !current.enabled || current.server != target.host || current.port != target.port
         || !runtime.select(id, process, &policy_target).is_ok_and(|(now, _, _, _)| now == endpoint) {

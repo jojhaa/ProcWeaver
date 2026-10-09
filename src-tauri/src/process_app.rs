@@ -28,6 +28,7 @@ pub fn run() {
         .manage(state)
         .setup(|app| {
             crate::storage::initialize_process(app.handle())?;
+            external_proxy::diagnostics::initialize(&crate::storage::data_dir());
             function_mode::initialize();
             process_capture::initialize();
             tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("process.html".into()))
@@ -71,6 +72,7 @@ pub fn run() {
             process_capture::get_process_capture, process_capture::set_process_capture,
             external_proxy::get_external_proxy, external_proxy::save_external_proxy_settings,
             external_proxy::apply_external_bundles, external_proxy::test_external_proxy,
+            external_proxy::diagnostics::open_process_log_directory,
             crate::bundle_repository::read_bundle_repository_file,
             crate::bundle_repository::cancel_bundle_repository_request,
             commands::bundle_launch::launch_bundle_app, commands::bundle_launch::get_bundle_entry_states,

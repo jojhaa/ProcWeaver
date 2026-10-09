@@ -3,7 +3,7 @@
 use super::{
     driver::{Address, Device},
     ownership::{Event, Identity, Index},
-    packet::{Flow, Packet},
+    packet::{capture_bypass_destination, Flow, Packet},
     plan::Plan,
     preflight::VerifiedApi,
 };
@@ -73,6 +73,7 @@ struct Shared {
     unknown: AtomicU64,
     failures: AtomicU64,
 }
+
 pub struct Engine {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
@@ -300,6 +301,7 @@ fn reflect(s: &Shared, p: &Packet, r: &Route, data: &mut [u8], a: &mut Address) 
 fn network(s: Arc<Shared>) {
     let mut data = vec![0; 65575];
     let mut cleanup = Instant::now();
+    let mut diagnostic_summary = Instant::now();
     while let Ok((n, mut address)) = s.network.recv(&mut data) {
         let data = &mut data[..n];
         let Some(packet) = Packet::parse(data) else {
@@ -319,6 +321,11 @@ fn network(s: Arc<Shared>) {
             t.tokens.retain(|k, _| active.contains(k));
             t.bypass
                 .retain(|_, at| at.elapsed() < Duration::from_secs(2));
+            if s.external && diagnostic_summary.elapsed()>=Duration::from_secs(30) {
+                crate::external_proxy::diagnostics::emit("capture.snapshot","info",serde_json::json!({"tcpFlows":t.flows.len(),"udpFlows":t.udp.len(),"bypassedFlows":t.bypass.len(),"permitsAvailable":s.capacity.available_permits(),
+                    "tcp":s.tcp.load(Ordering::Relaxed),"udp":s.udp.load(Ordering::Relaxed),"dns":s.dns.load(Ordering::Relaxed),"unknown":s.unknown.load(Ordering::Relaxed),"failures":s.failures.load(Ordering::Relaxed)}));
+                diagnostic_summary=Instant::now();
+            }
             cleanup = Instant::now();
         }
         if flow.protocol == 6 {
@@ -364,7 +371,9 @@ fn network(s: Arc<Shared>) {
         }
         // Local proxy connections keep their existing HTTP/SOCKS protocol and
         // entry. Relays/core cannot be recursively redirected into themselves.
-        if (flow.destination.ip().is_loopback() || address.flags & (1 << 18) != 0)
+        if (flow.destination.ip().is_loopback()
+            || capture_bypass_destination(flow.destination.ip())
+            || address.flags & (1 << 18) != 0)
             && !s.test_loopback
             || s.stop.load(Ordering::Acquire)
         {

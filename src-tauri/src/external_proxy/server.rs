@@ -71,13 +71,14 @@ fn selected(runtime: &Engine, id: &str, process: &ProcessEntry, destination: &De
 }
 async fn tunnel<A, B>(runtime: Arc<Engine>, record: u64, mut client: A, mut upstream: B, mut stop: watch::Receiver<bool>, _permits: Arc<(OwnedSemaphorePermit, OwnedSemaphorePermit)>)
 where A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
+    let trace=super::diagnostics::Trace::new(Some(record)); let _activity=trace.activity("tcp");
     if *stop.borrow() { runtime.update(record, "closed", "业务包已停用", (0, 0)); return; }
     runtime.update(record, "active", "TCP 隧道已建立", (0, 0));
     tokio::select! {
-        _ = stop.changed() => runtime.update(record, "closed", "业务包已停用", (0, 0)),
+        _ = stop.changed() => { trace.event("tcp.tunnel_end","info",serde_json::json!({"reason":"bundle_stop"})); runtime.update(record, "closed", "业务包已停用", (0, 0)); },
         result = tokio::io::copy_bidirectional(&mut client, &mut upstream) => match result {
-            Ok(bytes) => runtime.update(record, "closed", "连接结束", bytes),
-            Err(_) => runtime.update(record, "failed", "隧道连接中断，未直连重试", (0, 0)),
+            Ok(bytes) => { trace.event("tcp.tunnel_end","info",serde_json::json!({"reason":"streams_completed","uploaded":bytes.0,"downloaded":bytes.1})); runtime.update(record, "closed", "连接结束", bytes); },
+            Err(error) => { trace.event("tcp.copy_failed","warning",transport::io_detail(&error)); runtime.update(record, "failed", "隧道连接中断，未直连重试", (0, 0)); },
         }
     }
 }
@@ -99,8 +100,9 @@ async fn http(runtime: Arc<Engine>, id: String, process: ProcessEntry, mut reque
     })();
     let destination = match destination { Ok(d) => d, Err(error) => return Ok(response(StatusCode::BAD_REQUEST, &error)) };
     let (endpoint, ports, record) = match selected(&runtime, &id, &process, &destination) { Ok(v) => v, Err(error) => return Ok(response(StatusCode::FORBIDDEN, &error)) };
+    let trace=super::diagnostics::Trace::new(Some(record));
     if connect {
-        match transport::connect(endpoint.as_ref(), &destination, &ports).await {
+        match transport::connect_traced(endpoint.as_ref(), &destination, &ports,&trace).await {
             Ok(upstream) => {
                 let upgraded = hyper::upgrade::on(&mut request);
                 tokio::spawn(async move {
@@ -120,8 +122,8 @@ async fn http(runtime: Arc<Engine>, id: String, process: ProcessEntry, mut reque
         let forward = endpoint.as_ref().is_some_and(|e| e.protocol == "http");
         let stream = if forward {
             let e = endpoint.as_ref().unwrap();
-            tokio::time::timeout(transport::HANDSHAKE, transport::dial(&e.host, e.port, &ports)).await.map_err(|_| "HTTP 代理连接超时")??
-        } else { transport::connect(endpoint.as_ref(), &destination, &ports).await? };
+            tokio::time::timeout(transport::HANDSHAKE, transport::dial_traced(&e.host, e.port, &ports,&trace)).await.map_err(|_| "HTTP 代理连接超时")??
+        } else { transport::connect_traced(endpoint.as_ref(), &destination, &ports,&trace).await? };
         strip_hop(request.headers_mut(), upgrade);
         request.headers_mut().insert(header::HOST, destination.authority().parse().map_err(|_| "目标请求头无效")?);
         if forward {
@@ -188,7 +190,7 @@ async fn socks(runtime: Arc<Engine>, id: String, mut stream: TcpStream, process:
         Ok(value) => value,
         Err(_) => { let _ = stream.write_all(&[5, 2, 0, 1, 0, 0, 0, 0, 0, 0]).await; return; }
     };
-    match transport::connect(endpoint.as_ref(), &destination, &ports).await {
+    match transport::connect_traced(endpoint.as_ref(), &destination, &ports,&super::diagnostics::Trace::new(Some(record))).await {
         Ok(upstream) => {
             if stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.is_ok() { tunnel(runtime, record, stream, upstream, stop, permits).await; }
         }

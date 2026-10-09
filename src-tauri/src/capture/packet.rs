@@ -133,3 +133,29 @@ pub fn local(ip: IpAddr) -> bool {
         }
     }
 }
+
+/// Destinations that should remain on the local network instead of entering
+/// process-scoped proxy routing. Private unicast addresses intentionally do
+/// not match because they may be explicitly routed by a business rule.
+pub fn capture_bypass_destination(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(value) => value.is_multicast() || value.is_broadcast() || value.is_link_local(),
+        IpAddr::V6(value) => value.is_multicast() || value.is_unicast_link_local(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capture_bypass_destination;
+    use std::net::IpAddr;
+
+    #[test]
+    fn capture_bypass_keeps_local_discovery_and_private_unicast_distinct() {
+        for value in ["224.0.0.251", "255.255.255.255", "169.254.1.1", "ff02::fb", "fe80::1"] {
+            assert!(capture_bypass_destination(value.parse::<IpAddr>().unwrap()), "{value}");
+        }
+        for value in ["192.168.1.10", "10.0.0.10", "2001:db8::10"] {
+            assert!(!capture_bypass_destination(value.parse::<IpAddr>().unwrap()), "{value}");
+        }
+    }
+}

@@ -170,6 +170,23 @@ export function ProcessDiagnostics({ state: s }: { state: State }) {
         </select>
       </div>
 
+      {s.external?.diagnostics && (
+        <div className="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-3 text-xs space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <strong className="text-slate-800 dark:text-slate-100">详细排障日志 · {s.external.diagnostics.error ? "写入异常" : s.external.diagnostics.ready ? "已开启" : "正在初始化"}</strong>
+            <button type="button" className={baseBtn} disabled={s.logsBusy} onClick={() => void s.actions.openLogs()}>
+              {s.logsBusy ? "正在打开…" : "打开日志目录"}
+            </button>
+          </div>
+          <p className="text-slate-500">后台保存建连阶段、关闭原因和会话汇总；最多 {s.external.diagnostics.retainedFiles} 份，每份 {Math.round(s.external.diagnostics.maxFileBytes / 1024 / 1024)} MiB。不记录密码和请求内容。</p>
+          <p className="text-slate-500">活跃任务：TCP {s.external.diagnostics.activeTcp} · UDP {s.external.diagnostics.activeUdp} · DNS {s.external.diagnostics.activeDns}</p>
+          <p className="font-mono text-[11px] text-slate-500 break-all">{s.external.diagnostics.directory} / {s.external.diagnostics.fileName}</p>
+          {(s.external.diagnostics.error || s.logsError || s.external.diagnostics.dropped > 0) && (
+            <p role="status" className="text-amber-700 dark:text-amber-300 break-words">{s.logsError || s.external.diagnostics.error || `有 ${s.external.diagnostics.dropped} 条日志因队列超限或写入失败未保存。`}</p>
+          )}
+        </div>
+      )}
+
       {!s.records.length ? (
         <div className="py-16 text-center text-sm text-slate-500 space-y-2">
           <p>尚未观察到任何独立连接记录。</p>
@@ -199,7 +216,7 @@ export function ProcessDiagnostics({ state: s }: { state: State }) {
                 </span>
               </div>
               <p className="text-[11px] text-slate-500 font-mono break-all">
-                {s.bundleNames[record.bundleId] || record.bundleId} · PID {record.pid} · {record.process} · {record.route} → {record.upstream}
+                #{record.id} · {new Date(record.at).toLocaleTimeString()} · {s.bundleNames[record.bundleId] || record.bundleId} · PID {record.pid} · {record.process} · {record.route} → {record.upstream}
               </p>
               {record.message && (
                 <p className="text-[11px] text-amber-700 dark:text-amber-300 break-words bg-amber-50 dark:bg-amber-950/20 p-1.5 rounded-lg">

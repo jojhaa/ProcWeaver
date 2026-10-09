@@ -18,6 +18,7 @@ pub(crate) fn request(app: &tauri::AppHandle, code: i32) {
         if crate::edition::PROCESS {
             crate::process_capture::stop();
             crate::external_proxy::shutdown();
+            crate::external_proxy::diagnostics::shutdown().await;
             PHASE.store(2, Ordering::Release);
             if code == tauri::RESTART_EXIT_CODE { app.request_restart(); } else { app.exit(code); }
             return;

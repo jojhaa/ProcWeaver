@@ -18,6 +18,7 @@ export function useExternalProxyEditor(open: boolean, instance: BundleLocalInsta
   const [probeRecords, setProbeRecords] = useState<ExternalProbeRecord[]>([]);
   const probeLock = useRef(false);
   const probeSerial = useRef(0);
+  const loadSerial = useRef(0);
   const [dns, setDns] = useState<ExternalDnsSettings>({ enabled: false, server: "1.1.1.1", port: 53 });
   const edit = (id: string, current = view) => {
     const endpoint = current?.endpoints.find(e => e.id === id);
@@ -25,15 +26,23 @@ export function useExternalProxyEditor(open: boolean, instance: BundleLocalInsta
     setMessage(""); setError("");
   };
   const load = async () => {
+    const serial = ++loadSerial.current;
     setBusy(true); setError("");
-    try { const next = await externalProxyApi.read(); setView(next); setDns(next.dns || { enabled: false, server: "1.1.1.1", port: 53 }); edit(next.defaultEndpointId || next.endpoints[0]?.id || "", next); }
-    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
-    finally { setBusy(false); }
+    try {
+      const next = await externalProxyApi.read();
+      if (serial !== loadSerial.current) return;
+      setView(next); setDns(next.dns || { enabled: false, server: "1.1.1.1", port: 53 }); edit(next.defaultEndpointId || next.endpoints[0]?.id || "", next);
+    } catch (e) {
+      if (serial === loadSerial.current) setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (serial === loadSerial.current) setBusy(false);
+    }
   };
   useEffect(() => {
-    if (!open) { setView(undefined); setDraft(blank()); setError(""); setMessage(""); return; }
+    if (!open) { loadSerial.current++; setView(undefined); setDraft(blank()); setError(""); setMessage(""); return; }
     setEndpointId(instance?.externalEndpointId || ""); setFallback(instance?.externalFallback || "direct"); setEnabled(instance?.enabled ?? true);
     void load();
+    return () => { loadSerial.current++; };
   }, [open, instance?.instanceId]);
   const run = async (work: () => Promise<void>) => {
     if (busy) return;

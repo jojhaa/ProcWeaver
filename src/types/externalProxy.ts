@@ -13,11 +13,17 @@ export interface ExternalRecord {
   id: number; bundleId: string; generation: number; pid: number; process: string; target: string;
   route: string; upstream: string; state: string; message: string; uploaded: number; downloaded: number; at: number;
 }
+export interface ProcessLogStatus {
+  directory: string; fileName: string; ready: boolean; error: string | null; dropped: number;
+  activeTcp: number; activeUdp: number; activeDns: number; lastWriteAt: number;
+  maxFileBytes: number; retainedFiles: number;
+}
 export interface ExternalProxyView {
   revision: number; enabled: boolean; defaultEndpointId: string | null; endpoints: ExternalEndpoint[];
   bundles: ExternalBundle[]; states: { id: string; port: number; ready: boolean; dnsPort: number; dnsReady: boolean; upstream: string; error: string }[];
   dns: ExternalDnsSettings;
   records: ExternalRecord[]; supported: boolean;
+  diagnostics?: ProcessLogStatus;
 }
 export interface ExternalSettingsInput { revision: number; defaultEndpointId: string | null; endpoints: ExternalEndpointInput[]; dns?: ExternalDnsSettings }
 export type ExternalProbeKind = "tcp" | "udp_dns" | "udp_stun";

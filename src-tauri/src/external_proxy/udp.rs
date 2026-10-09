@@ -1,5 +1,7 @@
 //! SOCKS5 UDP associations are scoped to a verified TCP control connection.
 use super::{transport::{self, Destination}, model::Endpoint, Engine};
+use super::diagnostics::Trace;
+use serde_json::json;
 use crate::routing_overrides::tracker::ProcessEntry;
 use std::{collections::HashMap, net::{IpAddr, SocketAddr}, sync::Arc, time::Duration};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpStream, UdpSocket}, sync::{mpsc, watch}};
@@ -25,47 +27,65 @@ pub(super) fn encode(destination: &Destination, data: &[u8]) -> Result<Vec<u8>, 
     if output.len() > MAX_PACKET { return Err("UDP 报文超过转发大小限制".into()); } Ok(output)
 }
 
-pub(super) struct Channel { socket: UdpSocket, control: Option<TcpStream>, target: Destination }
+pub(super) struct Channel { socket: UdpSocket, control: Option<TcpStream>, target: Destination, trace: Trace }
 impl Channel {
     pub async fn open(endpoint: Option<&Endpoint>, target: &Destination, forbidden: &[u16]) -> Result<Self, String> {
-        tokio::time::timeout(transport::HANDSHAKE, async {
+        Self::open_traced(endpoint,target,forbidden,Trace::new(None)).await
+    }
+    pub(super) async fn open_traced(endpoint: Option<&Endpoint>, target: &Destination, forbidden: &[u16], trace: Trace) -> Result<Self, String> {
+        trace.event("udp.open_started","info",json!({"target":target.authority(),"via":endpoint.map(|e|json!({"protocol":e.protocol,"host":e.host,"port":e.port}))}));
+        let result=tokio::time::timeout(transport::HANDSHAKE, async {
             if let Some(endpoint) = endpoint {
                 if endpoint.protocol != "socks5" { return Err("HTTP 上游不支持普通 UDP 转发，请选择支持 UDP 的 SOCKS5 代理".into()); }
-                let mut control = transport::dial(&endpoint.host, endpoint.port, forbidden).await?;
+                let mut control = transport::dial_traced(&endpoint.host, endpoint.port, forbidden,&trace).await?;
                 let local = control.local_addr().map_err(|_| "无法取得 UDP 控制连接地址")?;
                 let socket = UdpSocket::bind(SocketAddr::new(local.ip(), 0)).await.map_err(|_| "无法绑定 UDP 转发入口")?;
-                transport::socks_authenticate(&mut control, endpoint).await?;
+                let step=trace.step("udp.socks_authenticate");
+                let result=transport::socks_authenticate_traced(&mut control,endpoint,Some(&trace)).await;
+                step.finish(result.is_ok(),json!({"error":result.as_ref().err()})); result?;
                 let address = socket.local_addr().map_err(|_| "无法取得 UDP 地址")?;
-                let bound = transport::socks_request(&mut control, 3, &Destination { host: address.ip().to_string(), port: address.port() }).await?;
+                let step=trace.step("udp.associate");
+                let result=transport::socks_request_traced(&mut control,3,&Destination { host:address.ip().to_string(),port:address.port() },Some(&trace)).await;
+                step.finish(result.is_ok(),json!({"error":result.as_ref().err()})); let bound=result?;
                 if bound.port == 0 { return Err("SOCKS5 上游返回了无效 UDP 端口".into()); }
                 let host = if bound.host.parse::<IpAddr>().is_ok_and(|ip| ip.is_unspecified()) {
                     control.peer_addr().map_err(|_| "无法取得 SOCKS5 上游地址")?.ip().to_string()
                 } else { bound.host };
                 let relay = resolve(&host, bound.port, forbidden, Some(local.is_ipv4())).await?;
                 socket.connect(relay).await.map_err(|_| "连接 SOCKS5 UDP 中继失败")?;
-                Ok(Self { socket, control: Some(control), target: target.clone() })
+                trace.event("udp.associate_ready","info",json!({"relay":relay.to_string(),"local":address.to_string()}));
+                Ok(Self { socket, control: Some(control), target: target.clone(), trace:trace.clone() })
             } else {
                 let address = resolve(&target.host, target.port, forbidden, None).await?;
                 let bind = if address.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
                 let socket = UdpSocket::bind(bind).await.map_err(|_| "无法绑定直连 UDP 入口")?;
                 socket.connect(address).await.map_err(|_| "无法连接直连 UDP 目标")?;
-                Ok(Self { socket, control: None, target: target.clone() })
+                Ok(Self { socket, control: None, target: target.clone(), trace:trace.clone() })
             }
-        }).await.map_err(|_| "UDP 上游握手超时".to_string())?
+        }).await.unwrap_or_else(|_|Err("UDP 上游握手超时".into()));
+        if let Err(error)=&result { trace.event("udp.open_failed","warning",json!({"error":error})); } result
     }
     pub async fn send(&self, data: &[u8]) -> Result<(), String> {
         let encoded;
         let packet = if self.control.is_some() { encoded = encode(&self.target, data)?; &encoded } else { data };
-        self.socket.send(packet).await.map_err(|_| "UDP 转发失败，未直连重试")?; Ok(())
+        self.socket.send(packet).await.map_err(|error| { self.trace.event("udp.send_failed","warning",transport::io_detail(&error)); "UDP 转发失败，未直连重试" })?; Ok(())
     }
     pub async fn receive(&mut self, buffer: &mut [u8]) -> Result<(Destination, Vec<u8>), String> {
         let result = if let Some(control) = &mut self.control {
             tokio::select! {
-                _ = control.read_u8() => return Err("SOCKS5 UDP 控制连接已关闭".into()),
+                result = control.read_u8() => {
+                    let detail=match result {
+                        Err(error) if error.kind()==std::io::ErrorKind::UnexpectedEof => json!({"reason":"eof","io":transport::io_detail(&error)}),
+                        Err(error) => json!({"reason":"io_error","io":transport::io_detail(&error)}),
+                        Ok(_) => json!({"reason":"unexpected_data"}),
+                    };
+                    self.trace.event("udp.control_ended","warning",detail);
+                    return Err("SOCKS5 UDP 控制连接已关闭".into());
+                },
                 result = self.socket.recv(buffer) => result,
             }
         } else { self.socket.recv(buffer).await };
-        let len = result.map_err(|_| "UDP 上游接收失败")?;
+        let len = result.map_err(|error| { self.trace.event("udp.receive_failed","warning",transport::io_detail(&error)); "UDP 上游接收失败" })?;
         if self.control.is_some() {
             let (source, data) = decode(&buffer[..len])?;
             if source.port != self.target.port || self.target.host.parse::<IpAddr>().is_ok_and(|target| source.host.parse::<IpAddr>().ok() != Some(target)) {
@@ -75,6 +95,7 @@ impl Channel {
         } else { Ok((self.target.clone(), buffer[..len].to_vec())) }
     }
 }
+impl Drop for Channel { fn drop(&mut self) { self.trace.event("udp.channel_released","info",json!({"target":self.target.authority(),"proxied":self.control.is_some()})); } }
 async fn resolve(host: &str, port: u16, forbidden: &[u16], ipv4: Option<bool>) -> Result<SocketAddr, String> {
     let addresses = tokio::net::lookup_host((host, port)).await.map_err(|_| "UDP 中继或直连目标解析失败")?;
     for address in addresses.take(16) {
@@ -88,7 +109,33 @@ async fn resolve(host: &str, port: u16, forbidden: &[u16], ipv4: Option<bool>) -
 struct Flow { sender: mpsc::Sender<Vec<u8>>, task: tokio::task::AbortHandle, endpoint: Option<Endpoint> }
 impl Drop for Flow { fn drop(&mut self) { self.task.abort(); } }
 struct Response { policy: Destination, endpoint: Option<Endpoint>, packet: Vec<u8> }
+const RESPONSE_QUEUE_WAIT: Duration = Duration::from_secs(2);
+
+async fn enqueue_response(
+    output: &mpsc::Sender<Response>,
+    response: Response,
+    trace: &Trace,
+    wait: Duration,
+) -> Result<(), String> {
+    match tokio::time::timeout(wait, output.send(response)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => {
+            trace.event("udp.response_queue_closed", "warning", json!({}));
+            Err("UDP 响应接收端已关闭".into())
+        }
+        Err(_) => {
+            trace.event(
+                "udp.response_queue_timeout",
+                "warning",
+                json!({ "waitMs": wait.as_millis() as u64 }),
+            );
+            Err("UDP 响应队列拥塞".into())
+        }
+    }
+}
 pub(super) async fn associate(runtime: Arc<Engine>, id: String, mut control: TcpStream, mut process: ProcessEntry, requested: Destination, mut stop: watch::Receiver<bool>) -> Result<(), String> {
+    let trace=Trace::new(None); let _activity=trace.activity("udp");
+    trace.event("udp.local_associate_started","info",json!({"bundleId":id,"pid":process.pid,"idleMs":IDLE.as_millis() as u64}));
     let peer = control.peer_addr().map_err(|_| "UDP 控制连接无效")?;
     let requested_ip = requested.host.parse::<IpAddr>().map_err(|_| "UDP 客户端地址必须为 IP")?;
     if !requested_ip.is_unspecified() && requested_ip != peer.ip() { return Err("UDP 客户端地址与控制连接不符".into()); }
@@ -105,12 +152,13 @@ pub(super) async fn associate(runtime: Arc<Engine>, id: String, mut control: Tcp
     let (out, mut responses) = mpsc::channel::<Response>(64);
     let mut packet = vec![0; 65535];
     let mut identity_checked = std::time::Instant::now();
+    let mut last_drop=std::time::Instant::now()-Duration::from_secs(1); let mut queue_drops=0u64;
     let expiry = tokio::time::sleep(IDLE); tokio::pin!(expiry);
     loop {
         tokio::select! {
-            _ = stop.changed() => break,
-            _ = control.read_u8() => break,
-            _ = &mut expiry => break,
+            _ = stop.changed() => { trace.event("udp.local_associate_end","info",json!({"reason":"bundle_stop"})); break; },
+            result = control.read_u8() => { trace.event("udp.local_associate_end","info",json!({"reason":if result.is_ok(){"unexpected_data"}else{"control_read_ended"},"io":result.err().as_ref().map(transport::io_detail)})); break; },
+            _ = &mut expiry => { trace.event("udp.local_associate_end","info",json!({"reason":"idle","idleMs":IDLE.as_millis() as u64})); break; },
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
             Some(response) = responses.recv() => {
                 if runtime.select(&id, &process, &response.policy).is_ok_and(|(endpoint, _, _, _)| endpoint == response.endpoint) {
@@ -165,7 +213,7 @@ pub(super) async fn associate(runtime: Arc<Engine>, id: String, mut control: Tcp
                     });
                     flows.insert(key.clone(), Flow { sender, task, endpoint: selected_endpoint });
                 }
-                if let Some(flow) = flows.get(&key) { let _ = flow.sender.try_send(data.to_vec()); }
+                if let Some(flow) = flows.get(&key) { if flow.sender.try_send(data.to_vec()).is_err() { queue_drops+=1; if last_drop.elapsed()>=Duration::from_secs(1) { trace.event("udp.local_queue_drop","warning",json!({"target":key,"closed":flow.sender.is_closed(),"droppedSinceLast":queue_drops})); queue_drops=0; last_drop=std::time::Instant::now(); } } }
             }
         }
     }
@@ -182,26 +230,62 @@ impl Drop for UdpRecord {
     }
 }
 async fn relay(runtime: Arc<Engine>, record: u64, endpoint: Option<Endpoint>, target: Destination, ports: Vec<u16>, mut input: mpsc::Receiver<Vec<u8>>, output: mpsc::Sender<Response>) -> Result<(), String> {
-    let mut channel = Channel::open(endpoint.as_ref(), &target, &ports).await?;
+    let trace=Trace::new(Some(record)); let _activity=trace.activity("udp");
+    let mut channel = Channel::open_traced(endpoint.as_ref(), &target, &ports,trace.clone()).await?;
     runtime.update(record, "active", "UDP 转发已建立", (0, 0));
     let mut buffer = vec![0; 65535]; let mut totals = (0, 0);
     let mut recorded = std::time::Instant::now() - Duration::from_secs(1);
     let idle = tokio::time::sleep(IDLE); tokio::pin!(idle);
     loop {
         tokio::select! {
-            _ = &mut idle => break,
+            _ = &mut idle => { trace.event("udp.relay_end","info",json!({"reason":"idle","idleMs":IDLE.as_millis() as u64,"uploaded":totals.0,"downloaded":totals.1})); break; },
             data = input.recv() => {
-                let Some(data) = data else { break; };
+                let Some(data) = data else { trace.event("udp.relay_end","info",json!({"reason":"input_closed","uploaded":totals.0,"downloaded":totals.1})); break; };
                 channel.send(&data).await?; totals.0 += data.len() as u64;
                 idle.as_mut().reset(tokio::time::Instant::now() + IDLE);
             },
             result = channel.receive(&mut buffer) => {
                 let (source, data) = result?; totals.1 += data.len() as u64;
-                let _ = output.try_send(Response { policy: target.clone(), endpoint: endpoint.clone(), packet: encode(&source, &data)? });
+                enqueue_response(
+                    &output,
+                    Response { policy: target.clone(), endpoint: endpoint.clone(), packet: encode(&source, &data)? },
+                    &trace,
+                    RESPONSE_QUEUE_WAIT,
+                ).await?;
                 if recorded.elapsed() >= Duration::from_secs(1) { runtime.update(record, "active", "UDP 响应已转发", totals); recorded = std::time::Instant::now(); }
                 idle.as_mut().reset(tokio::time::Instant::now() + IDLE);
             }
         }
     }
     runtime.update(record, "closed", "UDP 会话结束", totals); Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn response_queue_reports_backpressure_and_closed_receiver() {
+        let target = transport::Destination::new("fixture.invalid", 443).unwrap();
+        let trace = Trace::new(None);
+        let (output, mut pending) = mpsc::channel(1);
+        output.send(Response { policy: target.clone(), endpoint: None, packet: vec![1] }).await.unwrap();
+        let result = enqueue_response(
+            &output,
+            Response { policy: target.clone(), endpoint: None, packet: vec![2] },
+            &trace,
+            Duration::from_millis(10),
+        ).await;
+        assert_eq!(result, Err("UDP 响应队列拥塞".into()));
+        let _ = pending.recv().await;
+
+        drop(pending);
+        let result = enqueue_response(
+            &output,
+            Response { policy: target, endpoint: None, packet: vec![3] },
+            &trace,
+            Duration::from_millis(10),
+        ).await;
+        assert_eq!(result, Err("UDP 响应接收端已关闭".into()));
+    }
 }
